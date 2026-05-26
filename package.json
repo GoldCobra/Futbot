@@ -1,0 +1,37 @@
+{
+  "name": "futbot",
+  "version": "1.0.0",
+  "description": "Standalone Futbot for Mario Strikers Competitive Rated and gear utilities.",
+  "main": "index.js",
+  "private": true,
+  "engines": {
+    "node": ">=20 <25"
+  },
+  "scripts": {
+    "start": "node index.js",
+    "commands:register": "node scripts/register_commands.js",
+    "db:migrate:competitive": "node scripts/migrateCompetitiveSchema.js",
+    "db:migrate:competitive-seasons": "node scripts/migrateCompetitiveSeasons.js",
+    "db:migrate:competitive-ranks": "node scripts/migrateCompetitiveRankThresholds.js",
+    "db:migrate:competitive-default-rating": "node scripts/migrateCompetitiveDefaultRating.js",
+    "db:migrate:competitive-rollback": "node scripts/migrateCompetitiveRollbackSupport.js",
+    "db:migrate:competitive-whr-sync": "node scripts/migrateCompetitiveWhrSync.js",
+    "db:migrate:competitive-season-lifecycle": "node scripts/migrateCompetitiveSeasonLifecycle.js",
+    "db:migrate:competitive-season-rewards": "node scripts/migrateCompetitiveSeasonRewards.js",
+    "db:migrate:competitive-season-awards": "node scripts/migrateCompetitiveSeasonAwards.js",
+    "db:rebuild:competitive-season-rewards": "node scripts/rebuildCompetitiveSeasonRewards.js",
+    "db:rebuild:competitive-season-awards": "node scripts/rebuildCompetitiveSeasonAwards.js",
+    "db:reset:competitive-live-test": "node scripts/resetCompetitiveLiveTestData.js",
+    "test": "jest --runInBand"
+  },
+  "dependencies": {
+    "discord.js": "14.26.3",
+    "dotenv": "^10.0.0",
+    "mssql": "^7.2.1",
+    "multimap": "^1.1.0"
+  },
+  "devDependencies": {
+    "jest": "^28.1.0"
+  },
+  "license": "ISC"
+}
