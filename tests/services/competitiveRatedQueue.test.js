@@ -4,6 +4,7 @@ const mockPlayerIdsByDiscordId = new Map();
 let mockNextPlayerId = 1000;
 let mockNextRatedMatchId = 5000;
 const mockMatchNumbersByScope = new Map();
+const ADMIN_ROLE_ID = '1070908166725967942';
 const mockRatedMatchDao = {
     createMatchHeader: jest.fn(async ({ gameId, modeCode }) => {
         const scope = `${gameId}:${modeCode}`;
@@ -445,12 +446,17 @@ function createMatchClientMock() {
     return { channel, client, issueSupportChannel, logThreads, thread };
 }
 
-function createButtonInteractionMock({ customId, userId = 'button-user', client }) {
+function createButtonInteractionMock({ customId, userId = 'button-user', client, roleIds = [] }) {
     const interaction = {
         customId,
         user: {
             id: userId,
             toString: () => `<@${userId}>`
+        },
+        member: {
+            roles: {
+                cache: new Map(roleIds.map(roleId => [roleId, { id: roleId }]))
+            }
         },
         client,
         replied: false,
@@ -2024,6 +2030,72 @@ describe('competitiveRatedQueue', () => {
             competitiveRatedQueue.__resetState();
             jest.useRealTimers();
         }
+    });
+
+    it('rejects GAME WIN clicks from admin users who are not match participants', async () => {
+        const { client } = createMatchClientMock();
+        const match = createMatchFixture({
+            stage: 'awaiting_winner'
+        });
+        competitiveRatedQueue.__seedStateForTests({ activeMatches: [match] });
+
+        const interaction = createButtonInteractionMock({
+            customId: 'rated:competitive:match:winner:match-1',
+            userId: 'admin-user',
+            roleIds: [ADMIN_ROLE_ID],
+            client
+        });
+        await competitiveRatedQueue.handleInteraction(interaction);
+
+        expect(match.score).toEqual({ team1: 0, team2: 0 });
+        expect(match.stage).toBe('awaiting_winner');
+        expect(match.pendingResult).toBeUndefined();
+        expect(mockRatedMatchDao.recordGame).not.toHaveBeenCalled();
+        expect(mockRatedMatchDao.completeMatch).not.toHaveBeenCalled();
+        expect(interaction.editReply.mock.calls.at(-1)[0].content)
+            .toContain('Only a player in this match may report a win.');
+    });
+
+    it('rejects Confirm Game Loss clicks from admin users who are not the losing participant', async () => {
+        const { client } = createMatchClientMock();
+        const pendingResult = {
+            gameNumber: 1,
+            winnerTeamIndex: 1,
+            winnerMention: '<@home-user>',
+            loserTeamIndex: 2,
+            loserRepMention: '<@away-user>',
+            reporterDiscordId: 'home-user',
+            homeTeamNumber: 1,
+            stadiumCode: 'bowser',
+            captainCode: 'mario'
+        };
+        const match = createMatchFixture({
+            stage: 'awaiting_loser_confirmation',
+            score: { team1: 1, team2: 0 },
+            pendingResult,
+            pendingResultGameNumber: 1,
+            loserTeamIndex: 2,
+            loserRepMention: '<@away-user>',
+            selectedStadium: { code: 'bowser', description: 'Bowser Stadium' },
+            selectedCaptain: { code: 'mario', description: 'Mario' }
+        });
+        competitiveRatedQueue.__seedStateForTests({ activeMatches: [match] });
+
+        const interaction = createButtonInteractionMock({
+            customId: 'rated:competitive:match:loser_confirm:match-1:1',
+            userId: 'admin-user',
+            roleIds: [ADMIN_ROLE_ID],
+            client
+        });
+        await competitiveRatedQueue.handleInteraction(interaction);
+
+        expect(match.score).toEqual({ team1: 1, team2: 0 });
+        expect(match.stage).toBe('awaiting_loser_confirmation');
+        expect(match.pendingResult).toEqual(pendingResult);
+        expect(mockRatedMatchDao.recordGame).not.toHaveBeenCalled();
+        expect(mockRatedMatchDao.completeMatch).not.toHaveBeenCalled();
+        expect(interaction.editReply.mock.calls.at(-1)[0].content)
+            .toContain('Only the losing player may confirm the game result.');
     });
 
     it('waits for MSBL Confirm Game Loss before completing a final game', async () => {
