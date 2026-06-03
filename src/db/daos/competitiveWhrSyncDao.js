@@ -62,6 +62,41 @@ function normalizeSyncRow(row) {
     };
 }
 
+function normalizeRunnerPartition(row) {
+    if (!row) return null;
+    return {
+        gameId: row.GameId,
+        mode: row.ModeCode,
+        syncIds: row.syncIds ?? [],
+        count: toNumber(row.SyncCount)
+    };
+}
+
+function buildSyncIdPredicate(syncIds, inputs) {
+    const ids = [...new Set((syncIds ?? [])
+        .map(value => Number(value))
+        .filter(value => Number.isInteger(value) && value > 0))];
+
+    if (!ids.length) {
+        return { predicate: '1 = 0', inputs };
+    }
+
+    const placeholders = ids.map((id, index) => {
+        const key = `syncId${index}`;
+        inputs[key] = [sql.Int, id];
+        return `@${key}`;
+    });
+
+    return {
+        predicate: `Id IN (${placeholders.join(', ')})`,
+        inputs
+    };
+}
+
+function truncateError(value) {
+    return String(value?.message ?? value ?? 'Unknown WHR/TST runner failure').slice(0, 1000);
+}
+
 class CompetitiveWhrSyncDao {
     async syncPendingCompletedMatches({ limit = 50 } = {}) {
         const pending = await executeQuery(
@@ -89,6 +124,143 @@ class CompetitiveWhrSyncDao {
             }
         }
         return results;
+    }
+
+    async getPendingRunnerPartitions({ limit = 50, includeFailed = false, includeNotConfigured = false } = {}) {
+        const statuses = ['pending_external_runner'];
+        if (includeFailed) statuses.push('failed');
+        if (includeNotConfigured) statuses.push('not_configured');
+
+        const statusInputs = {};
+        const statusPlaceholders = statuses.map((status, index) => {
+            const key = `runnerStatus${index}`;
+            statusInputs[key] = [sql.VarChar(30), status];
+            return `@${key}`;
+        });
+
+        const result = await executeQuery(
+            `SELECT TOP (@limit)
+                Id,
+                GameId,
+                ModeCode
+             FROM ${T.whrSync} WITH (READPAST)
+             WHERE SyncStatus IN ('synced','rolled_back')
+               AND WhrRunnerStatus IN (${statusPlaceholders.join(', ')})
+             ORDER BY UpdatedAtUtc ASC, Id ASC`,
+            {
+                limit: [sql.Int, limit],
+                ...statusInputs
+            }
+        );
+
+        const partitions = new Map();
+        for (const row of result.recordset) {
+            const key = `${row.GameId}:${row.ModeCode}`;
+            if (!partitions.has(key)) {
+                partitions.set(key, {
+                    GameId: row.GameId,
+                    ModeCode: row.ModeCode,
+                    syncIds: [],
+                    SyncCount: 0
+                });
+            }
+            const partition = partitions.get(key);
+            partition.syncIds.push(row.Id);
+            partition.SyncCount += 1;
+        }
+
+        return [...partitions.values()].map(normalizeRunnerPartition).filter(Boolean);
+    }
+
+    async markRunnerRunning({ gameId, mode, syncIds }) {
+        return this._updateRunnerStatus({
+            gameId,
+            mode,
+            syncIds,
+            whrRunnerStatus: 'running',
+            clearError: true,
+            expectedRunnerStatuses: ['pending_external_runner', 'failed', 'not_configured']
+        });
+    }
+
+    async markRunnerComplete({ gameId, mode, syncIds }) {
+        return this._updateRunnerStatus({
+            gameId,
+            mode,
+            syncIds,
+            whrRunnerStatus: 'complete',
+            clearError: true,
+            expectedRunnerStatuses: ['running']
+        });
+    }
+
+    async markRunnerFailed({ gameId, mode, syncIds, error }) {
+        return this._updateRunnerStatus({
+            gameId,
+            mode,
+            syncIds,
+            whrRunnerStatus: 'failed',
+            lastError: truncateError(error),
+            expectedRunnerStatuses: ['running', 'pending_external_runner']
+        });
+    }
+
+    async markRunnerNotConfigured({ gameId, mode, syncIds, reason }) {
+        return this._updateRunnerStatus({
+            gameId,
+            mode,
+            syncIds,
+            whrRunnerStatus: 'not_configured',
+            lastError: truncateError(reason),
+            expectedRunnerStatuses: ['pending_external_runner']
+        });
+    }
+
+    async _updateRunnerStatus({
+        gameId,
+        mode,
+        syncIds,
+        whrRunnerStatus,
+        lastError = null,
+        clearError = false,
+        expectedRunnerStatuses = []
+    }) {
+        const inputs = {
+            gameId: [sql.TinyInt, gameId],
+            modeCode: [sql.VarChar(10), mode],
+            whrRunnerStatus: [sql.VarChar(30), whrRunnerStatus],
+            lastError: [sql.NVarChar(1000), lastError]
+        };
+        const { predicate } = buildSyncIdPredicate(syncIds, inputs);
+        const expectedStatuses = [...new Set(expectedRunnerStatuses.filter(Boolean))];
+        const expectedStatusClause = expectedStatuses.length
+            ? `AND WhrRunnerStatus IN (${expectedStatuses.map((status, index) => {
+                const key = `expectedRunnerStatus${index}`;
+                inputs[key] = [sql.VarChar(30), status];
+                return `@${key}`;
+            }).join(', ')})`
+            : '';
+        const lastErrorExpression = clearError ? 'NULL' : '@lastError';
+
+        const result = await executeQuery(
+            `UPDATE ${T.whrSync}
+             SET WhrRunnerStatus = @whrRunnerStatus,
+                 LastAttemptAtUtc = SYSUTCDATETIME(),
+                 AttemptCount = AttemptCount + 1,
+                 LastError = ${lastErrorExpression},
+                 UpdatedAtUtc = SYSUTCDATETIME()
+             WHERE GameId = @gameId
+               AND ModeCode = @modeCode
+               AND SyncStatus IN ('synced','rolled_back')
+               ${expectedStatusClause}
+               AND ${predicate}`,
+            inputs
+        );
+
+        return {
+            updatedRows: result.rowsAffected?.[0] ?? 0,
+            whrRunnerStatus
+        };
     }
 
     async syncCompletedMatch({ ratedMatchId }) {

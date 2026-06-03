@@ -26,6 +26,7 @@ const T = {
     ratedGame: competitiveTable('RatedMatchGame'),
     rollback: competitiveTable('CompetitiveMatchRollback'),
     rollbackSnapshot: competitiveTable('CompetitiveMatchRollbackChangeSnapshot'),
+    seasonMatchSequence: competitiveTable('CompetitiveSeasonMatchSequence'),
     rewardProgress: competitiveTable('CompetitiveSeasonRewardProgress'),
     rewardEarned: competitiveTable('CompetitiveSeasonRewardEarned'),
     awardResult: competitiveTable('CompetitiveSeasonAwardResult'),

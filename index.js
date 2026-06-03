@@ -18,7 +18,6 @@ const CONSTANTS = require('./src/utils/constants');
 const errors = require('./src/utils/errors');
 const commandLoader = require('./src/commands/loader');
 const competitiveRatedQueue = require('./src/services/competitiveRatedQueue');
-const { generalCommandButtonCallBacks } = require('./src/bot/handlers/buttons');
 const { fetchChannel, safeFollowUp, safeSend } = require('./src/utils/discord');
 
 const ACTIVITY_REFRESH_INTERVAL_MS = 10 * 60_000;
@@ -57,10 +56,6 @@ client.on('interactionCreate', async interaction => {
             return await competitiveRatedQueue.handleInteraction(interaction);
         }
 
-        const roleButtonHandler = generalCommandButtonCallBacks[interaction.customId];
-        if (roleButtonHandler) {
-            return await roleButtonHandler(interaction);
-        }
     } catch (err) {
         console.error('[Futbot] Interaction error:', err);
         const debugChannel = await fetchChannel(interaction.guild, CONSTANTS.CHANNELS.DEBUG_ERRORS)

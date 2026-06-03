@@ -1,8 +1,9 @@
 const {
     CONSTANTS,
-    RATED_ISSUE_FORUM_BY_GAME_TYPE,
+    RATED_ISSUE_SUPPORT_CHANNEL_BY_GAME_TYPE,
     THREAD_NAME_MAX_LENGTH
 } = require('./constants');
+const { ChannelType } = require('discord.js');
 const { truncateDiscordName } = require('./formatting');
 const {
     logRatedError,
@@ -75,32 +76,28 @@ function buildIssueReportPostContent(snapshot) {
 }
 
 async function createIssueReportPost(client, snapshot) {
-    const forumChannelId = RATED_ISSUE_FORUM_BY_GAME_TYPE[snapshot.gameType];
-    const forumChannel = await client.channels.fetch(forumChannelId).catch(err => {
-        console.error(`[RatedQueue] Failed to fetch issue forum channel ${forumChannelId}: ${err.message}`);
-        logRatedError(client, snapshot, 'report_issue.forum_fetch_failed', err, { forum: forumChannelId });
+    const supportChannelId = RATED_ISSUE_SUPPORT_CHANNEL_BY_GAME_TYPE[snapshot.gameType];
+    const supportChannel = await client.channels.fetch(supportChannelId).catch(err => {
+        console.error(`[RatedQueue] Failed to fetch issue support channel ${supportChannelId}: ${err.message}`);
+        logRatedError(client, snapshot, 'report_issue.channel_fetch_failed', err, { channel: supportChannelId });
         return null;
     });
-    if (!forumChannel?.threads?.create) {
-        console.error(`[RatedQueue] Issue forum channel ${forumChannelId} is not available for thread creation.`);
-        logRatedError(client, snapshot, 'report_issue.forum_missing', new Error('Forum channel is unavailable'), { forum: forumChannelId });
+    if (!supportChannel?.threads?.create) {
+        console.error(`[RatedQueue] Issue support channel ${supportChannelId} is not available for thread creation.`);
+        logRatedError(client, snapshot, 'report_issue.channel_missing', new Error('Support channel is unavailable'), { channel: supportChannelId });
         return null;
     }
 
     const staffRoleIds = getIssueReportStaffRoleIds(snapshot.gameType);
-    const reportThread = await forumChannel.threads.create({
+    const reportThread = await supportChannel.threads.create({
         name: truncateDiscordName(snapshot.threadName, THREAD_NAME_MAX_LENGTH),
-        reason: `${snapshot.gameType} rated match issue report`,
-        message: {
-            content: buildIssueReportPostContent(snapshot),
-            allowedMentions: {
-                roles: staffRoleIds,
-                users: snapshot.participantIds
-            }
-        }
+        type: ChannelType.PrivateThread,
+        autoArchiveDuration: 1440,
+        invitable: false,
+        reason: `${snapshot.gameType} rated match issue report`
     }).catch(err => {
         console.error(`[RatedQueue] Failed to create issue report post for match ${snapshot.id}: ${err.message}`);
-        logRatedError(client, snapshot, 'report_issue.create_failed', err, { forum: forumChannelId });
+        logRatedError(client, snapshot, 'report_issue.create_failed', err, { channel: supportChannelId });
         return null;
     });
     if (!reportThread) {
@@ -121,10 +118,39 @@ async function createIssueReportPost(client, snapshot) {
         )
     ));
 
+    if (typeof reportThread.send !== 'function') {
+        console.error(`[RatedQueue] Issue report thread ${reportThread.id} is not available for messaging.`);
+        logRatedError(client, snapshot, 'report_issue.thread_missing_send', new Error('Issue report thread is unavailable'), {
+            match: snapshot.id,
+            issueThread: reportThread.id,
+            channel: supportChannelId
+        });
+        return null;
+    }
+
+    const reportMessage = await reportThread.send({
+        content: buildIssueReportPostContent(snapshot),
+        allowedMentions: {
+            roles: staffRoleIds,
+            users: snapshot.participantIds
+        }
+    }).catch(err => {
+        console.error(`[RatedQueue] Failed to send issue report post for match ${snapshot.id}: ${err.message}`);
+        logRatedError(client, snapshot, 'report_issue.message_failed', err, {
+            match: snapshot.id,
+            issueThread: reportThread.id,
+            channel: supportChannelId
+        });
+        return null;
+    });
+    if (!reportMessage) {
+        return null;
+    }
+
     logRatedInfo(client, snapshot, 'report_issue.created', {
         match: snapshot.id,
         issueThread: reportThread.id,
-        forum: forumChannelId
+        channel: supportChannelId
     });
     return reportThread;
 }

@@ -29,7 +29,7 @@ describe('comp-season command', () => {
                     SeasonNumber: 1,
                     DisplayName: 'Burst Season 2026',
                     StartDateUtc: '2026-06-04T08:00:00.000Z',
-                    EndDateUtc: '2026-09-03T08:00:00.000Z',
+                    EndDateUtc: '2026-09-02T08:00:00.000Z',
                     LifecycleStatus: 'active'
                 }]
             })
@@ -39,8 +39,8 @@ describe('comp-season command', () => {
                     Id: 3,
                     SeasonNumber: 2,
                     DisplayName: 'Next Season',
-                    StartDateUtc: '2026-09-10T08:00:00.000Z',
-                    EndDateUtc: '2026-12-03T08:00:00.000Z',
+                    StartDateUtc: '2026-09-03T08:00:00.000Z',
+                    EndDateUtc: '2026-12-02T08:00:00.000Z',
                     LifecycleStatus: 'scheduled'
                 }]
             });

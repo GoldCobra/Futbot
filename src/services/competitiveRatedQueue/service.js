@@ -23,6 +23,7 @@ const {
     finalizeDueEndingSeason,
     activateDueSeason
 } = require('../competitiveRating');
+const { runPendingCompetitiveWhrRunner } = require('../competitiveWhrRunner');
 const { COMP_RANK_EMOJIS, COMP_RANK_NAMES, PLACEMENT_GAMES_REQUIRED } = require('../../utils/competitiveConstants');
 const RatedMatchDao = require('../../db/daos/ratedMatchDao');
 const ratedMatchDao = new RatedMatchDao();
@@ -3811,6 +3812,17 @@ async function handleAutomaticSeasonTransitions(client) {
     return result;
 }
 
+async function recoverPendingCompetitiveWhrRunner(client, event) {
+    const result = await runPendingCompetitiveWhrRunner?.();
+    if (result?.updatedRows > 0) {
+        logRatedWarn(client, { all: true }, event, {
+            rows: result.updatedRows,
+            partitions: result.partitions?.map(partition => `${partition.gameId}:${partition.mode}:${partition.count}`).join(',')
+        });
+    }
+    return result;
+}
+
 async function tick(client) {
     const now = Date.now();
     await handleAutomaticSeasonTransitions(client).catch(error => {
@@ -3845,6 +3857,9 @@ async function tick(client) {
     });
     await recoverPendingCompetitiveWhrSync?.().catch(error => {
         logRatedError(client, { all: true }, 'whr.sync_recovery_failed', error);
+    });
+    await recoverPendingCompetitiveWhrRunner(client, 'whr.runner_not_configured').catch(error => {
+        logRatedError(client, { all: true }, 'whr.runner_recovery_failed', error);
     });
     await finalizeOverdueCompletedThreads(client, now);
     await reconcileAllPanels(client);
@@ -3898,6 +3913,12 @@ async function ensureCompetitiveRatedQueue(client) {
     } catch (err) {
         console.error(`[RatedQueue] WHR/TST sync recovery failed: ${err.message}`);
         logRatedError(client, { all: true }, 'whr.sync_recovery_initial_failed', err);
+    }
+    try {
+        await recoverPendingCompetitiveWhrRunner(client, 'whr.runner_initial_not_configured');
+    } catch (err) {
+        console.error(`[RatedQueue] WHR/TST runner recovery failed: ${err.message}`);
+        logRatedError(client, { all: true }, 'whr.runner_recovery_initial_failed', err);
     }
 }
 
@@ -4050,13 +4071,42 @@ async function handleExtendSearch(interaction) {
     });
 }
 
+async function getReportableMatchSnapshot(matchId, client) {
+    const existingSnapshot = state.reportableMatchesById.get(matchId);
+    if (existingSnapshot) {
+        return existingSnapshot;
+    }
+
+    if (typeof ratedMatchDao.getReportableMatchSnapshot !== 'function') {
+        return null;
+    }
+
+    try {
+        const rebuiltSnapshot = await ratedMatchDao.getReportableMatchSnapshot(matchId);
+        if (!isReportableMatch(rebuiltSnapshot)) {
+            return null;
+        }
+
+        state.reportableMatchesById.set(matchId, rebuiltSnapshot);
+        logRatedInfo(client, rebuiltSnapshot, 'report_issue.snapshot_rebuilt', {
+            match: matchId
+        });
+        return rebuiltSnapshot;
+    } catch (err) {
+        logRatedError(client, { all: true }, 'report_issue.snapshot_rebuild_failed', err, {
+            match: matchId
+        });
+        return null;
+    }
+}
+
 async function handleReportIssueInteraction(interaction) {
     const matchId = parseIdFromCustomId(interaction.customId);
     if (!await ensureDeferredReply(interaction)) {
         return true;
     }
     return await withInteractionLock(`report_issue:${matchId}`, async () => {
-        const snapshot = state.reportableMatchesById.get(matchId);
+        const snapshot = await getReportableMatchSnapshot(matchId, interaction.client);
         if (!snapshot || snapshot.issueThreadId) {
             logRatedInfo(interaction.client, snapshot ?? {}, 'report_issue.ignored', {
                 match: matchId,

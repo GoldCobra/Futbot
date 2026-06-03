@@ -3,6 +3,7 @@ const {
     RATED_RUNTIME_LOG_CLEANUP_INTERVAL_MS,
     RATED_RUNTIME_LOG_INFO_FLUSH_MS,
     RATED_RUNTIME_LOG_MAX_MESSAGE_LENGTH,
+    RATED_RUNTIME_LOG_RETENTION_MS,
     RATED_RUNTIME_LOG_THREADS
 } = require('./constants');
 const { state } = require('./state');
@@ -306,8 +307,36 @@ function collectionHas(collection, id) {
     return collectionValues(collection).some(message => message?.id === id);
 }
 
-async function deleteFetchedMessages(thread, fetched) {
-    const messages = collectionValues(fetched).filter(Boolean);
+function getMessageCreatedTimestamp(message) {
+    if (typeof message?.createdTimestamp === 'number') {
+        return message.createdTimestamp;
+    }
+    if (message?.createdAt instanceof Date) {
+        return message.createdAt.getTime();
+    }
+    return null;
+}
+
+function shouldDeleteRuntimeLogMessage(thread, message, cutoffTimestamp) {
+    if (!message?.id || message.id === thread?.id) {
+        return false;
+    }
+
+    const createdTimestamp = getMessageCreatedTimestamp(message);
+    return typeof createdTimestamp === 'number' && createdTimestamp < cutoffTimestamp;
+}
+
+function filterFetchedMessages(fetched, messages) {
+    const ids = new Set(messages.map(message => message.id));
+    if (fetched && typeof fetched.filter === 'function') {
+        return fetched.filter(message => ids.has(message?.id));
+    }
+    return new Map(messages.map(message => [message.id, message]));
+}
+
+async function deleteFetchedMessages(thread, fetched, cutoffTimestamp) {
+    const messages = collectionValues(fetched)
+        .filter(message => shouldDeleteRuntimeLogMessage(thread, message, cutoffTimestamp));
     if (messages.length === 0) {
         return 0;
     }
@@ -315,7 +344,8 @@ async function deleteFetchedMessages(thread, fetched) {
     let deletedCount = 0;
     let bulkDeleted = null;
     if (typeof thread.bulkDelete === 'function' && messages.length > 1) {
-        bulkDeleted = await thread.bulkDelete(fetched, true).catch(() => null);
+        const bulkCandidates = filterFetchedMessages(fetched, messages);
+        bulkDeleted = await thread.bulkDelete(bulkCandidates, true).catch(() => null);
         deletedCount += collectionValues(bulkDeleted).length;
     }
 
@@ -332,7 +362,7 @@ async function deleteFetchedMessages(thread, fetched) {
     return deletedCount;
 }
 
-async function cleanupLogThread(client, route) {
+async function cleanupLogThread(client, route, cutoffTimestamp) {
     const thread = await client?.channels?.fetch?.(route.threadId).catch(err => {
         console.error(`[RatedQueueLog] Failed to fetch cleanup thread ${route.threadId}: ${err.message}`);
         return null;
@@ -363,7 +393,7 @@ async function cleanupLogThread(client, route) {
         }
 
         before = messages.at(-1)?.id ?? before;
-        deletedCount += await deleteFetchedMessages(thread, fetched);
+        deletedCount += await deleteFetchedMessages(thread, fetched, cutoffTimestamp);
         if (messages.length < RATED_RUNTIME_LOG_CLEANUP_FETCH_LIMIT) {
             break;
         }
@@ -372,14 +402,15 @@ async function cleanupLogThread(client, route) {
     return deletedCount;
 }
 
-async function runRatedRuntimeLogCleanup(client) {
+async function runRatedRuntimeLogCleanup(client, now = Date.now()) {
     for (const route of getAllLogRoutes()) {
         flushInfoBuffer(route.threadId);
     }
     await flushRuntimeLogsForTests();
 
+    const cutoffTimestamp = now - RATED_RUNTIME_LOG_RETENTION_MS;
     for (const route of getAllLogRoutes()) {
-        const deleted = await cleanupLogThread(client, route);
+        const deleted = await cleanupLogThread(client, route, cutoffTimestamp);
         const line = formatLogLine('info', route, 'cleanup.complete', { deleted });
         queueLogLines(client, route.threadId, [line]);
     }
@@ -387,16 +418,22 @@ async function runRatedRuntimeLogCleanup(client) {
     await Promise.all([...state.runtimeLogQueuesByThreadId.values()].map(queue => queue.catch(() => {})));
 }
 
+function runRatedRuntimeLogCleanupSafely(client) {
+    runRatedRuntimeLogCleanup(client).catch(error => {
+        console.error(`[RatedQueueLog] Cleanup failed: ${error.message}`);
+    });
+}
+
 function startRatedRuntimeLogCleanupLoop(client) {
     if (state.runtimeLogCleanupTimer) {
         return;
     }
 
-    state.runtimeLogCleanupTimer = setInterval(() => {
-        runRatedRuntimeLogCleanup(client).catch(error => {
-            console.error(`[RatedQueueLog] Cleanup failed: ${error.message}`);
-        });
-    }, RATED_RUNTIME_LOG_CLEANUP_INTERVAL_MS);
+    runRatedRuntimeLogCleanupSafely(client);
+    state.runtimeLogCleanupTimer = setInterval(
+        () => runRatedRuntimeLogCleanupSafely(client),
+        RATED_RUNTIME_LOG_CLEANUP_INTERVAL_MS
+    );
     state.runtimeLogCleanupTimer.unref?.();
 }
 

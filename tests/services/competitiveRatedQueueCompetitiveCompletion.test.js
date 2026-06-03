@@ -7,6 +7,11 @@ const mockRecordCompetitiveResult = jest.fn();
 const mockGetPlayerRating = jest.fn(async () => null);
 const mockGetActiveSeason = jest.fn(async () => ({ Id: 2, DisplayName: 'Burst Season 2026' }));
 const mockGetDefaultCompetitiveRating = jest.fn(async () => 500);
+const mockRunPendingCompetitiveWhrRunner = jest.fn(async () => ({
+    status: 'idle',
+    partitions: [],
+    updatedRows: 0
+}));
 const mockRatedMatchDao = {
     createMatchHeader: jest.fn(async () => ({ id: 101, matchNumber: 1, seasonMatchNumber: 1 })),
     activateMatch: jest.fn(async ({ participants }) => participants.map((participant, index) => ({
@@ -34,6 +39,10 @@ jest.mock('../../src/services/competitiveRating', () => ({
     getPlayerRating: (...args) => mockGetPlayerRating(...args),
     getActiveSeason: (...args) => mockGetActiveSeason(...args),
     getDefaultCompetitiveRating: (...args) => mockGetDefaultCompetitiveRating(...args)
+}));
+
+jest.mock('../../src/services/competitiveWhrRunner', () => ({
+    runPendingCompetitiveWhrRunner: (...args) => mockRunPendingCompetitiveWhrRunner(...args)
 }));
 
 jest.mock('../../src/db/daos/ratedMatchDao', () => jest.fn().mockImplementation(() => mockRatedMatchDao));
@@ -90,12 +99,17 @@ function createMatchClientMock() {
         setArchived: jest.fn(async () => thread)
     };
 
-    const issueForumChannel = {
-        id: '1503763332421699734',
+    const issueSupportChannel = {
+        id: '1509130945003913246',
         threads: {
             create: jest.fn(async () => ({
                 id: 'issue-thread-1',
                 url: 'https://discord.com/channels/guild-1/issue-thread-1',
+                send: jest.fn(async payload => ({
+                    id: 'issue-thread-message-1',
+                    payload,
+                    content: payload.content
+                })),
                 members: {
                     add: jest.fn(async () => {})
                 }
@@ -140,7 +154,7 @@ function createMatchClientMock() {
             fetch: jest.fn(async channelId => {
                 if (channelId === 'thread-1') return thread;
                 if (channelId === '1501486517464600657') return channel;
-                if (channelId === '1503763332421699734') return issueForumChannel;
+                if (channelId === issueSupportChannel.id) return issueSupportChannel;
                 return logThread;
             })
         }
@@ -289,6 +303,7 @@ describe('competitiveRatedQueue competitive completion flow', () => {
         mockGetPlayerRating.mockClear();
         mockGetActiveSeason.mockClear();
         mockGetDefaultCompetitiveRating.mockClear();
+        mockRunPendingCompetitiveWhrRunner.mockClear();
         mockRatedMatchDao.createMatchHeader.mockClear();
         mockRatedMatchDao.activateMatch.mockClear();
         mockRatedMatchDao.cancelMatchById.mockClear();

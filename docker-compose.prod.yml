@@ -1,0 +1,10 @@
+services:
+  futbot:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    container_name: futbot
+    env_file:
+      - ./.env
+    restart: unless-stopped
+    init: true

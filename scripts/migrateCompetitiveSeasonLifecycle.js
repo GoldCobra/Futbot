@@ -41,7 +41,9 @@ async function migrate() {
 
         IF COL_LENGTH(N'${SEASON_TABLE}', 'TransitionLastError') IS NULL
             ALTER TABLE ${SEASON_TABLE} ADD TransitionLastError NVARCHAR(1000) NULL;
+    `);
 
+    await executeQuery(`
         IF NOT EXISTS (
             SELECT 1
             FROM sys.check_constraints
@@ -51,7 +53,9 @@ async function migrate() {
             ALTER TABLE ${SEASON_TABLE}
             ADD CONSTRAINT CK_CompetitiveSeason_LifecycleStatus
             CHECK (LifecycleStatus IN ('scheduled','active','ending','completed'));
+    `);
 
+    await executeQuery(`
         UPDATE ${SEASON_TABLE}
         SET LifecycleStatus = CASE
                 WHEN IsCompleted = 1 THEN 'completed'

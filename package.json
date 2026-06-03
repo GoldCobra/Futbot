@@ -22,11 +22,13 @@
     "db:rebuild:competitive-season-rewards": "node scripts/rebuildCompetitiveSeasonRewards.js",
     "db:rebuild:competitive-season-awards": "node scripts/rebuildCompetitiveSeasonAwards.js",
     "db:reset:competitive-live-test": "node scripts/resetCompetitiveLiveTestData.js",
+    "whr:status": "node scripts/auditCompetitiveWhrSync.js",
     "test": "jest --runInBand"
   },
   "dependencies": {
     "discord.js": "14.26.3",
     "dotenv": "^10.0.0",
+    "embed-table": "^4.2.3",
     "mssql": "^7.2.1",
     "multimap": "^1.1.0"
   },

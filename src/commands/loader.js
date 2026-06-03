@@ -2,12 +2,24 @@ const fs = require('node:fs');
 const path = require('node:path');
 const {
     Collection,
+    MessageFlags,
+    PermissionsBitField,
     REST,
     Routes,
     SlashCommandBuilder
 } = require('discord.js');
 const CONSTANTS = require('../utils/constants');
 const {safeFollowUp} = require('../utils/discord');
+
+const STAFF_COMMAND_NAMES = new Set(['mslstaff']);
+const STAFF_COMMAND_ROLE_IDS = new Set([
+    CONSTANTS.ROLES.ADMIN,
+    CONSTANTS.ROLES.DEVELOPER,
+    CONSTANTS.ROLES.MSL_STAFF,
+    CONSTANTS.ROLES.MSL_STAFF_MSC,
+    CONSTANTS.ROLES.MSL_STAFF_SMS,
+    CONSTANTS.ROLES.MSL_STAFF_MSBL
+]);
 
 const COMMAND_PROFILES = {
 futbot: [
@@ -17,7 +29,7 @@ futbot: [
         'directories': [
             {
                 'name': 'general',
-                'include': ['button', 'gear', 'gearrules', 'ratedreset', 'ratedsetup']
+                'include': ['gear', 'gearrules', 'ratedreset', 'ratedsetup']
             }
         ],
         'areTopLevelCommands': true
@@ -54,6 +66,34 @@ function commandFileIsIncluded(file, directory) {
     return true;
 }
 
+function memberHasAnyRole(member, roleIds) {
+    const roleCache = member?.roles?.cache;
+    if (roleCache && typeof roleCache.some === 'function') {
+        return roleCache.some(role => roleIds.has(role.id));
+    }
+
+    const roles = member?.roles;
+    if (Array.isArray(roles)) {
+        return roles.some(role => roleIds.has(typeof role === 'string' ? role : role?.id));
+    }
+
+    return false;
+}
+
+function canUseStaffCommand(interaction) {
+    if (interaction?.memberPermissions?.has?.(PermissionsBitField.Flags.Administrator)) {
+        return true;
+    }
+
+    return memberHasAnyRole(interaction?.member, STAFF_COMMAND_ROLE_IDS);
+}
+
+async function denyStaffCommand(interaction) {
+    await safeFollowUp(interaction, {
+        content: 'You do not have permission to use MSL staff commands.',
+        flags: MessageFlags.Ephemeral
+    });
+}
 
 function loadSubCommands(subCommandFiles, adjustedExecution=null, directory={}) {
     const commandFiles = subCommandFiles.filter(file => file.endsWith('.js') && commandFileIsIncluded(file, directory));
@@ -169,6 +209,11 @@ async function execute(interaction) {
     let command = topLevelCommand;
 
     if (topLevelCommand instanceof Collection) {
+        if (STAFF_COMMAND_NAMES.has(interaction.commandName) && !canUseStaffCommand(interaction)) {
+            await denyStaffCommand(interaction);
+            return;
+        }
+
         const subcommand = typeof interaction.options.getSubcommand === 'function'
             ? interaction.options.getSubcommand(false)
             : interaction.options._subcommand;
@@ -233,5 +278,9 @@ module.exports = {
     registerCommands,
     loadCommandsForRegistration,
     loadCommands,
-    execute
+    execute,
+    __private: {
+        canUseStaffCommand,
+        memberHasAnyRole
+    }
 }

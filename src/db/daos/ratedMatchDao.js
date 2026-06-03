@@ -9,6 +9,7 @@ const T = {
     matchSequence: competitiveTable('CompetitiveMatchSequence'),
     seasonMatchSequence: competitiveTable('CompetitiveSeasonMatchSequence')
 };
+const COMPLETED_THREAD_ICON = String.fromCodePoint(0x2705);
 
 function bindInputs(request, inputs = {}) {
     for (const [key, value] of Object.entries(inputs)) {
@@ -20,6 +21,48 @@ function bindInputs(request, inputs = {}) {
 async function runRequest(runner, query, inputs = {}) {
     const request = bindInputs(runner.request(), inputs);
     return request.query(query);
+}
+
+function buildTeamName(participants, teamNumber) {
+    const names = participants
+        .filter(participant => participant.teamNumber === teamNumber)
+        .map(participant => participant.username);
+    return names.length > 0 ? names.join(' + ') : `Team ${teamNumber}`;
+}
+
+function buildReportableMatchSnapshot(rows) {
+    if (!Array.isArray(rows) || rows.length === 0) {
+        return null;
+    }
+
+    const header = rows[0];
+    const participants = rows.map(row => {
+        const discordId = String(row.DiscordId);
+        return {
+            id: discordId,
+            mention: `<@${discordId}>`,
+            username: String(row.PlayerName || discordId),
+            teamNumber: Number(row.TeamNumber)
+        };
+    });
+    const team1Name = buildTeamName(participants, 1);
+    const team2Name = buildTeamName(participants, 2);
+    const mode = String(header.ModeCode);
+    const matchNumber = header.MatchNumber ?? '?';
+
+    return {
+        id: String(header.MatchCode),
+        mode,
+        gameType: String(header.GameType),
+        threadId: header.ThreadId ? String(header.ThreadId) : null,
+        threadName: `${COMPLETED_THREAD_ICON} ${mode} #${matchNumber} | ${team1Name} VS ${team2Name}`,
+        threadUrl: header.ThreadUrl ?? null,
+        finalMessageId: null,
+        participants: participants.map(({ teamNumber, ...participant }) => participant),
+        participantIds: participants.map(participant => participant.id),
+        issueThreadId: null,
+        issueThreadUrl: null
+    };
 }
 
 class RatedMatchDao {
@@ -387,6 +430,39 @@ class RatedMatchDao {
              ORDER BY rm.CompletedAtUtc ASC`
         );
         return result.recordset;
+    }
+
+    async getReportableMatchSnapshot(matchCode) {
+        if (!matchCode) {
+            return null;
+        }
+
+        const result = await executeQuery(
+            `SELECT
+                    rm.MatchCode,
+                    game.Code AS GameType,
+                    rm.ModeCode,
+                    rm.MatchNumber,
+                    rm.ThreadId,
+                    rm.ThreadUrl,
+                    rmp.DiscordId,
+                    rmp.TeamNumber,
+                    rmp.IsRepresentative,
+                    p.Name AS PlayerName
+             FROM ${T.ratedMatch} rm
+             INNER JOIN ${T.game} game
+                ON rm.GameId = game.Id
+             INNER JOIN ${T.ratedParticipant} rmp
+                ON rmp.RatedMatchId = rm.Id
+             INNER JOIN dbo.Player p
+                ON p.Id = rmp.PlayerId
+             WHERE rm.MatchCode = @matchCode
+               AND rm.Status = 'completed'
+             ORDER BY rmp.TeamNumber ASC, rmp.IsRepresentative DESC, rmp.Id ASC`,
+            { matchCode }
+        );
+
+        return buildReportableMatchSnapshot(result.recordset);
     }
 
     async markThreadFinalizationSucceeded({ ratedMatchId }) {

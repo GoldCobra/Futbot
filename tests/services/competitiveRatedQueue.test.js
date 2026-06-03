@@ -28,6 +28,7 @@ const mockRatedMatchDao = {
     recordGame: jest.fn(async () => {}),
     completeMatch: jest.fn(async () => {}),
     cancelMatch: jest.fn(async () => {}),
+    getReportableMatchSnapshot: jest.fn(async () => null),
     getPendingCompletedThreadFinalizations: jest.fn(async () => []),
     markThreadFinalizationSucceeded: jest.fn(async () => {}),
     markThreadFinalizationFailed: jest.fn(async () => {})
@@ -88,6 +89,11 @@ const mockGetPlayerRating = jest.fn(async (discordId) => {
 });
 const mockGetActiveSeason = jest.fn(async () => ({ Id: 2, DisplayName: 'Burst Season 2026' }));
 const mockGetDefaultCompetitiveRating = jest.fn(async () => 500);
+const mockRunPendingCompetitiveWhrRunner = jest.fn(async () => ({
+    status: 'idle',
+    partitions: [],
+    updatedRows: 0
+}));
 const mockExecuteQuery = jest.fn(async (query, params = {}) => {
     const sql = String(query);
     if (sql.includes('COUNT(*) AS QueueCount')) {
@@ -158,6 +164,10 @@ jest.mock('../../src/services/competitiveRating', () => ({
     getPlayerRatingForSeason: (...args) => mockGetPlayerRating(...args),
     getActiveSeason: (...args) => mockGetActiveSeason(...args),
     getDefaultCompetitiveRating: (...args) => mockGetDefaultCompetitiveRating(...args)
+}));
+
+jest.mock('../../src/services/competitiveWhrRunner', () => ({
+    runPendingCompetitiveWhrRunner: (...args) => mockRunPendingCompetitiveWhrRunner(...args)
 }));
 
 jest.mock('../../src/db/daos/ratedMatchDao', () => jest.fn().mockImplementation(() => mockRatedMatchDao));
@@ -386,15 +396,20 @@ function createMatchClientMock() {
     });
     const logThreads = new Map(Object.values(RATED_LOG_THREAD_IDS).map(id => [id, createLogThread(id)]));
 
-    const issueForumChannel = {
-        id: '1503756820391395348',
-        type: ChannelType.GuildForum,
+    const issueSupportChannel = {
+        id: '1509130945003913246',
+        type: ChannelType.GuildText,
         threads: {
             create: jest.fn(async payload => ({
                 id: `issue-thread-${++issueThreadCounter}`,
                 name: payload.name,
                 url: `https://discord.com/channels/guild-1/issue-thread-${issueThreadCounter}`,
                 payload,
+                send: jest.fn(async messagePayload => ({
+                    id: `issue-thread-message-${issueThreadCounter}`,
+                    payload: messagePayload,
+                    content: messagePayload.content
+                })),
                 members: {
                     add: jest.fn(async () => {})
                 }
@@ -407,17 +422,17 @@ function createMatchClientMock() {
             id: 'bot-user'
         },
         channels: {
-            cache: new Map([[channel.id, channel], [issueForumChannel.id, issueForumChannel]]),
+            cache: new Map([[channel.id, channel], [issueSupportChannel.id, issueSupportChannel]]),
             fetch: jest.fn(async channelId => {
                 if (channelId === thread.id) return thread;
-                if (channelId === issueForumChannel.id) return issueForumChannel;
+                if (channelId === issueSupportChannel.id) return issueSupportChannel;
                 if (logThreads.has(channelId)) return logThreads.get(channelId);
                 return channel;
             })
         }
     };
 
-    return { channel, client, issueForumChannel, logThreads, thread };
+    return { channel, client, issueSupportChannel, logThreads, thread };
 }
 
 function createButtonInteractionMock({ customId, userId = 'button-user', client }) {
@@ -781,12 +796,15 @@ describe('competitiveRatedQueue', () => {
         mockGetPlayerRating.mockClear();
         mockGetActiveSeason.mockClear();
         mockGetDefaultCompetitiveRating.mockClear();
+        mockRunPendingCompetitiveWhrRunner.mockClear();
         mockRatedMatchDao.createMatchHeader.mockClear();
         mockRatedMatchDao.activateMatch.mockClear();
         mockRatedMatchDao.cancelMatchById.mockClear();
         mockRatedMatchDao.recordGame.mockClear();
         mockRatedMatchDao.completeMatch.mockClear();
         mockRatedMatchDao.cancelMatch.mockClear();
+        mockRatedMatchDao.getReportableMatchSnapshot.mockReset();
+        mockRatedMatchDao.getReportableMatchSnapshot.mockResolvedValue(null);
         mockRatedMatchDao.getPendingCompletedThreadFinalizations.mockReset();
         mockRatedMatchDao.getPendingCompletedThreadFinalizations.mockResolvedValue([]);
         mockRatedMatchDao.markThreadFinalizationSucceeded.mockClear();
@@ -832,6 +850,7 @@ describe('competitiveRatedQueue', () => {
         await competitiveRatedQueue.ensureCompetitiveRatedQueue(client);
         competitiveRatedQueue.__resetState();
 
+        expect(mockRunPendingCompetitiveWhrRunner).toHaveBeenCalledTimes(1);
         expect(channel.send).not.toHaveBeenCalled();
         expect(panelImageMessage.edit).not.toHaveBeenCalled();
         expect(panelMessage.edit).not.toHaveBeenCalled();
@@ -1059,30 +1078,51 @@ describe('competitiveRatedQueue', () => {
         }
     });
 
-    it('cleans every rated runtime log thread and posts cleanup completion', async () => {
+    it('cleans only old rated runtime log messages and posts cleanup completion', async () => {
         const { client, logThreads } = createMatchClientMock();
+        const now = Date.UTC(2026, 4, 27, 12, 0, 0);
+        const oldTimestamp = now - (8 * 24 * 60 * 60 * 1000);
+        const recentTimestamp = now - (2 * 24 * 60 * 60 * 1000);
+        const mscLogThread = logThreads.get(RATED_LOG_THREAD_IDS.MSC_1V1);
         const firstMessage = {
             id: 'log-old-1',
+            createdTimestamp: oldTimestamp,
             delete: jest.fn(async () => {})
         };
         const secondMessage = {
             id: 'log-old-2',
+            createdTimestamp: oldTimestamp,
+            delete: jest.fn(async () => {})
+        };
+        const recentMessage = {
+            id: 'log-recent-1',
+            createdTimestamp: recentTimestamp,
+            delete: jest.fn(async () => {})
+        };
+        const starterMessage = {
+            id: mscLogThread.id,
+            createdTimestamp: oldTimestamp,
             delete: jest.fn(async () => {})
         };
         const collection = new Map([
             [firstMessage.id, firstMessage],
-            [secondMessage.id, secondMessage]
+            [secondMessage.id, secondMessage],
+            [recentMessage.id, recentMessage],
+            [starterMessage.id, starterMessage]
         ]);
-        const mscLogThread = logThreads.get(RATED_LOG_THREAD_IDS.MSC_1V1);
         mscLogThread.messages.fetch
             .mockResolvedValueOnce(collection)
             .mockResolvedValue(new Map());
         mscLogThread.bulkDelete.mockResolvedValueOnce(new Map([[firstMessage.id, firstMessage]]));
 
-        await competitiveRatedQueue.__runRuntimeLogCleanupForTests(client);
+        await competitiveRatedQueue.__runRuntimeLogCleanupForTests(client, now);
 
-        expect(mscLogThread.bulkDelete).toHaveBeenCalledWith(collection, true);
+        expect(mscLogThread.bulkDelete).toHaveBeenCalledTimes(1);
+        expect([...mscLogThread.bulkDelete.mock.calls[0][0].keys()].sort()).toEqual(['log-old-1', 'log-old-2']);
+        expect(mscLogThread.bulkDelete).toHaveBeenCalledWith(expect.any(Map), true);
         expect(secondMessage.delete).toHaveBeenCalled();
+        expect(recentMessage.delete).not.toHaveBeenCalled();
+        expect(starterMessage.delete).not.toHaveBeenCalled();
         for (const thread of logThreads.values()) {
             const cleanupLog = thread.send.mock.calls.map(([payload]) => payload.content).join('\n');
             expect(cleanupLog).toContain('[info]');
@@ -3087,8 +3127,8 @@ describe('competitiveRatedQueue', () => {
         }
     });
 
-    it('adds a Report Issue button after match completion and creates one forum post for players', async () => {
-        const { client, issueForumChannel, thread } = createMatchClientMock();
+    it('adds a Report Issue button after match completion and creates one private support thread for players', async () => {
+        const { client, issueSupportChannel, thread } = createMatchClientMock();
         const match = createMatchFixture({
             firstTo: 1,
             stage: 'awaiting_winner'
@@ -3147,19 +3187,23 @@ describe('competitiveRatedQueue', () => {
         });
         await competitiveRatedQueue.handleInteraction(reportInteraction);
 
-        expect(issueForumChannel.threads.create).toHaveBeenCalledTimes(1);
-        const postPayload = issueForumChannel.threads.create.mock.calls[0][0];
-        expect(postPayload.name).toBe('✅ 1v1 #1 | Home VS Away');
-        expect(postPayload.message.content).toContain('Match: **✅ 1v1 #1 | Home VS Away**');
-        expect(postPayload.message.content).toContain('Match Thread: https://discord.com/channels/guild-1/thread-1');
-        expect(postPayload.message.content).toContain('<@&1070908166725967942>');
-        expect(postPayload.message.content).toContain('<@&790896138827333652>');
-        expect(postPayload.message.content).toContain('<@home-user> <@away-user>');
-        expect(postPayload.message.allowedMentions.roles).toEqual(['1070908166725967942', '790896138827333652']);
-        expect(postPayload.message.allowedMentions.users).toEqual(['home-user', 'away-user']);
-        const createdIssueThread = await issueForumChannel.threads.create.mock.results[0].value;
+        expect(issueSupportChannel.threads.create).toHaveBeenCalledTimes(1);
+        const threadPayload = issueSupportChannel.threads.create.mock.calls[0][0];
+        expect(threadPayload.name).toBe('✅ 1v1 #1 | Home VS Away');
+        expect(threadPayload.type).toBe(ChannelType.PrivateThread);
+        expect(threadPayload.invitable).toBe(false);
+        const createdIssueThread = await issueSupportChannel.threads.create.mock.results[0].value;
         expect(createdIssueThread.members.add).toHaveBeenCalledWith('home-user');
         expect(createdIssueThread.members.add).toHaveBeenCalledWith('away-user');
+        expect(createdIssueThread.send).toHaveBeenCalledTimes(1);
+        const postPayload = createdIssueThread.send.mock.calls[0][0];
+        expect(postPayload.content).toContain('Match: **✅ 1v1 #1 | Home VS Away**');
+        expect(postPayload.content).toContain('Match Thread: https://discord.com/channels/guild-1/thread-1');
+        expect(postPayload.content).toContain('<@&1070908166725967942>');
+        expect(postPayload.content).toContain('<@&790896138827333652>');
+        expect(postPayload.content).toContain('<@home-user> <@away-user>');
+        expect(postPayload.allowedMentions.roles).toEqual(['1070908166725967942', '790896138827333652']);
+        expect(postPayload.allowedMentions.users).toEqual(['home-user', 'away-user']);
         expect(reportInteraction.editReply.mock.calls.at(-1)[0].content).toContain('Issue report created: https://discord.com/channels/guild-1/issue-thread-1');
 
         const duplicateReportInteraction = createButtonInteractionMock({
@@ -3168,9 +3212,55 @@ describe('competitiveRatedQueue', () => {
             client
         });
         await competitiveRatedQueue.handleInteraction(duplicateReportInteraction);
-        expect(issueForumChannel.threads.create).toHaveBeenCalledTimes(1);
+        expect(issueSupportChannel.threads.create).toHaveBeenCalledTimes(1);
         expect(duplicateReportInteraction.editReply).not.toHaveBeenCalled();
         expect(duplicateReportInteraction.deleteReply).toHaveBeenCalled();
+    });
+
+    it('rebuilds report issue snapshots from the database after restart', async () => {
+        const { client, issueSupportChannel } = createMatchClientMock();
+        mockRatedMatchDao.getReportableMatchSnapshot.mockResolvedValueOnce({
+            id: 'db-match-1',
+            mode: '1v1',
+            gameType: 'MSC',
+            threadId: 'thread-db',
+            threadName: '✅ 1v1 #42 | Db Home VS Db Away',
+            threadUrl: 'https://discord.com/channels/guild-1/thread-db',
+            finalMessageId: null,
+            participants: [
+                { id: 'home-user', mention: '<@home-user>', username: 'Db Home' },
+                { id: 'away-user', mention: '<@away-user>', username: 'Db Away' }
+            ],
+            participantIds: ['home-user', 'away-user'],
+            issueThreadId: null,
+            issueThreadUrl: null
+        });
+
+        const reportInteraction = createButtonInteractionMock({
+            customId: 'rated:competitive:match:report_issue:db-match-1',
+            userId: 'home-user',
+            client
+        });
+
+        await competitiveRatedQueue.handleInteraction(reportInteraction);
+
+        expect(mockRatedMatchDao.getReportableMatchSnapshot).toHaveBeenCalledWith('db-match-1');
+        expect(issueSupportChannel.threads.create).toHaveBeenCalledTimes(1);
+        const threadPayload = issueSupportChannel.threads.create.mock.calls[0][0];
+        expect(threadPayload.name).toBe('✅ 1v1 #42 | Db Home VS Db Away');
+        expect(threadPayload.type).toBe(ChannelType.PrivateThread);
+        expect(threadPayload.invitable).toBe(false);
+        const createdIssueThread = await issueSupportChannel.threads.create.mock.results[0].value;
+        expect(createdIssueThread.members.add).toHaveBeenCalledWith('home-user');
+        expect(createdIssueThread.members.add).toHaveBeenCalledWith('away-user');
+        expect(createdIssueThread.send).toHaveBeenCalledTimes(1);
+        const postPayload = createdIssueThread.send.mock.calls[0][0];
+        expect(postPayload.content).toContain('Match: **✅ 1v1 #42 | Db Home VS Db Away**');
+        expect(postPayload.content).toContain('Match Thread: https://discord.com/channels/guild-1/thread-db');
+        expect(postPayload.content).toContain('<@home-user> <@away-user>');
+        expect(postPayload.allowedMentions.roles).toEqual(['1070908166725967942', '790896138827333652']);
+        expect(postPayload.allowedMentions.users).toEqual(['home-user', 'away-user']);
+        expect(reportInteraction.editReply.mock.calls.at(-1)[0].content).toContain('Issue report created: https://discord.com/channels/guild-1/issue-thread-1');
     });
 
     it('reports users with an active competitive search as busy', () => {
