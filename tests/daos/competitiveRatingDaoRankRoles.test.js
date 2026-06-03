@@ -21,10 +21,12 @@ describe('CompetitiveRatingDao rank role lookup', () => {
         expect(query).toContain('PlacementComplete = 1');
         expect(query).toContain('ELSE 0');
         expect(query).not.toMatch(/WHERE[\s\S]*PlacementComplete\s*=\s*1/);
+        expect(query).not.toMatch(/WHERE[\s\S]*GameId\s*=/);
+        expect(query).toContain("ModeCode = '1v1'");
         expect(params).toEqual({ playerId: 7, seasonId: 2 });
     });
 
-    it('returns the best completed placement rank when the player has ranked 1v1 rows', async () => {
+    it('returns the best completed placement rank across all competitive 1v1 games', async () => {
         executeQuery.mockResolvedValueOnce({ recordset: [{ HighestRank: 4 }] });
         const dao = new CompetitiveRatingDao();
 
