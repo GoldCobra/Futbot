@@ -139,7 +139,9 @@ class CompetitiveWhrSyncDao {
         });
 
         const result = await executeQuery(
-            `SELECT TOP (@limit)
+            `SET TRANSACTION ISOLATION LEVEL READ COMMITTED;
+
+             SELECT TOP (@limit)
                 Id,
                 GameId,
                 ModeCode

@@ -37,6 +37,9 @@ describe('CompetitiveWhrSyncDao runner status methods', () => {
                 runnerStatus0: [{ type: 'VarChar', length: 30 }, 'pending_external_runner']
             })
         );
+        const [query] = mockExecuteQuery.mock.calls[0];
+        expect(query).toContain('SET TRANSACTION ISOLATION LEVEL READ COMMITTED');
+        expect(query).toContain('WITH (READPAST)');
         expect(result).toEqual([
             { gameId: 1, mode: '1v1', syncIds: [10, 11], count: 2 },
             { gameId: 2, mode: '2v2', syncIds: [20], count: 1 }
