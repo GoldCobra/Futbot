@@ -318,6 +318,37 @@ function renderPoolJoinMessage(search, compRating = null) {
     );
 }
 
+function buildLeavePoolComponents(search) {
+    return [
+        new ActionRowBuilder().addComponents(
+            new ButtonBuilder()
+                .setCustomId(cancelSearchCustomId(search.id))
+                .setLabel(buildLeavePoolLabel(search.mode))
+                .setStyle(ButtonStyle.Danger)
+        )
+    ];
+}
+
+function buildPoolJoinPayload(search, compRating = null) {
+    return {
+        content: renderPoolJoinMessage(search, compRating),
+        components: buildLeavePoolComponents(search),
+        ephemeral: true
+    };
+}
+
+function buildExistingPoolEntryPayload(search) {
+    return {
+        content: renderTimedMessage(
+            `Your ${getModeCompactLabel(search.mode)} pool entry is still active.`,
+            search.expiresAt,
+            `**${search.durationMinutes ?? DEFAULT_POOL_DURATION_MINUTES} mins**`
+        ),
+        components: buildLeavePoolComponents(search),
+        ephemeral: true
+    };
+}
+
 function buildSearchExpiryWarningPayload(search) {
     return {
         content: renderTimedMessage(
@@ -1757,6 +1788,16 @@ async function maybeJoinSearch(interaction, panelConfig, mode, durationMinutes, 
         return;
     }
 
+    const existingSearch = state.activeSearchesByUserId.get(interaction.user.id);
+    if (existingSearch?.id && state.activeSearchesById.has(existingSearch.id)) {
+        logRatedInfo(interaction.client, { gameType: panelConfig.gameType, mode }, 'queue.join_replayed', {
+            user: interaction.user.id,
+            search: existingSearch.id
+        });
+        await safeReply(interaction, buildExistingPoolEntryPayload(existingSearch));
+        return;
+    }
+
     const busyReason = getCompetitiveRatedBusyReason(interaction.user.id);
     if (busyReason) {
         logRatedInfo(interaction.client, { gameType: panelConfig.gameType, mode }, 'queue.join_ignored', {
@@ -1817,18 +1858,7 @@ async function maybeJoinSearch(interaction, panelConfig, mode, durationMinutes, 
 
     const compRating = ratingProfile.compRating ?? null;
 
-    await safeReply(interaction, {
-        content: renderPoolJoinMessage(search, compRating),
-        components: [
-            new ActionRowBuilder().addComponents(
-                new ButtonBuilder()
-                    .setCustomId(cancelSearchCustomId(search.id))
-                    .setLabel(buildLeavePoolLabel(mode))
-                    .setStyle(ButtonStyle.Danger)
-            )
-        ],
-        ephemeral: true
-    });
+    await safeReply(interaction, buildPoolJoinPayload(search, compRating));
     schedulePanelStatusRefresh(panelConfig.channelId, interaction.client);
 }
 

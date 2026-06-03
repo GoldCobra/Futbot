@@ -1068,8 +1068,36 @@ describe('competitiveRatedQueue', () => {
 
         expect(competitiveRatedQueue.__getStateSnapshot().activeSearchCount).toBe(1);
         expect(firstInteraction.editReply.mock.calls.at(-1)[0].content).toContain('joined the 1vs1 pool');
-        expect(duplicateInteraction.editReply).not.toHaveBeenCalled();
-        expect(duplicateInteraction.deleteReply).toHaveBeenCalled();
+        const duplicatePayload = duplicateInteraction.editReply.mock.calls.at(-1)[0];
+        expect(duplicatePayload.content).toContain('Your 1vs1 pool entry is still active.');
+        expect(duplicatePayload.components[0].toJSON().components[0].label).toBe('Leave 1vs1');
+        expect(duplicateInteraction.deleteReply).not.toHaveBeenCalled();
+    });
+
+    it('replays the private leave button when a queued player clicks Search again', async () => {
+        const { client } = createMatchClientMock();
+        const firstInteraction = createButtonInteractionMock({
+            customId: 'rated:competitive:join:1501486517464600657:2v2',
+            userId: '12345',
+            client
+        });
+        const replayInteraction = createButtonInteractionMock({
+            customId: 'rated:competitive:join:1501486517464600657:2v2',
+            userId: '12345',
+            client
+        });
+
+        await competitiveRatedQueue.handleInteraction(firstInteraction);
+        await competitiveRatedQueue.handleInteraction(replayInteraction);
+
+        expect(competitiveRatedQueue.__getStateSnapshot().activeSearchCount).toBe(1);
+        const replayPayload = replayInteraction.editReply.mock.calls.at(-1)[0];
+        expect(replayPayload.content).toContain('Your 2vs2 pool entry is still active.');
+        expect(replayPayload.content).toContain('Time remaining:');
+        const leaveButton = replayPayload.components[0].toJSON().components[0];
+        expect(leaveButton.label).toBe('Leave 2vs2');
+        expect(leaveButton.custom_id).toContain(':search:cancel:');
+        expect(replayInteraction.deleteReply).not.toHaveBeenCalled();
     });
 
     it('does not join the pool when the Search interaction could not be acknowledged', async () => {
