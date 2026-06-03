@@ -1,9 +1,5 @@
 const CompetitiveRatingDao = require('../db/daos/competitiveRatingDao');
 const CompetitiveWhrSyncDao = require('../db/daos/competitiveWhrSyncDao');
-const {
-    COMPETITIVE_WHR_TST_UNAVAILABLE_MESSAGE,
-    isCompetitiveWhrRunnerConfigured
-} = require('./competitiveWhrRunner');
 const CONSTANTS = require('../utils/constants');
 const { getKFactor, ELO_DIVISOR } = require('../utils/competitiveConstants');
 
@@ -233,16 +229,7 @@ async function getActiveSeason() {
 }
 
 async function getSeasonQueueAvailability() {
-    const availability = await dao.getSeasonQueueAvailability();
-    if (availability?.canQueue && !isCompetitiveWhrRunnerConfigured()) {
-        return {
-            ...availability,
-            canQueue: false,
-            status: 'whr_not_configured',
-            message: COMPETITIVE_WHR_TST_UNAVAILABLE_MESSAGE
-        };
-    }
-    return availability;
+    return dao.getSeasonQueueAvailability();
 }
 
 async function beginDueSeasonEnding() {

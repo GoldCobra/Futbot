@@ -17,7 +17,11 @@ describe('competitiveWhrRunner', () => {
 
         const result = await runner.runPending();
 
-        expect(dao.getPendingRunnerPartitions).toHaveBeenCalledWith({ limit: 50 });
+        expect(dao.getPendingRunnerPartitions).toHaveBeenCalledWith({
+            limit: 50,
+            includeFailed: false,
+            includeNotConfigured: false
+        });
         expect(dao.markRunnerNotConfigured).toHaveBeenNthCalledWith(1, {
             gameId: 1,
             mode: '1v1',
@@ -49,7 +53,11 @@ describe('competitiveWhrRunner', () => {
 
         const result = await runner.runPending({ limit: 10 });
 
-        expect(dao.getPendingRunnerPartitions).toHaveBeenCalledWith({ limit: 10 });
+        expect(dao.getPendingRunnerPartitions).toHaveBeenCalledWith({
+            limit: 10,
+            includeFailed: false,
+            includeNotConfigured: false
+        });
         expect(dao.markRunnerNotConfigured).not.toHaveBeenCalled();
         expect(result).toEqual({
             status: 'idle',
@@ -102,6 +110,11 @@ describe('competitiveWhrRunner', () => {
 
         const result = await runner.runPending();
 
+        expect(dao.getPendingRunnerPartitions).toHaveBeenCalledWith({
+            limit: 50,
+            includeFailed: true,
+            includeNotConfigured: true
+        });
         expect(dao.markRunnerRunning).toHaveBeenCalledWith({
             gameId: 1,
             mode: '1v1',
@@ -155,5 +168,37 @@ describe('competitiveWhrRunner', () => {
             error: failure
         });
         expect(dao.markRunnerComplete).not.toHaveBeenCalled();
+    });
+
+    it('includes not-configured backlog when a runner is configured later', async () => {
+        const dao = {
+            getPendingRunnerPartitions: jest.fn(async () => [
+                { gameId: 3, mode: '1v1', syncIds: [31], count: 1 }
+            ]),
+            markRunnerRunning: jest.fn(async () => ({ updatedRows: 1 })),
+            markRunnerComplete: jest.fn(async () => ({ updatedRows: 1 })),
+            markRunnerFailed: jest.fn()
+        };
+        const commandRunner = jest.fn(async () => ({ stdout: '', stderr: '' }));
+        const runner = new CompetitiveWhrRunner({
+            dao,
+            runnerCommand: 'node scripts/rebuild-whr.js',
+            commandRunner
+        });
+
+        const result = await runner.runPending({ limit: 25 });
+
+        expect(dao.getPendingRunnerPartitions).toHaveBeenCalledWith({
+            limit: 25,
+            includeFailed: true,
+            includeNotConfigured: true
+        });
+        expect(result).toEqual({
+            status: 'complete',
+            partitions: [
+                { gameId: 3, mode: '1v1', syncIds: [31], count: 1, whrRunnerStatus: 'complete', updatedRows: 1 }
+            ],
+            updatedRows: 1
+        });
     });
 });

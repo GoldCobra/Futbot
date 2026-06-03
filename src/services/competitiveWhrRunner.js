@@ -54,7 +54,12 @@ class CompetitiveWhrRunner {
     }
 
     async runPending({ limit = 50, reason = DEFAULT_NOT_CONFIGURED_REASON } = {}) {
-        const partitions = await this.dao.getPendingRunnerPartitions({ limit });
+        const includeBacklog = Boolean(this.runnerCommand);
+        const partitions = await this.dao.getPendingRunnerPartitions({
+            limit,
+            includeFailed: includeBacklog,
+            includeNotConfigured: includeBacklog
+        });
         const processed = [];
 
         for (const partition of partitions) {

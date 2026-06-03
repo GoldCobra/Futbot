@@ -46,6 +46,35 @@ describe('CompetitiveWhrSyncDao runner status methods', () => {
         ]);
     });
 
+    it('can include failed and not-configured runner backlog for later recalculation', async () => {
+        mockExecuteQuery.mockResolvedValue({
+            recordset: [
+                { Id: 30, GameId: 1, ModeCode: '1v1' },
+                { Id: 31, GameId: 1, ModeCode: '1v1' }
+            ]
+        });
+        const dao = new CompetitiveWhrSyncDao();
+
+        const result = await dao.getPendingRunnerPartitions({
+            limit: 25,
+            includeFailed: true,
+            includeNotConfigured: true
+        });
+
+        expect(mockExecuteQuery).toHaveBeenCalledWith(
+            expect.stringContaining("WhrRunnerStatus IN (@runnerStatus0, @runnerStatus1, @runnerStatus2)"),
+            expect.objectContaining({
+                limit: ['Int', 25],
+                runnerStatus0: [{ type: 'VarChar', length: 30 }, 'pending_external_runner'],
+                runnerStatus1: [{ type: 'VarChar', length: 30 }, 'failed'],
+                runnerStatus2: [{ type: 'VarChar', length: 30 }, 'not_configured']
+            })
+        );
+        expect(result).toEqual([
+            { gameId: 1, mode: '1v1', syncIds: [30, 31], count: 2 }
+        ]);
+    });
+
     it('marks only pending runner rows as not configured', async () => {
         mockExecuteQuery.mockResolvedValue({ rowsAffected: [2], recordset: [] });
         const dao = new CompetitiveWhrSyncDao();

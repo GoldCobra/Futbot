@@ -5,7 +5,6 @@ const mockGetSeasonQueueAvailability = jest.fn();
 const mockSyncCompletedMatch = jest.fn();
 const mockMarkRolledBack = jest.fn();
 const mockSyncPendingCompletedMatches = jest.fn();
-const mockIsCompetitiveWhrRunnerConfigured = jest.fn();
 
 jest.mock('../../src/db/daos/competitiveRatingDao', () => jest.fn().mockImplementation(() => ({
     getActiveSeason: (...args) => mockGetActiveSeason(...args),
@@ -19,11 +18,6 @@ jest.mock('../../src/db/daos/competitiveWhrSyncDao', () => jest.fn().mockImpleme
     markRolledBack: (...args) => mockMarkRolledBack(...args),
     syncPendingCompletedMatches: (...args) => mockSyncPendingCompletedMatches(...args)
 })));
-
-jest.mock('../../src/services/competitiveWhrRunner', () => ({
-    COMPETITIVE_WHR_TST_UNAVAILABLE_MESSAGE: 'Rated matches are temporarily unavailable while WHR/TST recalculation is being prepared.',
-    isCompetitiveWhrRunnerConfigured: (...args) => mockIsCompetitiveWhrRunnerConfigured(...args)
-}));
 
 const {
     getSeasonQueueAvailability,
@@ -41,7 +35,6 @@ describe('competitiveRating WHR/TST sync hooks', () => {
         mockSyncCompletedMatch.mockReset();
         mockMarkRolledBack.mockReset();
         mockSyncPendingCompletedMatches.mockReset();
-        mockIsCompetitiveWhrRunnerConfigured.mockReset();
 
         mockGetActiveSeason.mockResolvedValue({ Id: 2, DisplayName: 'Burst Season 2026' });
         mockGetSeasonQueueAvailability.mockResolvedValue({
@@ -57,7 +50,6 @@ describe('competitiveRating WHR/TST sync hooks', () => {
         mockSyncCompletedMatch.mockResolvedValue({ syncStatus: 'synced' });
         mockMarkRolledBack.mockResolvedValue({ syncStatus: 'rolled_back' });
         mockSyncPendingCompletedMatches.mockResolvedValue([{ ratedMatchId: 77, syncStatus: 'synced' }]);
-        mockIsCompetitiveWhrRunnerConfigured.mockReturnValue(true);
     });
 
     it('schedules WHR/TST sync after a stored competitive completion without blocking the result', async () => {
@@ -107,21 +99,18 @@ describe('competitiveRating WHR/TST sync hooks', () => {
         expect(result).toEqual([{ ratedMatchId: 77, syncStatus: 'synced' }]);
     });
 
-    it('blocks queue availability when the WHR/TST runner is not configured', async () => {
-        mockIsCompetitiveWhrRunnerConfigured.mockReturnValue(false);
-
+    it('keeps active queue availability open even when WHR/TST backfill is not configured yet', async () => {
         const result = await getSeasonQueueAvailability();
 
         expect(result).toEqual({
-            canQueue: false,
-            status: 'whr_not_configured',
+            canQueue: true,
+            status: 'active',
             season: { Id: 2, DisplayName: 'Burst Season 2026' },
-            message: 'Rated matches are temporarily unavailable while WHR/TST recalculation is being prepared.'
+            message: null
         });
     });
 
-    it('keeps existing season availability blocks unchanged before checking WHR/TST', async () => {
-        mockIsCompetitiveWhrRunnerConfigured.mockReturnValue(false);
+    it('keeps existing season availability blocks unchanged', async () => {
         mockGetSeasonQueueAvailability.mockResolvedValue({
             canQueue: false,
             status: 'scheduled',
