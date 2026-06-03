@@ -86,4 +86,20 @@ describe('competitiveRating rank role assignment', () => {
             id: CONSTANTS.ROLES.SUPERSTAR
         }));
     });
+
+    it('assigns the active Unranked role for placement players at rank 0', async () => {
+        const unrankedRoleId = '1504569388056186901';
+        const bronzeRoleId = '1504566977182699620';
+        const { assignCompRankRoles } = loadServiceWithThresholds([
+            { RankNumber: 0, DiscordRoleId: unrankedRoleId },
+            { RankNumber: 1, DiscordRoleId: bronzeRoleId }
+        ]);
+        const { client, member, removed, added } = createClientWithMember([bronzeRoleId]);
+
+        await assignCompRankRoles(client, 'guild-1', 'discord-1', 0);
+
+        expect(removed).toEqual([bronzeRoleId]);
+        expect(added).toEqual([unrankedRoleId]);
+        expect(member.roles.add).toHaveBeenCalledWith(unrankedRoleId);
+    });
 });

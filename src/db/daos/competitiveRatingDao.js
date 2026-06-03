@@ -649,12 +649,14 @@ class CompetitiveRatingDao {
 
     async getBestCompletedOneVOneRank(playerId, seasonId) {
         const result = await executeQuery(
-            `SELECT MAX(RankNumber) AS HighestRank
+            `SELECT COALESCE(MAX(CASE
+                        WHEN PlacementComplete = 1 THEN RankNumber
+                        ELSE 0
+                    END), 0) AS HighestRank
              FROM ${T.rating}
              WHERE PlayerId = @playerId
                AND SeasonId = @seasonId
-               AND ModeCode = '1v1'
-               AND PlacementComplete = 1`,
+               AND ModeCode = '1v1'`,
             { playerId, seasonId }
         );
         return result.recordset[0]?.HighestRank ?? 0;
