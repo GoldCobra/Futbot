@@ -480,6 +480,7 @@ class CompetitiveWhrSyncDao {
     }
 
     async _mirrorSinglesMatch(transaction, match, participants) {
+        // Robotic Nightmare's head-to-head commands read the legacy match tables.
         const existing = await this._findExistingSinglesMirror(transaction, match, participants);
         if (existing) {
             return { legacyMatchId: existing };
@@ -570,6 +571,7 @@ class CompetitiveWhrSyncDao {
     }
 
     async _mirrorDoublesMatch(transaction, match, participants) {
+        // Robotic Nightmare's head-to-head commands read the legacy match tables.
         const existing = await this._findExistingDoublesMirror(transaction, match, participants);
         if (existing) {
             return { legacyMultiMatchId: existing };

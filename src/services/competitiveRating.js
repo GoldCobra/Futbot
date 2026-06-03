@@ -1,10 +1,12 @@
 const CompetitiveRatingDao = require('../db/daos/competitiveRatingDao');
 const CompetitiveWhrSyncDao = require('../db/daos/competitiveWhrSyncDao');
+const CONSTANTS = require('../utils/constants');
 const { getKFactor, ELO_DIVISOR } = require('../utils/competitiveConstants');
 
 const dao = new CompetitiveRatingDao();
 const whrSyncDao = new CompetitiveWhrSyncDao();
 const RANK_THRESHOLD_CACHE_MS = 5 * 60_000;
+const LEGACY_RANK_ROLE_IDS = new Set((CONSTANTS.LEGACY_RANK_ROLE_IDS ?? []).map(String));
 let rankThresholdCache = {
     expiresAt: 0,
     rows: null
@@ -53,8 +55,11 @@ async function assignCompRankRoles(client, guildId, discordId, highestRank) {
         const thresholds = await getCachedRankThresholds();
         const compRoleIds = thresholds
             .map(row => row.DiscordRoleId)
-            .filter(Boolean);
-        const roleId = thresholds.find(row => Number(row.RankNumber) === Number(highestRank))?.DiscordRoleId ?? null;
+            .filter(roleId => roleId && !LEGACY_RANK_ROLE_IDS.has(String(roleId)));
+        const targetRoleId = thresholds.find(row => Number(row.RankNumber) === Number(highestRank))?.DiscordRoleId ?? null;
+        const roleId = targetRoleId && !LEGACY_RANK_ROLE_IDS.has(String(targetRoleId))
+            ? targetRoleId
+            : null;
         if (!compRoleIds.length) return;
 
         const guild = await client.guilds.fetch(guildId).catch(() => null);
