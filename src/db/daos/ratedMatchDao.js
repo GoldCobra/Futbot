@@ -339,17 +339,57 @@ class RatedMatchDao {
                 : this._getParticipantId(matchId, confirmedByDiscordId)
         ]);
 
-        await executeQuery(
-            `INSERT INTO ${T.ratedGame} (
-                RatedMatchId, GameNumber, WinnerTeamNumber, HomeTeamNumber,
-                StadiumCode, CaptainCode, ReportedByParticipantId, ConfirmedByParticipantId,
-                ReportedAtUtc, ConfirmedAtUtc
-             )
-             VALUES (
-                @matchId, @gameNumber, @winnerTeamNumber, @homeTeamNumber,
-                @stadiumCode, @captainCode, @reportedByParticipantId, @confirmedByParticipantId,
-                SYSUTCDATETIME(), SYSUTCDATETIME()
-             )`,
+        const result = await executeQuery(
+            `SET XACT_ABORT ON;
+             BEGIN TRY
+                BEGIN TRANSACTION;
+
+                DECLARE @ExistingId INT;
+                SELECT TOP 1 @ExistingId = Id
+                FROM ${T.ratedGame} WITH (UPDLOCK, HOLDLOCK)
+                WHERE RatedMatchId = @matchId
+                  AND GameNumber = @gameNumber;
+
+                IF @ExistingId IS NOT NULL
+                BEGIN
+                    IF EXISTS (
+                        SELECT 1
+                        FROM ${T.ratedGame}
+                        WHERE Id = @ExistingId
+                          AND WinnerTeamNumber = @winnerTeamNumber
+                          AND HomeTeamNumber = @homeTeamNumber
+                          AND ISNULL(StadiumCode, '') = ISNULL(@stadiumCode, '')
+                          AND ISNULL(CaptainCode, '') = ISNULL(@captainCode, '')
+                    )
+                    BEGIN
+                        SELECT @ExistingId AS Id, CAST(0 AS BIT) AS Inserted;
+                    END
+                    ELSE
+                    BEGIN
+                        THROW 51020, 'RatedMatchGame already exists with different result data.', 1;
+                    END
+                END
+                ELSE
+                BEGIN
+                    INSERT INTO ${T.ratedGame} (
+                        RatedMatchId, GameNumber, WinnerTeamNumber, HomeTeamNumber,
+                        StadiumCode, CaptainCode, ReportedByParticipantId, ConfirmedByParticipantId,
+                        ReportedAtUtc, ConfirmedAtUtc
+                    )
+                    OUTPUT INSERTED.Id, CAST(1 AS BIT) AS Inserted
+                    VALUES (
+                        @matchId, @gameNumber, @winnerTeamNumber, @homeTeamNumber,
+                        @stadiumCode, @captainCode, @reportedByParticipantId, @confirmedByParticipantId,
+                        SYSUTCDATETIME(), SYSUTCDATETIME()
+                    );
+                END
+
+                COMMIT TRANSACTION;
+             END TRY
+             BEGIN CATCH
+                IF @@TRANCOUNT > 0 ROLLBACK TRANSACTION;
+                THROW;
+             END CATCH`,
             {
                 matchId,
                 gameNumber,
@@ -361,6 +401,7 @@ class RatedMatchDao {
                 confirmedByParticipantId: resolvedConfirmedByParticipantId ?? null
             }
         );
+        return result.recordset[0] ?? null;
     }
 
     async completeMatch({ matchCode, team1Score, team2Score, winnerTeamNumber, homeTeamNumber, awayTeamNumber }) {

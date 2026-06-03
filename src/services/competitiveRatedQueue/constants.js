@@ -115,7 +115,7 @@ const SCORE_EMOJIS = {
     1: '<:rm1:1501918592017371167>',
     2: '<:rm2:1501918611177214082>'
 };
-const MATCH_TIMEOUT_PHASES = new Set(['start', 'game', 'loser_confirmation']);
+const MATCH_TIMEOUT_PHASES = new Set(['start', 'game', 'loser_confirmation', 'loser_advantage']);
 const LOSER_CHOICE_TIMEOUT_MINUTES = 2;
 const SELECTION_TIMEOUT_MINUTES = 2;
 const STADIUM_DISPLAY_OVERRIDES = { 'Lava Pit': 'The Lava Pit' };

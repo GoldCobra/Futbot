@@ -1221,7 +1221,7 @@ function clearMatchTimers(match) {
 
 function getMatchTimeoutMinutes(phase) {
     if (phase === 'game') return CONFIG.MATCH_GAME_TIMEOUT_MINUTES;
-    if (phase === 'loser_confirmation') return LOSER_CHOICE_TIMEOUT_MINUTES;
+    if (phase === 'loser_confirmation' || phase === 'loser_advantage') return LOSER_CHOICE_TIMEOUT_MINUTES;
     return CONFIG.MATCH_START_TIMEOUT_MINUTES;
 }
 
@@ -1237,9 +1237,9 @@ function scheduleMatchTimeout(match, phase, client) {
     match.timeoutPhase = phase;
     match.timeoutDeadlineAt = deadlineAt;
 
-    const callback = phase === 'loser_confirmation'
+    const callback = phase === 'loser_confirmation' || phase === 'loser_advantage'
         ? () => resolveLoserConfirmationIfTimedOut(match.id, phase, client).catch(err => {
-            console.error(`Competitive match loser_confirmation timeout failed: ${err.message}`);
+            console.error(`Competitive match ${phase} timeout failed: ${err.message}`);
             logRatedError(client, match, 'match.timeout_failed', err, getMatchLogDetails(match, { phase }));
         })
         : () => cancelMatchIfTimedOut(match.id, phase, client).catch(err => {
@@ -3345,7 +3345,10 @@ async function handleLoserConfirm(interaction, match) {
         if (isMatchComplete) {
             match.loserAdvantagePromptShown = true;
             const winnerMention = getPendingResultWinnerMention(match);
-            await recordConfirmedGameResult(match, interaction.client, interaction.user.id);
+            if (!await recordConfirmedGameResult(match, interaction.client, interaction.user.id)) {
+                await interaction.deleteReply().catch(() => {});
+                return;
+            }
             clearPendingResult(match);
             await interaction.deleteReply().catch(() => {});
             await completeMatch(match, winnerMention, interaction.client);
@@ -3358,7 +3361,10 @@ async function handleLoserConfirm(interaction, match) {
 
         const confirmedResultMessage = renderNoSetupGameResultMessage(match, '');
         match.loserAdvantagePromptShown = true;
-        await recordConfirmedGameResult(match, interaction.client, interaction.user.id);
+        if (!await recordConfirmedGameResult(match, interaction.client, interaction.user.id)) {
+            await interaction.deleteReply().catch(() => {});
+            return;
+        }
         clearPendingResult(match);
         match.startClickedUserIds = [];
         match.stage = 'awaiting_winner';
@@ -3384,7 +3390,10 @@ async function handleLoserConfirm(interaction, match) {
     if (isMatchComplete) {
         match.loserAdvantagePromptShown = true;
         const winnerMention = getPendingResultWinnerMention(match);
-        await recordConfirmedGameResult(match, interaction.client, interaction.user.id);
+        if (!await recordConfirmedGameResult(match, interaction.client, interaction.user.id)) {
+            await interaction.deleteReply().catch(() => {});
+            return;
+        }
         await clearWinnerWaitingPrompt(match);
         clearPendingResult(match);
         await interaction.deleteReply().catch(() => {});
@@ -3398,8 +3407,11 @@ async function handleLoserConfirm(interaction, match) {
 
     const thread = await interaction.client.channels.fetch(match.threadId).catch(() => null);
     await clearCurrentControlMessage(match, interaction.client, null, thread);
-    await recordConfirmedGameResult(match, interaction.client, interaction.user.id);
-    scheduleMatchTimeout(match, 'loser_confirmation', interaction.client);
+    if (!await recordConfirmedGameResult(match, interaction.client, interaction.user.id)) {
+        await interaction.deleteReply().catch(() => {});
+        return;
+    }
+    scheduleMatchTimeout(match, 'loser_advantage', interaction.client);
     const advantagePromptContent = renderTimedMessage(
         'Choose your advantage for the next game:',
         match.timeoutDeadlineAt,
@@ -3535,6 +3547,8 @@ async function resolveLoserConfirmationIfTimedOut(matchId, phase, client) {
     const lockKey = `match:${matchId}`;
     await withOperationQueue(lockKey, async () => {
         if (!state.activeMatchesById.has(matchId) || match.stage !== 'awaiting_loser_confirmation') return;
+        const advantagePromptAlreadyShown = phase === 'loser_advantage' || match.loserAdvantagePromptShown;
+        if (phase === 'loser_advantage' && !match.loserAdvantagePromptShown) return;
 
         if (!requiresSetup(match.gameType)) {
             const loserMention = match.teams[match.loserTeamIndex - 1].repMention;
@@ -3542,7 +3556,7 @@ async function resolveLoserConfirmationIfTimedOut(matchId, phase, client) {
             const isMatchComplete = match.score.team1 >= match.firstTo || match.score.team2 >= match.firstTo;
             if (isMatchComplete) {
                 const winnerMention = getPendingResultWinnerMention(match);
-                await recordConfirmedGameResult(match, client, null);
+                if (!await recordConfirmedGameResult(match, client, null)) return;
                 clearPendingResult(match);
                 match.loserAdvantagePromptShown = true;
                 await completeMatch(match, winnerMention, client);
@@ -3557,7 +3571,7 @@ async function resolveLoserConfirmationIfTimedOut(matchId, phase, client) {
                 match,
                 `${loserMention} did not confirm in time — proceeding to the next game.`
             );
-            await recordConfirmedGameResult(match, client, null);
+            if (!await recordConfirmedGameResult(match, client, null)) return;
             clearPendingResult(match);
             match.loserAdvantagePromptShown = false;
             match.startClickedUserIds = [];
@@ -3581,7 +3595,7 @@ async function resolveLoserConfirmationIfTimedOut(matchId, phase, client) {
         match.selectedStadium = options.stadiums[Math.floor(Math.random() * options.stadiums.length)];
         match.selectedCaptain = options.captains[Math.floor(Math.random() * options.captains.length)];
         await clearWinnerWaitingPrompt(match);
-        await recordConfirmedGameResult(match, client, null);
+        if (!advantagePromptAlreadyShown && !await recordConfirmedGameResult(match, client, null)) return;
         storeDelayedGameResult(match, timedOutGameNumber, winnerMention);
         clearPendingResult(match);
         match.loserAdvantagePromptShown = false;

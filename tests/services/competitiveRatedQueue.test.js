@@ -2713,6 +2713,61 @@ describe('competitiveRatedQueue', () => {
         )).toBe(0);
     });
 
+    it('does not record the same game again when the loser advantage prompt times out', async () => {
+        jest.useFakeTimers({ doNotFake: ['performance'] });
+        jest.setSystemTime(1_000_000);
+        const randomSpy = jest.spyOn(Math, 'random').mockReturnValue(0.5);
+
+        try {
+            const { client, thread } = createMatchClientMock();
+            const match = createMatchFixture({
+                stage: 'awaiting_winner'
+            });
+            competitiveRatedQueue.__seedStateForTests({
+                activeMatches: [match],
+                cachedOptionsByGameType: { MSC: createMatchOptions() }
+            });
+
+            await competitiveRatedQueue.handleInteraction(createButtonInteractionMock({
+                customId: 'rated:competitive:match:winner:match-1:1',
+                userId: 'home-user',
+                client
+            }));
+            const confirmPayload = findThreadPayload(thread, payload =>
+                getButtonComponents(payload).some(component => component.label === 'Confirm Game Loss')
+            );
+
+            await competitiveRatedQueue.handleInteraction(createButtonInteractionMock({
+                customId: getButtonCustomIdByLabel(confirmPayload, 'Confirm Game Loss'),
+                userId: 'away-user',
+                client
+            }));
+
+            expect(mockRatedMatchDao.recordGame).toHaveBeenCalledTimes(1);
+            expect(match.timeoutPhase).toBe('loser_advantage');
+            expect(match.loserAdvantagePromptShown).toBe(true);
+
+            jest.advanceTimersByTime(2 * 60_000 + 1);
+            await flushAsyncTasks();
+            await flushAsyncTasks();
+
+            expect(mockRatedMatchDao.recordGame).toHaveBeenCalledTimes(1);
+            expect(match.stage).toBe('awaiting_winner');
+            expect(match.timeoutPhase).toBe('game');
+            expect(countThreadPayloads(thread, payload =>
+                payload.content?.includes('Competitive game write failed')
+            )).toBe(0);
+            expect(findThreadPayload(thread, payload => payload.content?.includes('wins **Game 1**'))).toBeDefined();
+            expect(findThreadPayload(thread, payload =>
+                getButtonComponents(payload).some(component => component.label === 'GAME WIN')
+            )).toBeDefined();
+        } finally {
+            randomSpy.mockRestore();
+            competitiveRatedQueue.__resetState();
+            jest.useRealTimers();
+        }
+    });
+
     it('falls back to a new private follow-up when the loser advantage prompt cannot reuse the old ephemeral message', async () => {
         const warnSpy = jest.spyOn(console, 'warn').mockImplementation(() => {});
         try {
