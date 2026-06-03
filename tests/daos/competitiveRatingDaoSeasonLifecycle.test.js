@@ -13,6 +13,7 @@ jest.mock('../../src/db/sqlClient', () => ({
 }));
 
 const CompetitiveRatingDao = require('../../src/db/daos/competitiveRatingDao');
+const { executeQuery } = require('../../src/db/sqlClient');
 
 function createActivationTransactionMock() {
     const calls = [];
@@ -91,5 +92,66 @@ describe('CompetitiveRatingDao season activation', () => {
         expect(queries.some(query => (
             query.includes('INSERT INTO') && query.includes('CompetitiveSeasonMatchSequence')
         ))).toBe(true);
+    });
+});
+
+describe('CompetitiveRatingDao season queue availability', () => {
+    beforeEach(() => {
+        executeQuery.mockReset();
+        jest.useFakeTimers({ doNotFake: ['performance'] });
+    });
+
+    afterEach(() => {
+        jest.useRealTimers();
+    });
+
+    it('blocks queueing when an active season has not reached StartDateUtc yet', async () => {
+        jest.setSystemTime(new Date('2026-06-03T12:00:00.000Z'));
+        executeQuery.mockResolvedValueOnce({
+            recordset: [{
+                Id: 2,
+                SeasonNumber: 1,
+                DisplayName: 'Burst Season 2026',
+                StartDateUtc: '2026-06-04T08:00:00.000Z',
+                EndDateUtc: '2026-09-02T08:00:00.000Z',
+                IsActive: true,
+                IsCompleted: false,
+                LifecycleStatus: 'active'
+            }]
+        });
+
+        const dao = new CompetitiveRatingDao();
+
+        await expect(dao.getSeasonQueueAvailability()).resolves.toEqual(expect.objectContaining({
+            canQueue: false,
+            status: 'scheduled',
+            message: 'Season has not started yet. Rated matches open soon.'
+        }));
+        expect(executeQuery).toHaveBeenCalledTimes(1);
+    });
+
+    it('allows queueing when an active season is within its scheduled window', async () => {
+        jest.setSystemTime(new Date('2026-06-04T08:00:01.000Z'));
+        const season = {
+            Id: 2,
+            SeasonNumber: 1,
+            DisplayName: 'Burst Season 2026',
+            StartDateUtc: '2026-06-04T08:00:00.000Z',
+            EndDateUtc: '2026-09-02T08:00:00.000Z',
+            IsActive: true,
+            IsCompleted: false,
+            LifecycleStatus: 'active'
+        };
+        executeQuery.mockResolvedValueOnce({ recordset: [season] });
+
+        const dao = new CompetitiveRatingDao();
+
+        await expect(dao.getSeasonQueueAvailability()).resolves.toEqual({
+            canQueue: true,
+            status: 'active',
+            season,
+            message: null
+        });
+        expect(executeQuery).toHaveBeenCalledTimes(1);
     });
 });

@@ -139,13 +139,26 @@ class CompetitiveRatingDao {
              ORDER BY CASE WHEN LifecycleStatus = 'active' THEN 0 ELSE 1 END, Id DESC`
         );
         const season = current.recordset[0];
-        if (season?.LifecycleStatus === 'active' && season.IsActive && new Date(season.EndDateUtc).getTime() > Date.now()) {
-            return {
-                canQueue: true,
-                status: 'active',
-                season,
-                message: null
-            };
+        if (season?.LifecycleStatus === 'active' && season.IsActive) {
+            const now = Date.now();
+            const startsAt = new Date(season.StartDateUtc).getTime();
+            const endsAt = new Date(season.EndDateUtc).getTime();
+            if (startsAt <= now && endsAt > now) {
+                return {
+                    canQueue: true,
+                    status: 'active',
+                    season,
+                    message: null
+                };
+            }
+            if (startsAt > now) {
+                return {
+                    canQueue: false,
+                    status: 'scheduled',
+                    season,
+                    message: 'Season has not started yet. Rated matches open soon.'
+                };
+            }
         }
         if (season?.LifecycleStatus === 'ending' || season) {
             return {
