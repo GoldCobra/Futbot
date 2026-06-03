@@ -2085,6 +2085,7 @@ describe('competitiveRatedQueue', () => {
 
         await competitiveRatedQueue.__tickForTests(client);
 
+        expect(mockRatedMatchDao.recordGame).toHaveBeenCalledTimes(1);
         expect(findThreadPayload(thread, payload => payload.content?.includes('WINS THE MATCH'))).toBeDefined();
         expect(threadHasImagePayload(thread, 'g2.png')).toBe(false);
         expect(competitiveRatedQueue.__getStateSnapshot().activeMatchCount).toBe(0);
@@ -2713,7 +2714,7 @@ describe('competitiveRatedQueue', () => {
         )).toBe(0);
     });
 
-    it('does not record the same game again when the loser advantage prompt times out', async () => {
+    it.each(['MSC', 'SMS'])('does not record the same %s game again when the loser advantage prompt times out', async (gameType) => {
         jest.useFakeTimers({ doNotFake: ['performance'] });
         jest.setSystemTime(1_000_000);
         const randomSpy = jest.spyOn(Math, 'random').mockReturnValue(0.5);
@@ -2721,11 +2722,12 @@ describe('competitiveRatedQueue', () => {
         try {
             const { client, thread } = createMatchClientMock();
             const match = createMatchFixture({
+                gameType,
                 stage: 'awaiting_winner'
             });
             competitiveRatedQueue.__seedStateForTests({
                 activeMatches: [match],
-                cachedOptionsByGameType: { MSC: createMatchOptions() }
+                cachedOptionsByGameType: { [gameType]: createMatchOptions() }
             });
 
             await competitiveRatedQueue.handleInteraction(createButtonInteractionMock({
@@ -2761,6 +2763,62 @@ describe('competitiveRatedQueue', () => {
             expect(findThreadPayload(thread, payload =>
                 getButtonComponents(payload).some(component => component.label === 'GAME WIN')
             )).toBeDefined();
+        } finally {
+            randomSpy.mockRestore();
+            competitiveRatedQueue.__resetState();
+            jest.useRealTimers();
+        }
+    });
+
+    it('routes loser advantage timeouts through tick without cancelling the match or duplicating the saved game', async () => {
+        jest.useFakeTimers({ doNotFake: ['performance'] });
+        jest.setSystemTime(1_000_000);
+        const randomSpy = jest.spyOn(Math, 'random').mockReturnValue(0.5);
+
+        try {
+            const { client, thread } = createMatchClientMock();
+            const match = createMatchFixture({
+                gameType: 'SMS',
+                stage: 'awaiting_winner'
+            });
+            competitiveRatedQueue.__seedStateForTests({
+                activeMatches: [match],
+                cachedOptionsByGameType: { SMS: createMatchOptions() }
+            });
+
+            await competitiveRatedQueue.handleInteraction(createButtonInteractionMock({
+                customId: 'rated:competitive:match:winner:match-1:1',
+                userId: 'home-user',
+                client
+            }));
+            const confirmPayload = findThreadPayload(thread, payload =>
+                getButtonComponents(payload).some(component => component.label === 'Confirm Game Loss')
+            );
+
+            await competitiveRatedQueue.handleInteraction(createButtonInteractionMock({
+                customId: getButtonCustomIdByLabel(confirmPayload, 'Confirm Game Loss'),
+                userId: 'away-user',
+                client
+            }));
+
+            expect(mockRatedMatchDao.recordGame).toHaveBeenCalledTimes(1);
+            expect(match.timeoutPhase).toBe('loser_advantage');
+            clearTimeout(match.timeoutTimer);
+            match.timeoutTimer = null;
+
+            jest.advanceTimersByTime(2 * 60_000 + 1);
+            await competitiveRatedQueue.__tickForTests(client);
+
+            expect(mockRatedMatchDao.recordGame).toHaveBeenCalledTimes(1);
+            expect(competitiveRatedQueue.__getStateSnapshot().activeMatchCount).toBe(1);
+            expect(match.stage).toBe('awaiting_winner');
+            expect(match.timeoutPhase).toBe('game');
+            expect(findThreadPayload(thread, payload =>
+                payload.content?.includes('MATCH CANCELLED DUE TO INACTIVITY')
+            )).toBeUndefined();
+            expect(findThreadPayload(thread, payload =>
+                payload.content?.includes('Competitive game write failed')
+            )).toBeUndefined();
         } finally {
             randomSpy.mockRestore();
             competitiveRatedQueue.__resetState();

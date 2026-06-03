@@ -3892,7 +3892,7 @@ async function tick(client) {
         if (!match.timeoutPhase || now < match.timeoutDeadlineAt) {
             continue;
         }
-        if (match.timeoutPhase === 'loser_confirmation') {
+        if (match.timeoutPhase === 'loser_confirmation' || match.timeoutPhase === 'loser_advantage') {
             await resolveLoserConfirmationIfTimedOut(match.id, match.timeoutPhase, client);
         } else {
             await cancelMatchIfTimedOut(match.id, match.timeoutPhase, client);
@@ -4225,7 +4225,11 @@ async function handleMatchInteraction(interaction) {
         rememberPrivateDeliveryInteraction,
         withInteractionLock,
         handleExpiredMatch: async () => {
-            if (match.timeoutPhase && match.timeoutPhase !== 'loser_confirmation' && Date.now() >= match.timeoutDeadlineAt) {
+            if (
+                match.timeoutPhase
+                && !['loser_confirmation', 'loser_advantage'].includes(match.timeoutPhase)
+                && Date.now() >= match.timeoutDeadlineAt
+            ) {
                 await ensureDeferredUpdate(interaction);
                 await cancelMatchForInactivity(match, match.timeoutPhase, interaction.client);
                 return true;
