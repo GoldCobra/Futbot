@@ -1627,7 +1627,7 @@ describe('competitiveRatedQueue', () => {
             expect(findThreadPayload(thread, payload => payload.components?.[0]?.toJSON().components[0].label === 'GAME WIN'))
                 .toBeDefined();
 
-            jest.advanceTimersByTime(20 * 60_000);
+            jest.advanceTimersByTime(30 * 60_000);
             await competitiveRatedQueue.__tickForTests(client);
             await flushAsyncTasks();
 
@@ -1947,7 +1947,7 @@ describe('competitiveRatedQueue', () => {
             expect(winnerPayload).toBeDefined();
             expect(winnerPayload.content).toContain('Press **GAME WIN** when the game is over.');
             expect(winnerPayload.content).toContain('Time remaining:');
-            expect(winnerPayload.content).toContain(relativeTimestamp(2_200_000));
+            expect(winnerPayload.content).toContain(relativeTimestamp(2_800_000));
             expect(threadHasPublicSelectionButtons(thread)).toBe(false);
             expect(competitiveRatedQueue.__getStateSnapshot().activeMatchCount).toBe(1);
         } finally {
