@@ -201,30 +201,23 @@ async function ignoreMatchInteraction(interaction, match, event, reason, extra =
 }
 
 const SEASON_UNAVAILABLE_MESSAGE = 'Season ended. New Season will start soon.';
+const QUEUE_JOIN_SEASON_UNAVAILABLE_MESSAGE = 'Season has not started yet. Rated matches open soon.';
 
-function buildPanelMessage(channelId = CONFIG.PANEL_CHANNELS[0].channelId, availability = { canQueue: true }) {
-    const queueUnavailable = availability?.canQueue === false;
+function buildPanelMessage(channelId = CONFIG.PANEL_CHANNELS[0].channelId) {
     const row = new ActionRowBuilder().addComponents(
         new ButtonBuilder()
             .setCustomId(panelJoinCustomId(channelId, '1v1'))
             .setLabel('Search 1vs1')
-            .setStyle(ButtonStyle.Primary)
-            .setDisabled(queueUnavailable),
+            .setStyle(ButtonStyle.Primary),
         new ButtonBuilder()
             .setCustomId(panelJoinCustomId(channelId, '2v2'))
             .setLabel('Search 2vs2')
             .setStyle(ButtonStyle.Primary)
-            .setDisabled(queueUnavailable)
     );
 
-    return queueUnavailable
-        ? {
-            content: availability?.message ?? SEASON_UNAVAILABLE_MESSAGE,
-            components: [row]
-        }
-        : {
-            components: [row]
-        };
+    return {
+        components: [row]
+    };
 }
 
 function buildStatusMessageContent(counts) {
@@ -1359,13 +1352,10 @@ async function reconcilePanelChannel(client, panelConfig) {
 
     const counts = buildSearchCounts(channel.id);
     const hasAnySearches = counts['1v1'] > 0 || counts['2v2'] > 0;
-    const availability = await getCurrentQueueAvailability(client, panelConfig);
-    const availabilityKey = availability?.canQueue === false
-        ? `${availability.status}:${availability.message ?? ''}`
-        : 'active';
     const panelIsBootstrapped = panelMeta.imageMessageId && panelMeta.panelMessageId;
-    const needsFullReconcile = !panelIsBootstrapped || hasAnySearches || panelMeta.statusMessageId != null || panelMeta.availabilityKey !== availabilityKey;
+    const needsFullReconcile = !panelIsBootstrapped || hasAnySearches || panelMeta.statusMessageId != null;
     const existingMessages = needsFullReconcile ? await fetchRecentMessages(channel, 100) : [];
+    const deletedMessageIds = new Set();
 
     const panelImagePayload = buildPanelImageMessage(panelConfig);
     let panelImageMessage = findPanelImageMessage(existingMessages, client.user?.id, panelConfig);
@@ -1390,27 +1380,22 @@ async function reconcilePanelChannel(client, panelConfig) {
         }
     }
 
-    const panelPayload = buildPanelMessage(channel.id, availability);
+    const panelPayload = buildPanelMessage(channel.id);
     let panelMessage = findPanelMessage(existingMessages, client.user?.id, channel.id);
     const shouldRecreatePanelMessage = Boolean(
         panelMessage
             && panelImageMessage
             && panelMessage.createdTimestamp < panelImageMessage.createdTimestamp
-    );
+    ) || panelMessageNeedsRecreate(panelMessage);
     if (shouldRecreatePanelMessage) {
         await panelMessage.delete().catch(() => {});
+        deletedMessageIds.add(panelMessage.id);
         panelMessage = null;
         panelMeta.panelMessageId = null;
     }
 
     if (panelMessage) {
         panelMeta.panelMessageId = panelMessage.id;
-        if (panelMeta.availabilityKey !== availabilityKey) {
-            await panelMessage.edit(panelPayload).catch(err => {
-                console.warn(`[RatedQueue] Failed to edit panel buttons in ${channel.id}: ${err.message}`);
-                logRatedWarn(client, panelConfig, 'panel.controls.edit_failed', { channel: channel.id, error: err.message });
-            });
-        }
     } else if (!panelMeta.panelMessageId) {
         try {
             const createdPanelMessage = await channel.send(panelPayload);
@@ -1426,7 +1411,7 @@ async function reconcilePanelChannel(client, panelConfig) {
             return;
         }
     }
-    panelMeta.availabilityKey = availabilityKey;
+    panelMeta.availabilityKey = 'static';
 
     const statusMessage = findStatusMessage(existingMessages, client.user?.id);
     if (hasAnySearches) {
@@ -1460,7 +1445,7 @@ async function reconcilePanelChannel(client, panelConfig) {
         );
     }
 
-    await prunePanelChannelMessages(existingMessages, panelMeta);
+    await prunePanelChannelMessages(existingMessages, panelMeta, deletedMessageIds);
 }
 
 async function fetchPanelMessageById(channel, messageId) {
@@ -1521,7 +1506,7 @@ async function refreshPanelStatus(channelId, client) {
     panelMeta.statusMessageId = null;
 }
 
-async function prunePanelChannelMessages(messages, panelMeta) {
+async function prunePanelChannelMessages(messages, panelMeta, skipMessageIds = new Set()) {
     const keepMessageIds = new Set([
         panelMeta.imageMessageId,
         panelMeta.panelMessageId,
@@ -1529,7 +1514,7 @@ async function prunePanelChannelMessages(messages, panelMeta) {
     ].filter(Boolean));
 
     for (const message of messages) {
-        if (keepMessageIds.has(message.id)) {
+        if (keepMessageIds.has(message.id) || skipMessageIds.has(message.id)) {
             continue;
         }
 
@@ -1607,6 +1592,24 @@ function findPanelMessage(messages, botUserId, channelId) {
             )
         );
     }) ?? null;
+}
+
+function componentIsDisabled(component) {
+    return component?.disabled === true || component?.data?.disabled === true;
+}
+
+function panelMessageNeedsRecreate(message) {
+    if (!message) {
+        return false;
+    }
+
+    if (typeof message.content === 'string' && message.content.trim().length > 0) {
+        return true;
+    }
+
+    return (message.components ?? []).some(row =>
+        (row.components ?? []).some(component => componentIsDisabled(component))
+    );
 }
 
 function findPanelImageMessage(messages, botUserId, panelConfig) {
@@ -1743,7 +1746,7 @@ async function maybeJoinSearch(interaction, panelConfig, mode, durationMinutes, 
     const availability = await getCurrentQueueAvailability(interaction.client, { gameType: panelConfig.gameType, mode });
     if (availability?.canQueue === false) {
         await safeReply(interaction, {
-            content: availability.message ?? SEASON_UNAVAILABLE_MESSAGE,
+            content: QUEUE_JOIN_SEASON_UNAVAILABLE_MESSAGE,
             components: [],
             ephemeral: true
         });

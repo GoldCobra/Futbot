@@ -89,6 +89,11 @@ const mockGetPlayerRating = jest.fn(async (discordId) => {
 });
 const mockGetActiveSeason = jest.fn(async () => ({ Id: 2, DisplayName: 'Burst Season 2026' }));
 const mockGetDefaultCompetitiveRating = jest.fn(async () => 500);
+const mockGetSeasonQueueAvailability = jest.fn(async () => ({
+    canQueue: true,
+    status: 'active',
+    message: null
+}));
 const mockRunPendingCompetitiveWhrRunner = jest.fn(async () => ({
     status: 'idle',
     partitions: [],
@@ -163,7 +168,12 @@ jest.mock('../../src/services/competitiveRating', () => ({
     getPlayerRating: (...args) => mockGetPlayerRating(...args),
     getPlayerRatingForSeason: (...args) => mockGetPlayerRating(...args),
     getActiveSeason: (...args) => mockGetActiveSeason(...args),
-    getDefaultCompetitiveRating: (...args) => mockGetDefaultCompetitiveRating(...args)
+    getDefaultCompetitiveRating: (...args) => mockGetDefaultCompetitiveRating(...args),
+    getSeasonQueueAvailability: (...args) => mockGetSeasonQueueAvailability(...args),
+    recoverPendingCompetitiveWhrSync: jest.fn(async () => []),
+    beginDueSeasonEnding: jest.fn(async () => null),
+    finalizeDueEndingSeason: jest.fn(async () => null),
+    activateDueSeason: jest.fn(async () => null)
 }));
 
 jest.mock('../../src/services/competitiveWhrRunner', () => ({
@@ -796,6 +806,12 @@ describe('competitiveRatedQueue', () => {
         mockGetPlayerRating.mockClear();
         mockGetActiveSeason.mockClear();
         mockGetDefaultCompetitiveRating.mockClear();
+        mockGetSeasonQueueAvailability.mockClear();
+        mockGetSeasonQueueAvailability.mockResolvedValue({
+            canQueue: true,
+            status: 'active',
+            message: null
+        });
         mockRunPendingCompetitiveWhrRunner.mockClear();
         mockRatedMatchDao.createMatchHeader.mockClear();
         mockRatedMatchDao.activateMatch.mockClear();
@@ -824,10 +840,25 @@ describe('competitiveRatedQueue', () => {
         const message = competitiveRatedQueue.buildPanelMessage('1501486517464600657');
         const components = message.components[0].toJSON().components;
 
+        expect(message.content).toBeUndefined();
         expect(components[0].custom_id).toBe('rated:competitive:join:1501486517464600657:1v1');
         expect(components[1].custom_id).toBe('rated:competitive:join:1501486517464600657:2v2');
         expect(components[0].label).toBe('Search 1vs1');
         expect(components[1].label).toBe('Search 2vs2');
+        expect(components[0].disabled).not.toBe(true);
+        expect(components[1].disabled).not.toBe(true);
+    });
+
+    it('keeps panel buttons clickable when queue availability is blocked', () => {
+        const message = competitiveRatedQueue.buildPanelMessage('1501486517464600657', {
+            canQueue: false,
+            message: 'Season has not started yet. Rated matches open soon.'
+        });
+        const components = message.components[0].toJSON().components;
+
+        expect(message.content).toBeUndefined();
+        expect(components[0].disabled).not.toBe(true);
+        expect(components[1].disabled).not.toBe(true);
     });
 
     it('does not edit existing panel image or button messages during reconcile', async () => {
@@ -858,6 +889,75 @@ describe('competitiveRatedQueue', () => {
         expect(smsPanelMessage.edit).not.toHaveBeenCalled();
         expect(msblPanelImageMessage.edit).not.toHaveBeenCalled();
         expect(msblPanelMessage.edit).not.toHaveBeenCalled();
+    });
+
+    it('recreates stale unavailable panel messages instead of editing them', async () => {
+        const { channel, client } = createMatchClientMock();
+        const { panelImageMessage, panelMessage } = createPanelMessageFixtures();
+        panelMessage.content = 'Season has not started yet. Rated matches open soon.';
+        panelMessage.payload = {
+            content: panelMessage.content,
+            components: panelMessage.components
+        };
+        channel.messages.fetch = jest.fn(async arg => {
+            if (typeof arg === 'string') {
+                throw new Error('not found');
+            }
+            return new Map([
+                [panelImageMessage.id, panelImageMessage],
+                [panelMessage.id, panelMessage]
+            ]);
+        });
+
+        await competitiveRatedQueue.ensureCompetitiveRatedQueue(client);
+        competitiveRatedQueue.__resetState();
+
+        expect(panelMessage.edit).not.toHaveBeenCalled();
+        expect(panelMessage.delete).toHaveBeenCalledTimes(1);
+        const sentPanelPayload = channel.send.mock.calls.find(([payload]) =>
+            payload.components?.[0]?.toJSON?.().components?.some(component =>
+                component.custom_id === 'rated:competitive:join:1501486517464600657:1v1'
+            )
+        )?.[0];
+        expect(sentPanelPayload).toEqual(expect.objectContaining({
+            components: expect.any(Array)
+        }));
+        expect(sentPanelPayload.content).toBeUndefined();
+        const sentButtons = sentPanelPayload.components[0].toJSON().components;
+        expect(sentButtons[0].disabled).not.toBe(true);
+        expect(sentButtons[1].disabled).not.toBe(true);
+    });
+
+    it('returns the season-start message on join while keeping panel buttons enabled', async () => {
+        const { client } = createMatchClientMock();
+        mockGetSeasonQueueAvailability.mockResolvedValue({
+            canQueue: false,
+            status: 'scheduled',
+            message: 'Season has not started yet. Rated matches open soon.'
+        });
+        const interaction = createButtonInteractionMock({
+            customId: 'rated:competitive:join:1501486517464600657:1v1',
+            userId: '12345',
+            client
+        });
+
+        await competitiveRatedQueue.handleInteraction(interaction);
+
+        expect(interaction.reply).toHaveBeenCalledWith({
+            content: 'Joining the 1vs1 pool...',
+            components: [],
+            flags: MessageFlags.Ephemeral
+        });
+        expect(interaction.editReply).toHaveBeenCalledWith({
+            content: 'Season has not started yet. Rated matches open soon.',
+            components: [],
+            flags: MessageFlags.Ephemeral
+        });
+        expect(mockExecuteQuery).not.toHaveBeenCalledWith(
+            expect.stringContaining('INSERT INTO dbo.Player'),
+            expect.anything()
+        );
+        expect(competitiveRatedQueue.__getStateSnapshot().activeSearchCount).toBe(0);
     });
 
     it('builds mode-specific leave pool labels', () => {
