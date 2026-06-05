@@ -2526,6 +2526,95 @@ async function closeMatchThread(thread, reason) {
     };
 }
 
+function isUnknownDiscordMessageError(error) {
+    return Number(error?.code) === 10008
+        || Number(error?.rawError?.code) === 10008
+        || String(error?.message ?? '').toLowerCase().includes('unknown message');
+}
+
+async function deleteParentThreadStarterMessage(matchSnapshot, thread, client, source) {
+    const parentChannelId = matchSnapshot.channelId
+        ?? matchSnapshot.panelChannelId
+        ?? thread?.parentId
+        ?? thread?.parent?.id
+        ?? null;
+    const threadId = matchSnapshot.threadId ?? thread?.id ?? null;
+    if (!parentChannelId || !threadId || typeof client?.channels?.fetch !== 'function') {
+        return { deleted: false, skipped: true };
+    }
+
+    const parentChannel = await client.channels.fetch(parentChannelId).catch(error => {
+        logRatedWarn(client, matchSnapshot, 'thread.parent_starter_fetch_channel_failed', getMatchLogDetails(matchSnapshot, {
+            source,
+            channel: parentChannelId,
+            error: formatThreadActionError(error)
+        }));
+        return null;
+    });
+    if (!parentChannel?.messages?.fetch) {
+        return { deleted: false, skipped: true };
+    }
+
+    let directFetchWasUnknown = false;
+    let starterMessage = await parentChannel.messages.fetch(threadId).catch(error => {
+        if (!isUnknownDiscordMessageError(error)) {
+            logRatedWarn(client, matchSnapshot, 'thread.parent_starter_fetch_failed', getMatchLogDetails(matchSnapshot, {
+                source,
+                channel: parentChannelId,
+                message: threadId,
+                error: formatThreadActionError(error)
+            }));
+        } else {
+            directFetchWasUnknown = true;
+        }
+        return null;
+    });
+    if (!starterMessage && directFetchWasUnknown) {
+        const recentMessages = await parentChannel.messages.fetch({ limit: 50 }).catch(error => {
+            logRatedWarn(client, matchSnapshot, 'thread.parent_starter_history_fetch_failed', getMatchLogDetails(matchSnapshot, {
+                source,
+                channel: parentChannelId,
+                message: threadId,
+                error: formatThreadActionError(error)
+            }));
+            return null;
+        });
+        const candidates = recentMessages?.values
+            ? Array.from(recentMessages.values())
+            : Array.isArray(recentMessages)
+            ? recentMessages
+            : [];
+        starterMessage = candidates.find(message =>
+            String(message?.id ?? '') === String(threadId)
+            || String(message?.thread?.id ?? '') === String(threadId)
+        ) ?? null;
+    }
+    if (!starterMessage) {
+        return { deleted: false, missing: true };
+    }
+
+    try {
+        await starterMessage.delete();
+        logRatedInfo(client, matchSnapshot, 'thread.parent_starter_deleted', getMatchLogDetails(matchSnapshot, {
+            source,
+            channel: parentChannelId,
+            message: threadId
+        }));
+        return { deleted: true };
+    } catch (error) {
+        if (!isUnknownDiscordMessageError(error)) {
+            logRatedWarn(client, matchSnapshot, 'thread.parent_starter_delete_failed', getMatchLogDetails(matchSnapshot, {
+                source,
+                channel: parentChannelId,
+                message: threadId,
+                error: formatThreadActionError(error)
+            }));
+            return { deleted: false, error };
+        }
+        return { deleted: false, missing: true };
+    }
+}
+
 async function trySetThreadTerminalName(thread, terminalName) {
     if (!thread?.setName) {
         return { ok: false, error: new Error('setName unavailable') };
@@ -2651,6 +2740,7 @@ function buildCompletedThreadFinalizationSnapshot(match) {
     return {
         id: match.id,
         ratedMatchId: match.ratedMatchId ?? null,
+        channelId: match.channelId,
         threadId: match.threadId,
         threadName: match.threadName,
         gameType: match.gameType,
@@ -2671,6 +2761,7 @@ function buildCompletedThreadFinalizationSnapshotFromDb(row) {
     return {
         id: row.MatchCode,
         ratedMatchId: row.Id,
+        channelId: row.PanelChannelId ? String(row.PanelChannelId) : null,
         threadId: row.ThreadId,
         threadName: null,
         gameType: row.GameType,
@@ -2691,6 +2782,7 @@ function buildCancelledThreadSnapshotFromDb(row) {
     return {
         id: row.MatchCode,
         ratedMatchId: row.Id,
+        channelId: row.PanelChannelId ? String(row.PanelChannelId) : null,
         threadId: row.ThreadId,
         threadName: null,
         gameType: row.GameType,
@@ -2759,6 +2851,7 @@ async function finalizeThreadLifecycle(matchSnapshot, client, {
         const success = closeStatus.archivedOk && closeStatus.lockedOk && renameStatus.renamed;
 
         if (success) {
+            await deleteParentThreadStarterMessage(matchSnapshot, thread, client, source);
             logRatedInfo(client, matchSnapshot, 'thread.closed', getMatchLogDetails(matchSnapshot, {
                 result,
                 source
@@ -2881,6 +2974,7 @@ function buildCompletedThreadFinalizationSnapshotFromReportable(snapshot, finali
     return {
         id: snapshot.id,
         ratedMatchId: snapshot.ratedMatchId ?? null,
+        channelId: snapshot.channelId ?? null,
         threadId: snapshot.threadId,
         threadName: snapshot.threadName,
         gameType: snapshot.gameType,

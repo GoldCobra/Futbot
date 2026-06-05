@@ -470,6 +470,7 @@ class RatedMatchDao {
                     rm.ModeCode,
                     rm.MatchNumber,
                     rm.SeasonMatchNumber,
+                    rm.PanelChannelId,
                     rm.ThreadId,
                     rm.ThreadUrl,
                     rm.Team1Score,

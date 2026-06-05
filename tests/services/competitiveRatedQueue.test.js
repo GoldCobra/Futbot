@@ -380,13 +380,16 @@ function createMatchClientMock() {
                 if (typeof arg === 'string') {
                     const message = sentChannelMessages.get(arg);
                     if (!message) {
-                        throw new Error('not found');
+                        const error = new Error('Unknown Message');
+                        error.code = 10008;
+                        throw error;
                     }
                     return message;
                 }
                 return new Map(sentChannelMessages.entries());
             })
         },
+        __sentMessages: sentChannelMessages,
         permissionOverwrites: {
             edit: jest.fn(async () => {})
         }
@@ -496,6 +499,20 @@ function createThreadMock(id = 'thread-rematch', name = '1v1 #2 | Home VS Away')
         setArchived: jest.fn(async () => thread)
     };
     return thread;
+}
+
+function seedParentThreadStarterMessage(channel, threadId = 'thread-1', messageId = threadId) {
+    const message = {
+        id: messageId,
+        type: 18,
+        thread: { id: threadId },
+        content: `started a thread ${threadId}`,
+        delete: jest.fn(async () => {
+            channel.__sentMessages.delete(messageId);
+        })
+    };
+    channel.__sentMessages.set(messageId, message);
+    return message;
 }
 
 function createButtonInteractionMock({ customId, userId = 'button-user', client, roleIds = [] }) {
@@ -741,6 +758,7 @@ function createMatchFixture(overrides = {}) {
     return {
         id: 'match-1',
         ratedMatchId: 5000,
+        channelId: '1501486517464600657',
         threadId: 'thread-1',
         threadUrl: 'https://discord.com/channels/guild-1/thread-1',
         threadName: '1v1 #1 | Home VS Away',
@@ -3251,7 +3269,8 @@ describe('competitiveRatedQueue', () => {
         let timeoutFired = false;
 
         try {
-            const { client, thread } = createMatchClientMock();
+            const { channel, client, thread } = createMatchClientMock();
+            const parentStarterMessage = seedParentThreadStarterMessage(channel, thread.id);
             const match = createMatchFixture({
                 firstTo: 1,
                 stage: 'awaiting_winner',
@@ -3292,6 +3311,8 @@ describe('competitiveRatedQueue', () => {
             expect(thread.setName).toHaveBeenCalledWith('✅ 1v1 #1 | Home VS Away');
             expectThreadRenameBeforeClose(thread);
             await flushAsyncTasks();
+            expect(parentStarterMessage.delete).toHaveBeenCalled();
+            expect(channel.__sentMessages.has(thread.id)).toBe(false);
             expect(mockRatedMatchDao.markThreadFinalizationSucceeded).toHaveBeenCalledWith({ ratedMatchId: 5000 });
             expect(competitiveRatedQueue.__getStateSnapshot().completedThreadCloseTimerCount).toBe(0);
             expect(competitiveRatedQueue.__getStateSnapshot().pendingCompletedThreadFinalizationCount).toBe(0);
@@ -3438,7 +3459,8 @@ describe('competitiveRatedQueue', () => {
         jest.setSystemTime(1_000_000);
 
         try {
-            const { client, thread } = createMatchClientMock();
+            const { channel, client, thread } = createMatchClientMock();
+            const parentStarterMessage = seedParentThreadStarterMessage(channel, thread.id);
             mockRatedMatchDao.getPendingCompletedThreadFinalizations
                 .mockResolvedValueOnce([{
                     Id: 9001,
@@ -3447,6 +3469,7 @@ describe('competitiveRatedQueue', () => {
                     ModeCode: '1v1',
                     MatchNumber: 1,
                     SeasonMatchNumber: 1,
+                    PanelChannelId: channel.id,
                     ThreadId: 'thread-1',
                     ThreadUrl: 'https://discord.com/channels/guild-1/thread-1',
                     Team1Score: 2,
@@ -3461,6 +3484,7 @@ describe('competitiveRatedQueue', () => {
             expect(thread.setName).toHaveBeenCalledWith('✅ 1v1 #1 | Home VS Away');
             expect(thread.setLocked).toHaveBeenCalledWith(true, 'MSC competitive completed match close delay');
             expect(thread.setArchived).toHaveBeenCalledWith(true, 'MSC competitive completed match close delay');
+            expect(parentStarterMessage.delete).toHaveBeenCalled();
             expect(mockRatedMatchDao.markThreadFinalizationSucceeded).toHaveBeenCalledWith({ ratedMatchId: 9001 });
             expect(competitiveRatedQueue.__getStateSnapshot().pendingCompletedThreadFinalizationCount).toBe(0);
         } finally {
@@ -3558,12 +3582,88 @@ describe('competitiveRatedQueue', () => {
         }
     });
 
+    it('keeps finalization successful when parent starter message delete fails', async () => {
+        jest.useFakeTimers({ doNotFake: ['performance'] });
+        jest.setSystemTime(1_000_000);
+
+        try {
+            const { channel, client, thread } = createMatchClientMock();
+            const parentStarterMessage = seedParentThreadStarterMessage(channel, thread.id);
+            parentStarterMessage.delete.mockRejectedValueOnce(new Error('Missing Permissions'));
+            mockRatedMatchDao.getPendingCompletedThreadFinalizations
+                .mockResolvedValueOnce([{
+                    Id: 9005,
+                    MatchCode: 'db-match-5',
+                    GameType: 'MSC',
+                    ModeCode: '1v1',
+                    MatchNumber: 5,
+                    SeasonMatchNumber: 5,
+                    PanelChannelId: channel.id,
+                    ThreadId: 'thread-1',
+                    ThreadUrl: 'https://discord.com/channels/guild-1/thread-1',
+                    Team1Score: 2,
+                    Team2Score: 0,
+                    CompletedAtUtc: new Date(1_000_000 - 10 * 60_000 - 1_000)
+                }])
+                .mockResolvedValue([]);
+
+            await competitiveRatedQueue.__tickForTests(client);
+            await flushAsyncTasks();
+
+            expect(parentStarterMessage.delete).toHaveBeenCalled();
+            expect(mockRatedMatchDao.markThreadFinalizationSucceeded).toHaveBeenCalledWith({ ratedMatchId: 9005 });
+            expect(mockRatedMatchDao.markThreadFinalizationFailed).not.toHaveBeenCalled();
+            expect(competitiveRatedQueue.__getStateSnapshot().pendingCompletedThreadFinalizationCount).toBe(0);
+        } finally {
+            competitiveRatedQueue.__resetState();
+            jest.useRealTimers();
+        }
+    });
+
+    it('deletes parent starter messages discovered from parent channel history', async () => {
+        jest.useFakeTimers({ doNotFake: ['performance'] });
+        jest.setSystemTime(1_000_000);
+
+        try {
+            const { channel, client, thread } = createMatchClientMock();
+            const parentStarterMessage = seedParentThreadStarterMessage(channel, thread.id, 'starter-message-1');
+            mockRatedMatchDao.getPendingCompletedThreadFinalizations
+                .mockResolvedValueOnce([{
+                    Id: 9006,
+                    MatchCode: 'db-match-6',
+                    GameType: 'MSC',
+                    ModeCode: '1v1',
+                    MatchNumber: 6,
+                    SeasonMatchNumber: 6,
+                    PanelChannelId: channel.id,
+                    ThreadId: 'thread-1',
+                    ThreadUrl: 'https://discord.com/channels/guild-1/thread-1',
+                    Team1Score: 2,
+                    Team2Score: 0,
+                    CompletedAtUtc: new Date(1_000_000 - 10 * 60_000 - 1_000)
+                }])
+                .mockResolvedValue([]);
+
+            await competitiveRatedQueue.__tickForTests(client);
+            await flushAsyncTasks();
+
+            expect(parentStarterMessage.delete).toHaveBeenCalledTimes(1);
+            expect(channel.__sentMessages.has('starter-message-1')).toBe(false);
+            expect(mockRatedMatchDao.markThreadFinalizationSucceeded).toHaveBeenCalledWith({ ratedMatchId: 9006 });
+            expect(mockRatedMatchDao.markThreadFinalizationFailed).not.toHaveBeenCalled();
+        } finally {
+            competitiveRatedQueue.__resetState();
+            jest.useRealTimers();
+        }
+    });
+
     it('marks an already locked and archived completed thread as finalized without extra Discord mutations', async () => {
         jest.useFakeTimers({ doNotFake: ['performance'] });
         jest.setSystemTime(1_000_000);
 
         try {
-            const { client, thread } = createMatchClientMock();
+            const { channel, client, thread } = createMatchClientMock();
+            const parentStarterMessage = seedParentThreadStarterMessage(channel, thread.id);
             thread.name = '✅ 1v1 #1 | Home VS Away';
             thread.locked = true;
             thread.archived = true;
@@ -3574,6 +3674,7 @@ describe('competitiveRatedQueue', () => {
                 ModeCode: '1v1',
                 MatchNumber: 4,
                 SeasonMatchNumber: 4,
+                PanelChannelId: channel.id,
                 ThreadId: 'thread-1',
                 ThreadUrl: 'https://discord.com/channels/guild-1/thread-1',
                 Team1Score: 2,
@@ -3587,6 +3688,7 @@ describe('competitiveRatedQueue', () => {
             expect(thread.setName).not.toHaveBeenCalled();
             expect(thread.setLocked).not.toHaveBeenCalled();
             expect(thread.setArchived).not.toHaveBeenCalled();
+            expect(parentStarterMessage.delete).toHaveBeenCalledTimes(1);
             expect(mockRatedMatchDao.markThreadFinalizationSucceeded).toHaveBeenCalledWith({ ratedMatchId: 9004 });
             expect(competitiveRatedQueue.__getStateSnapshot().pendingCompletedThreadFinalizationCount).toBe(0);
         } finally {
@@ -3743,6 +3845,7 @@ describe('competitiveRatedQueue', () => {
             jest.advanceTimersByTime(5 * 60_000);
             await flushAsyncTasks();
             await flushAsyncTasks();
+            await flushAsyncTasks();
 
             expect(channel.threads.create).not.toHaveBeenCalled();
             expect(thread.setName).toHaveBeenCalledWith('✅ 1v1 #1 | Home VS Away');
@@ -3767,6 +3870,8 @@ describe('competitiveRatedQueue', () => {
         try {
             const { channel, client, thread } = createMatchClientMock();
             const rematchThread = createThreadMock('thread-rematch', '1v1 #2 | Home VS Away');
+            const parentStarterMessage = seedParentThreadStarterMessage(channel, thread.id);
+            const rematchStarterMessage = seedParentThreadStarterMessage(channel, rematchThread.id);
             channel.threads.create.mockResolvedValueOnce(rematchThread);
             const match = createMatchFixture({
                 firstTo: 1,
@@ -3820,6 +3925,9 @@ describe('competitiveRatedQueue', () => {
             expect(rematchThread.members.add).toHaveBeenCalledWith('away-user');
             expect(thread.setLocked).toHaveBeenCalledWith(true, 'MSC competitive completed match close delay');
             expect(thread.setArchived).toHaveBeenCalledWith(true, 'MSC competitive completed match close delay');
+            expect(parentStarterMessage.delete).toHaveBeenCalledTimes(1);
+            expect(rematchStarterMessage.delete).not.toHaveBeenCalled();
+            expect(channel.__sentMessages.has(rematchThread.id)).toBe(true);
             const requesterPayload = requestRematch.editReply.mock.calls.at(-1)[0];
             const confirmerPayload = confirmRematch.editReply.mock.calls.at(-1)[0];
             expect(requesterPayload.content).toContain('<@home-user> VS <@away-user>');
