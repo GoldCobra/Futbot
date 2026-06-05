@@ -29,7 +29,7 @@ futbot: [
         'directories': [
             {
                 'name': 'general',
-                'include': ['gear', 'gearrules', 'ratedreset', 'ratedsetup']
+                'include': ['gear', 'gearrules', 'ratedreset', 'ratedsetup', 'report1v1', 'report2v2']
             }
         ],
         'areTopLevelCommands': true

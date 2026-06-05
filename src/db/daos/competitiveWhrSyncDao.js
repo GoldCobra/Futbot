@@ -318,6 +318,64 @@ class CompetitiveWhrSyncDao {
         }
     }
 
+    async linkExistingLegacyMirror({ ratedMatchId, legacyMatchId = null, legacyMultiMatchId = null }) {
+        if (!ratedMatchId) return null;
+        if (!legacyMatchId && !legacyMultiMatchId) {
+            throw new Error(`Cannot link WHR/TST sync for RatedMatch ${ratedMatchId}: no legacy match id provided`);
+        }
+
+        const pool = await getPool();
+        const transaction = new sql.Transaction(pool);
+        await transaction.begin(sql.ISOLATION_LEVEL.SERIALIZABLE);
+
+        try {
+            const match = await this._getCompletedMatchForUpdate(transaction, ratedMatchId);
+            if (!match) {
+                await transaction.commit();
+                return null;
+            }
+
+            let sync = await this._getSyncForUpdate(transaction, ratedMatchId);
+            if (!sync) {
+                sync = await this._insertPendingSync(transaction, match);
+            }
+
+            if (sync.SyncStatus === 'rolled_back') {
+                await transaction.commit();
+                return normalizeSyncRow(sync);
+            }
+
+            const result = await runRequest(
+                transaction,
+                `UPDATE ${T.whrSync}
+                 SET SyncStatus = 'synced',
+                     LegacyMatchId = COALESCE(LegacyMatchId, @legacyMatchId),
+                     LegacyMultiMatchId = COALESCE(LegacyMultiMatchId, @legacyMultiMatchId),
+                     WhrRunnerStatus = 'pending_external_runner',
+                     WhrRunnerRequestedAtUtc = SYSUTCDATETIME(),
+                     SyncedAtUtc = COALESCE(SyncedAtUtc, SYSUTCDATETIME()),
+                     LastAttemptAtUtc = SYSUTCDATETIME(),
+                     AttemptCount = AttemptCount + 1,
+                     LastError = NULL,
+                     UpdatedAtUtc = SYSUTCDATETIME()
+                 OUTPUT INSERTED.*
+                 WHERE Id = @syncId`,
+                {
+                    syncId: sync.Id,
+                    legacyMatchId,
+                    legacyMultiMatchId
+                }
+            );
+
+            await transaction.commit();
+            return normalizeSyncRow(result.recordset[0]);
+        } catch (err) {
+            await transaction.rollback().catch(() => {});
+            await this._markFailed(ratedMatchId, err).catch(() => {});
+            throw err;
+        }
+    }
+
     async markRolledBack({ ratedMatchId }) {
         if (!ratedMatchId) return null;
 

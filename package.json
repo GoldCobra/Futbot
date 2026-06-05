@@ -29,6 +29,8 @@
     "discord.js": "14.26.3",
     "dotenv": "^10.0.0",
     "embed-table": "^4.2.3",
+    "graphql": "^16.14.1",
+    "graphql-request": "^6.1.0",
     "mssql": "^7.2.1",
     "multimap": "^1.1.0"
   },

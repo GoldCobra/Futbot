@@ -127,7 +127,8 @@ async function recordCompetitiveResult({
     homeTeamNumber,
     awayTeamNumber,
     client,
-    guildId
+    guildId,
+    skipWhrSync = false
 }) {
     const season = seasonId
         ? await dao.getSeasonById(seasonId)
@@ -150,7 +151,9 @@ async function recordCompetitiveResult({
     if (mode === '1v1') {
         scheduleOneVOneRankRoleUpdate(changes, season.Id, client, guildId);
     }
-    scheduleCompetitiveWhrSync(ratedMatchId);
+    if (!skipWhrSync) {
+        scheduleCompetitiveWhrSync(ratedMatchId);
+    }
 
     return {
         seasonName: season.DisplayName,
