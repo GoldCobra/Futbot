@@ -446,6 +446,58 @@ function createMatchClientMock() {
     return { channel, client, issueSupportChannel, logThreads, thread };
 }
 
+function createThreadMock(id = 'thread-rematch', name = '1v1 #2 | Home VS Away') {
+    let threadMessageCounter = 0;
+    const sentThreadMessages = new Map();
+    const thread = {
+        id,
+        name,
+        url: `https://discord.com/channels/guild-1/${id}`,
+        send: jest.fn(async payload => {
+            const message = {
+                id: `${id}-message-${++threadMessageCounter}`,
+                payload,
+                content: payload.content,
+                components: payload.components,
+                edit: jest.fn(async nextPayload => {
+                    message.payload = {
+                        ...message.payload,
+                        ...nextPayload
+                    };
+                    message.content = message.payload.content;
+                    message.components = message.payload.components;
+                    return message;
+                }),
+                delete: jest.fn(async () => {
+                    sentThreadMessages.delete(message.id);
+                })
+            };
+            sentThreadMessages.set(message.id, message);
+            return message;
+        }),
+        messages: {
+            fetch: jest.fn(async messageId => {
+                const message = sentThreadMessages.get(messageId);
+                if (!message) {
+                    throw new Error('not found');
+                }
+                return message;
+            })
+        },
+        __sentMessages: sentThreadMessages,
+        members: {
+            add: jest.fn(async () => {})
+        },
+        setName: jest.fn(async nextName => {
+            thread.name = nextName;
+            return thread;
+        }),
+        setLocked: jest.fn(async () => thread),
+        setArchived: jest.fn(async () => thread)
+    };
+    return thread;
+}
+
 function createButtonInteractionMock({ customId, userId = 'button-user', client, roleIds = [] }) {
     const interaction = {
         customId,
@@ -3233,7 +3285,7 @@ describe('competitiveRatedQueue', () => {
             expect(thread.setArchived).not.toHaveBeenCalled();
             expect(thread.setName).not.toHaveBeenCalled();
 
-            jest.advanceTimersByTime(180_000);
+            jest.advanceTimersByTime(10 * 60_000);
             await flushAsyncTasks();
             expect(thread.setLocked).toHaveBeenCalledWith(true, 'MSC competitive completed match close delay');
             expect(thread.setArchived).toHaveBeenCalledWith(true, 'MSC competitive completed match close delay');
@@ -3282,7 +3334,7 @@ describe('competitiveRatedQueue', () => {
                 client
             }));
 
-            jest.advanceTimersByTime(3 * 60_000);
+            jest.advanceTimersByTime(10 * 60_000);
             await flushAsyncTasks();
             await competitiveRatedQueue.__tickForTests(client);
             await flushAsyncTasks();
@@ -3341,7 +3393,7 @@ describe('competitiveRatedQueue', () => {
                 client
             }));
 
-            jest.advanceTimersByTime(3 * 60_000);
+            jest.advanceTimersByTime(10 * 60_000);
             await flushAsyncTasks();
             await competitiveRatedQueue.__tickForTests(client);
             await flushAsyncTasks();
@@ -3399,7 +3451,7 @@ describe('competitiveRatedQueue', () => {
                     ThreadUrl: 'https://discord.com/channels/guild-1/thread-1',
                     Team1Score: 2,
                     Team2Score: 0,
-                    CompletedAtUtc: new Date(1_000_000 - 181_000)
+                    CompletedAtUtc: new Date(1_000_000 - 10 * 60_000 - 1_000)
                 }])
                 .mockResolvedValue([]);
 
@@ -3435,7 +3487,7 @@ describe('competitiveRatedQueue', () => {
                     ThreadUrl: 'https://discord.com/channels/guild-1/thread-1',
                     Team1Score: 2,
                     Team2Score: 1,
-                    CompletedAtUtc: new Date(1_000_000 - 120_000)
+                    CompletedAtUtc: new Date(1_000_000 - 9 * 60_000)
                 }])
                 .mockResolvedValue([]);
 
@@ -3489,7 +3541,7 @@ describe('competitiveRatedQueue', () => {
                 ThreadUrl: 'https://discord.com/channels/guild-1/thread-1',
                 Team1Score: 2,
                 Team2Score: 0,
-                CompletedAtUtc: new Date(1_000_000 - 181_000)
+                CompletedAtUtc: new Date(1_000_000 - 10 * 60_000 - 1_000)
             }]);
 
             await competitiveRatedQueue.__tickForTests(client);
@@ -3526,7 +3578,7 @@ describe('competitiveRatedQueue', () => {
                 ThreadUrl: 'https://discord.com/channels/guild-1/thread-1',
                 Team1Score: 2,
                 Team2Score: 0,
-                CompletedAtUtc: new Date(1_000_000 - 181_000)
+                CompletedAtUtc: new Date(1_000_000 - 10 * 60_000 - 1_000)
             }]);
 
             await competitiveRatedQueue.__tickForTests(client);
@@ -3584,6 +3636,8 @@ describe('competitiveRatedQueue', () => {
             threadPayloadHasFile(payload, 'sep.png')
         );
         const reportCustomId = getButtonCustomIdByLabel(reportPayload, 'Report Issue');
+        const finalButtonLabels = getButtonComponents(reportPayload).map(component => component.label);
+        expect(finalButtonLabels).toEqual(['Rematch', 'Report Issue']);
         expect(reportCustomId).toBe('rated:competitive:match:report_issue:match-1');
         expect(winnerPayload.content).toContain('WINS THE MATCH');
         expect(winnerPayload.content).toContain('Result:');
@@ -3631,6 +3685,310 @@ describe('competitiveRatedQueue', () => {
         expect(issueSupportChannel.threads.create).toHaveBeenCalledTimes(1);
         expect(duplicateReportInteraction.editReply).not.toHaveBeenCalled();
         expect(duplicateReportInteraction.deleteReply).toHaveBeenCalled();
+    });
+
+    it('keeps completed threads open for 10 minutes and closes after an unconfirmed rematch timeout', async () => {
+        jest.useFakeTimers({ doNotFake: ['performance'] });
+        jest.setSystemTime(1_000_000);
+
+        try {
+            const { channel, client, thread } = createMatchClientMock();
+            const match = createMatchFixture({
+                firstTo: 1,
+                stage: 'awaiting_winner'
+            });
+            competitiveRatedQueue.__seedStateForTests({
+                activeMatches: [match],
+                cachedOptionsByGameType: { MSC: createMatchOptions() }
+            });
+
+            await competitiveRatedQueue.handleInteraction(createButtonInteractionMock({
+                customId: 'rated:competitive:match:winner:match-1:1',
+                userId: 'home-user',
+                client
+            }));
+            const confirmPayload = findThreadPayload(thread, payload =>
+                getButtonComponents(payload).some(component => component.label === 'Confirm Game Loss')
+            );
+            await competitiveRatedQueue.handleInteraction(createButtonInteractionMock({
+                customId: getButtonCustomIdByLabel(confirmPayload, 'Confirm Game Loss'),
+                userId: 'away-user',
+                client
+            }));
+
+            const finalPayload = findThreadPayload(thread, payload =>
+                getButtonComponents(payload).some(component => component.label === 'Rematch')
+            );
+            const rematchCustomId = getButtonCustomIdByLabel(finalPayload, 'Rematch');
+            expect(competitiveRatedQueue.__getStateSnapshot().completedThreadCloseTimerCount).toBe(1);
+
+            const rematchRequest = createButtonInteractionMock({
+                customId: rematchCustomId,
+                userId: 'home-user',
+                client
+            });
+            await competitiveRatedQueue.handleInteraction(rematchRequest);
+
+            expect(competitiveRatedQueue.__getStateSnapshot()).toEqual(expect.objectContaining({
+                pendingRematchCount: 1,
+                rematchInitiatorCount: 1,
+                rematchTimerCount: 1,
+                completedThreadCloseTimerCount: 0
+            }));
+            expect(competitiveRatedQueue.getCompetitiveRatedBusyReason('home-user'))
+                .toBe('You are waiting for a rematch confirmation.');
+            expect(findThreadPayload(thread, payload => payload.content?.includes('requested a rematch')).content)
+                .toContain('<@away-user>, press **Rematch**');
+
+            jest.advanceTimersByTime(5 * 60_000);
+            await flushAsyncTasks();
+            await flushAsyncTasks();
+
+            expect(channel.threads.create).not.toHaveBeenCalled();
+            expect(thread.setName).toHaveBeenCalledWith('✅ 1v1 #1 | Home VS Away');
+            expect(thread.setLocked).toHaveBeenCalledWith(true, 'MSC competitive completed match close delay');
+            expect(thread.setArchived).toHaveBeenCalledWith(true, 'MSC competitive completed match close delay');
+            expect(competitiveRatedQueue.__getStateSnapshot()).toEqual(expect.objectContaining({
+                pendingRematchCount: 0,
+                rematchInitiatorCount: 0,
+                rematchTimerCount: 0,
+                pendingCompletedThreadFinalizationCount: 0
+            }));
+        } finally {
+            competitiveRatedQueue.__resetState();
+            jest.useRealTimers();
+        }
+    });
+
+    it('starts a 1v1 rematch with the same first-to and closes the completed thread immediately', async () => {
+        jest.useFakeTimers({ doNotFake: ['performance'] });
+        jest.setSystemTime(1_000_000);
+
+        try {
+            const { channel, client, thread } = createMatchClientMock();
+            const rematchThread = createThreadMock('thread-rematch', '1v1 #2 | Home VS Away');
+            channel.threads.create.mockResolvedValueOnce(rematchThread);
+            const match = createMatchFixture({
+                firstTo: 1,
+                stage: 'awaiting_winner'
+            });
+            competitiveRatedQueue.__seedStateForTests({
+                activeMatches: [match],
+                cachedOptionsByGameType: { MSC: createMatchOptions() }
+            });
+
+            await competitiveRatedQueue.handleInteraction(createButtonInteractionMock({
+                customId: 'rated:competitive:match:winner:match-1:1',
+                userId: 'home-user',
+                client
+            }));
+            const confirmPayload = findThreadPayload(thread, payload =>
+                getButtonComponents(payload).some(component => component.label === 'Confirm Game Loss')
+            );
+            await competitiveRatedQueue.handleInteraction(createButtonInteractionMock({
+                customId: getButtonCustomIdByLabel(confirmPayload, 'Confirm Game Loss'),
+                userId: 'away-user',
+                client
+            }));
+            const finalPayload = findThreadPayload(thread, payload =>
+                getButtonComponents(payload).some(component => component.label === 'Rematch')
+            );
+            const rematchCustomId = getButtonCustomIdByLabel(finalPayload, 'Rematch');
+
+            await competitiveRatedQueue.handleInteraction(createButtonInteractionMock({
+                customId: rematchCustomId,
+                userId: 'home-user',
+                client
+            }));
+            const confirmRematch = createButtonInteractionMock({
+                customId: rematchCustomId,
+                userId: 'away-user',
+                client
+            });
+            await competitiveRatedQueue.handleInteraction(confirmRematch);
+
+            expect(channel.threads.create).toHaveBeenCalledWith(expect.objectContaining({
+                type: ChannelType.PublicThread,
+                reason: 'MSC Competitive Rated match'
+            }));
+            expect(mockRatedMatchDao.createMatchHeader).toHaveBeenCalledWith(expect.objectContaining({
+                firstTo: 1,
+                modeCode: '1v1'
+            }));
+            expect(rematchThread.members.add).toHaveBeenCalledWith('home-user');
+            expect(rematchThread.members.add).toHaveBeenCalledWith('away-user');
+            expect(thread.setLocked).toHaveBeenCalledWith(true, 'MSC competitive completed match close delay');
+            expect(thread.setArchived).toHaveBeenCalledWith(true, 'MSC competitive completed match close delay');
+            expect(confirmRematch.editReply.mock.calls.at(-1)[0].content)
+                .toContain('https://discord.com/channels/guild-1/thread-rematch');
+            expect(competitiveRatedQueue.__getStateSnapshot()).toEqual(expect.objectContaining({
+                pendingRematchCount: 0,
+                rematchInitiatorCount: 0,
+                rematchTimerCount: 0
+            }));
+        } finally {
+            competitiveRatedQueue.__resetState();
+            jest.useRealTimers();
+        }
+    });
+
+    it('rejects rematch clicks from nonparticipants even when they are admins', async () => {
+        const { client } = createMatchClientMock();
+        competitiveRatedQueue.__seedStateForTests({
+            reportableMatches: [{
+                id: 'match-1',
+                ratedMatchId: 5000,
+                mode: '1v1',
+                gameType: 'MSC',
+                channelId: '1501486517464600657',
+                threadId: 'thread-1',
+                threadName: '✅ 1v1 #1 | Home VS Away',
+                threadUrl: 'https://discord.com/channels/guild-1/thread-1',
+                firstTo: 1,
+                completedAtMs: Date.now(),
+                threadFinalizedAt: null,
+                participants: [
+                    { id: 'home-user', mention: '<@home-user>', username: 'Home', teamNumber: 1, isRepresentative: true },
+                    { id: 'away-user', mention: '<@away-user>', username: 'Away', teamNumber: 2, isRepresentative: true }
+                ],
+                participantIds: ['home-user', 'away-user']
+            }]
+        });
+
+        const interaction = createButtonInteractionMock({
+            customId: 'rated:competitive:match:rematch:match-1',
+            userId: 'admin-user',
+            roleIds: [ADMIN_ROLE_ID],
+            client
+        });
+        await competitiveRatedQueue.handleInteraction(interaction);
+
+        expect(interaction.editReply.mock.calls.at(-1)[0].content)
+            .toBe('Only players from this match can request a rematch.');
+        expect(competitiveRatedQueue.__getStateSnapshot().pendingRematchCount).toBe(0);
+    });
+
+    it('rejects stale rematch clicks after thread finalization', async () => {
+        const { client } = createMatchClientMock();
+        competitiveRatedQueue.__seedStateForTests({
+            reportableMatches: [{
+                id: 'match-1',
+                ratedMatchId: 5000,
+                mode: '1v1',
+                gameType: 'MSC',
+                channelId: '1501486517464600657',
+                threadId: 'thread-1',
+                threadName: '✅ 1v1 #1 | Home VS Away',
+                threadUrl: 'https://discord.com/channels/guild-1/thread-1',
+                firstTo: 1,
+                completedAtMs: Date.now(),
+                threadFinalizedAt: new Date().toISOString(),
+                participants: [
+                    { id: 'home-user', mention: '<@home-user>', username: 'Home', teamNumber: 1, isRepresentative: true },
+                    { id: 'away-user', mention: '<@away-user>', username: 'Away', teamNumber: 2, isRepresentative: true }
+                ],
+                participantIds: ['home-user', 'away-user']
+            }]
+        });
+
+        const interaction = createButtonInteractionMock({
+            customId: 'rated:competitive:match:rematch:match-1',
+            userId: 'home-user',
+            client
+        });
+        await competitiveRatedQueue.handleInteraction(interaction);
+
+        expect(interaction.editReply.mock.calls.at(-1)[0].content)
+            .toBe('Rematch is no longer available for this match.');
+        expect(competitiveRatedQueue.__getStateSnapshot().pendingRematchCount).toBe(0);
+    });
+
+    it('allows only original 2v2 representatives to start a same-team rematch', async () => {
+        jest.useFakeTimers({ doNotFake: ['performance'] });
+        jest.setSystemTime(1_000_000);
+
+        try {
+            const { channel, client, thread } = createMatchClientMock();
+            const rematchThread = createThreadMock('thread-rematch-2v2', '2v2 #2 | Home Rep + Home Mate VS Away Rep + Away Mate');
+            channel.threads.create.mockResolvedValueOnce(rematchThread);
+            const snapshot = {
+                id: 'match-2v2',
+                ratedMatchId: 6000,
+                mode: '2v2',
+                gameType: 'MSC',
+                channelId: '1501486517464600657',
+                threadId: 'thread-1',
+                threadName: '✅ 2v2 #1 | Home Rep + Home Mate VS Away Rep + Away Mate',
+                threadUrl: 'https://discord.com/channels/guild-1/thread-1',
+                firstTo: 2,
+                completedAtMs: Date.now(),
+                threadFinalizedAt: null,
+                participants: [
+                    { id: 'home-rep', mention: '<@home-rep>', username: 'Home Rep', teamNumber: 1, isRepresentative: true },
+                    { id: 'home-mate', mention: '<@home-mate>', username: 'Home Mate', teamNumber: 1, isRepresentative: false },
+                    { id: 'away-rep', mention: '<@away-rep>', username: 'Away Rep', teamNumber: 2, isRepresentative: true },
+                    { id: 'away-mate', mention: '<@away-mate>', username: 'Away Mate', teamNumber: 2, isRepresentative: false }
+                ],
+                participantIds: ['home-rep', 'home-mate', 'away-rep', 'away-mate']
+            };
+            competitiveRatedQueue.__seedStateForTests({
+                reportableMatches: [snapshot],
+                pendingCompletedThreadFinalizations: [{
+                    id: 'match-2v2',
+                    ratedMatchId: 6000,
+                    threadId: 'thread-1',
+                    threadName: snapshot.threadName,
+                    gameType: 'MSC',
+                    mode: '2v2',
+                    stage: 'complete',
+                    finalizeAfterAt: Date.now() + 10 * 60_000
+                }]
+            });
+
+            const nonRep = createButtonInteractionMock({
+                customId: 'rated:competitive:match:rematch:match-2v2',
+                userId: 'home-mate',
+                client
+            });
+            await competitiveRatedQueue.handleInteraction(nonRep);
+            expect(nonRep.editReply.mock.calls.at(-1)[0].content)
+                .toBe('Only the team representatives from this match can request a 2v2 rematch.');
+
+            await competitiveRatedQueue.handleInteraction(createButtonInteractionMock({
+                customId: 'rated:competitive:match:rematch:match-2v2',
+                userId: 'home-rep',
+                client
+            }));
+            const awayRepConfirm = createButtonInteractionMock({
+                customId: 'rated:competitive:match:rematch:match-2v2',
+                userId: 'away-rep',
+                client
+            });
+            await competitiveRatedQueue.handleInteraction(awayRepConfirm);
+
+            expect(mockRatedMatchDao.createMatchHeader).toHaveBeenCalledWith(expect.objectContaining({
+                firstTo: 2,
+                modeCode: '2v2'
+            }));
+            const participants = mockRatedMatchDao.activateMatch.mock.calls.at(-1)[0].participants;
+            expect(participants).toEqual([
+                expect.objectContaining({ discordId: 'home-rep', teamNumber: 1, isRepresentative: true }),
+                expect.objectContaining({ discordId: 'home-mate', teamNumber: 1, isRepresentative: false }),
+                expect.objectContaining({ discordId: 'away-rep', teamNumber: 2, isRepresentative: true }),
+                expect.objectContaining({ discordId: 'away-mate', teamNumber: 2, isRepresentative: false })
+            ]);
+            expect(rematchThread.members.add).toHaveBeenCalledWith('home-rep');
+            expect(rematchThread.members.add).toHaveBeenCalledWith('home-mate');
+            expect(rematchThread.members.add).toHaveBeenCalledWith('away-rep');
+            expect(rematchThread.members.add).toHaveBeenCalledWith('away-mate');
+            expect(thread.setLocked).toHaveBeenCalledWith(true, 'MSC competitive completed match close delay');
+            expect(thread.setArchived).toHaveBeenCalledWith(true, 'MSC competitive completed match close delay');
+            expect(awayRepConfirm.editReply.mock.calls.at(-1)[0].content)
+                .toContain('https://discord.com/channels/guild-1/thread-rematch-2v2');
+        } finally {
+            competitiveRatedQueue.__resetState();
+            jest.useRealTimers();
+        }
     });
 
     it('rebuilds report issue snapshots from the database after restart', async () => {

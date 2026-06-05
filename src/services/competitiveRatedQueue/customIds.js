@@ -40,6 +40,10 @@ function reportIssueCustomId(matchId) {
     return `${CONFIG.PREFIX}:match:report_issue:${matchId}`;
 }
 
+function rematchCustomId(matchId) {
+    return `${CONFIG.PREFIX}:match:rematch:${matchId}`;
+}
+
 function startSetupCustomId(matchId, gameNumber = null) {
     return joinParts([CONFIG.PREFIX, 'match', 'start', matchId, gameNumber]);
 }
@@ -100,6 +104,7 @@ module.exports = {
     parseModeFromCustomId,
     parseOptionValueFromCustomId,
     reportIssueCustomId,
+    rematchCustomId,
     stadiumButtonCustomId,
     startSetupCustomId,
     winnerButtonCustomId

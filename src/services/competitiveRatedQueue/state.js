@@ -8,6 +8,9 @@ const state = {
     activeMatchesByThreadId: new Map(),
     activeMatchesByUserId: new Map(),
     reportableMatchesById: new Map(),
+    pendingRematchesByMatchId: new Map(),
+    rematchInitiatorsByUserId: new Map(),
+    rematchTimersByMatchId: new Map(),
     completedThreadCloseTimersByMatchId: new Map(),
     pendingCompletedThreadFinalizationsByMatchId: new Map(),
     cachedOptionsByGameType: new Map(),
@@ -57,10 +60,41 @@ function clearPendingCompletedThreadFinalizations() {
     state.pendingCompletedThreadFinalizationsByMatchId.clear();
 }
 
+function clearRematchTimer(matchId) {
+    const timer = state.rematchTimersByMatchId.get(matchId);
+    if (timer) {
+        clearTimeout(timer);
+        state.rematchTimersByMatchId.delete(matchId);
+    }
+}
+
+function clearPendingRematch(matchId) {
+    const pending = state.pendingRematchesByMatchId.get(matchId);
+    clearRematchTimer(matchId);
+    if (pending?.initiatorId) {
+        state.rematchInitiatorsByUserId.delete(pending.initiatorId);
+    }
+    state.pendingRematchesByMatchId.delete(matchId);
+}
+
+function clearPendingRematches() {
+    for (const matchId of state.pendingRematchesByMatchId.keys()) {
+        clearPendingRematch(matchId);
+    }
+    for (const timer of state.rematchTimersByMatchId.values()) {
+        clearTimeout(timer);
+    }
+    state.rematchTimersByMatchId.clear();
+    state.rematchInitiatorsByUserId.clear();
+}
+
 module.exports = {
     clearCompletedThreadCloseTimer,
     clearCompletedThreadCloseTimers,
     clearPendingCompletedThreadFinalizations,
+    clearPendingRematch,
+    clearPendingRematches,
+    clearRematchTimer,
     state,
     withInteractionLock,
     withOperationQueue

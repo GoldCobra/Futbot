@@ -47,6 +47,7 @@ const {
     MSC_CAPTAIN_BUTTON_ORDER,
     PANEL_BYPASS_ROLES,
     PLAYER_COUNT_EMOJI,
+    REMATCH_CONFIRM_TIMEOUT_MS,
     RULES_IMAGE_PATHS_BY_GAME_TYPE,
     SCORE_EMOJIS,
     SELECTION_TIMEOUT_MINUTES,
@@ -67,6 +68,7 @@ const {
     parseModeFromCustomId,
     parseOptionValueFromCustomId,
     reportIssueCustomId,
+    rematchCustomId,
     stadiumButtonCustomId,
     startSetupCustomId,
     winnerButtonCustomId
@@ -86,6 +88,9 @@ const {
     clearCompletedThreadCloseTimer,
     clearCompletedThreadCloseTimers,
     clearPendingCompletedThreadFinalizations,
+    clearPendingRematch,
+    clearPendingRematches,
+    clearRematchTimer,
     state,
     withInteractionLock,
     withOperationQueue
@@ -162,6 +167,10 @@ function getModeCompactLabel(mode) {
 
 function getPanelConfigByChannelId(channelId) {
     return CONFIG.PANEL_CHANNELS.find(panel => panel.channelId === channelId) ?? null;
+}
+
+function getPanelConfigByGameType(gameType) {
+    return CONFIG.PANEL_CHANNELS.find(panel => panel.gameType === gameType) ?? null;
 }
 
 function isManagedPanelChannel(channelId) {
@@ -839,8 +848,12 @@ function buildStartPayload(match) {
     });
 }
 
-function buildReportIssueButton(matchId) {
+function buildFinalMatchActionRow(matchId) {
     return new ActionRowBuilder().addComponents(
+        new ButtonBuilder()
+            .setCustomId(rematchCustomId(matchId))
+            .setLabel('Rematch')
+            .setStyle(ButtonStyle.Primary),
         new ButtonBuilder()
             .setCustomId(reportIssueCustomId(matchId))
             .setLabel('Report Issue')
@@ -850,7 +863,7 @@ function buildReportIssueButton(matchId) {
 
 function buildFinalMatchComponents(match) {
     return isReportableMatch(match)
-        ? [buildReportIssueButton(match.id)]
+        ? [buildFinalMatchActionRow(match.id)]
         : [];
 }
 
@@ -1150,6 +1163,10 @@ function getCompetitiveRatedBusyReason(userId) {
 
     if (state.activeMatchesByUserId.has(userId)) {
         return 'You are already in an active match thread.';
+    }
+
+    if (state.rematchInitiatorsByUserId.has(userId)) {
+        return 'You are waiting for a rematch confirmation.';
     }
 
     return null;
@@ -1986,7 +2003,11 @@ async function tryCreateMatches(channelId, client) {
     });
 }
 
-async function createCompetitiveRatedMatch(panelConfig, searches, client, { skipReconcile = false } = {}) {
+async function createCompetitiveRatedMatch(panelConfig, searches, client, {
+    skipReconcile = false,
+    firstToOverride = null,
+    teamsOverride = null
+} = {}) {
     const matchId = createId();
     if (!reserveSearchesForMatch(searches, matchId)) {
         logRatedWarn(client, { gameType: panelConfig.gameType, mode: searches[0]?.mode }, 'match.create_skipped', {
@@ -2007,8 +2028,10 @@ async function createCompetitiveRatedMatch(panelConfig, searches, client, { skip
         return null;
     }
 
-    const teams = searches[0].mode === '1v1' ? buildSinglesTeams(searches) : buildDoublesTeams(searches);
-    const firstTo = searches[0].mode === '1v1'
+    const teams = teamsOverride ?? (searches[0].mode === '1v1' ? buildSinglesTeams(searches) : buildDoublesTeams(searches));
+    const firstTo = firstToOverride != null && Number.isFinite(Number(firstToOverride))
+        ? Number(firstToOverride)
+        : searches[0].mode === '1v1'
         ? computeFirstTo(
             searches[0].options.minBestOf,
             searches[0].options.maxBestOf,
@@ -2775,6 +2798,8 @@ async function finalizeCompletedThreadIfDue(matchId, client, source = 'timer') {
     if (result.success) {
         try {
             await ratedMatchDao.markThreadFinalizationSucceeded({ ratedMatchId: pending.ratedMatchId });
+            markReportableMatchThreadFinalized(matchId);
+            clearPendingRematch(matchId);
             clearCompletedThreadFinalization(matchId);
         } catch (error) {
             logRatedError(client, pending, 'rated_match.thread_finalize_mark_success_failed', error, getMatchLogDetails(pending));
@@ -2825,6 +2850,258 @@ function scheduleCompletedThreadClose(match, client) {
         'completion'
     );
 }
+
+function markReportableMatchThreadFinalized(matchId) {
+    const snapshot = state.reportableMatchesById.get(matchId);
+    if (snapshot) {
+        snapshot.threadFinalizedAt = new Date().toISOString();
+    }
+}
+
+function getSnapshotCompletedAtMs(snapshot) {
+    if (Number.isFinite(snapshot?.completedAtMs)) {
+        return Number(snapshot.completedAtMs);
+    }
+    const ms = new Date(snapshot?.completedAtUtc ?? snapshot?.completedAt ?? Date.now()).getTime();
+    return Number.isFinite(ms) ? ms : Date.now();
+}
+
+function getCompletedThreadOriginalFinalizeAt(snapshot) {
+    return getSnapshotCompletedAtMs(snapshot) + COMPLETED_THREAD_CLOSE_DELAY_MS;
+}
+
+function isRematchWindowOpen(snapshot) {
+    if (!snapshot?.threadId || snapshot.threadFinalizedAt) {
+        return false;
+    }
+    return Date.now() <= getCompletedThreadOriginalFinalizeAt(snapshot);
+}
+
+function buildCompletedThreadFinalizationSnapshotFromReportable(snapshot, finalizeAfterAt = Date.now()) {
+    return {
+        id: snapshot.id,
+        ratedMatchId: snapshot.ratedMatchId ?? null,
+        threadId: snapshot.threadId,
+        threadName: snapshot.threadName,
+        gameType: snapshot.gameType,
+        mode: snapshot.mode,
+        score: snapshot.score ? { ...snapshot.score } : null,
+        stage: 'complete',
+        finalizeAfterAt
+    };
+}
+
+function setCompletedThreadFinalizationDeadline(snapshot, finalizeAfterAt) {
+    const existing = state.pendingCompletedThreadFinalizationsByMatchId.get(snapshot.id)
+        ?? buildCompletedThreadFinalizationSnapshotFromReportable(snapshot, finalizeAfterAt);
+    existing.finalizeAfterAt = finalizeAfterAt;
+    state.pendingCompletedThreadFinalizationsByMatchId.set(snapshot.id, existing);
+    clearCompletedThreadCloseTimer(snapshot.id);
+    return existing;
+}
+
+function restoreCompletedThreadFinalization(snapshot, client, source = 'rematch_restore') {
+    scheduleCompletedThreadFinalization(
+        buildCompletedThreadFinalizationSnapshotFromReportable(
+            snapshot,
+            Math.max(Date.now(), getCompletedThreadOriginalFinalizeAt(snapshot))
+        ),
+        client,
+        source
+    );
+}
+
+async function finalizeCompletedThreadFromSnapshot(snapshot, client, source = 'rematch') {
+    const pending = setCompletedThreadFinalizationDeadline(snapshot, Date.now());
+    const result = await finalizeCompletedThreadIfDue(pending.id, client, source);
+    if (result) {
+        markReportableMatchThreadFinalized(pending.id);
+    }
+    return result;
+}
+
+function getSnapshotParticipants(snapshot) {
+    return Array.isArray(snapshot?.participants) ? snapshot.participants : [];
+}
+
+function findSnapshotParticipant(snapshot, userId) {
+    return getSnapshotParticipants(snapshot).find(participant => participant.id === userId) ?? null;
+}
+
+function isEligibleRematchParticipant(snapshot, participant) {
+    if (!participant) return false;
+    if (snapshot.mode === '2v2') {
+        return participant.isRepresentative === true;
+    }
+    return true;
+}
+
+function getRequiredRematchResponders(snapshot, initiatorParticipant) {
+    return getSnapshotParticipants(snapshot)
+        .filter(participant => isEligibleRematchParticipant(snapshot, participant))
+        .filter(participant => Number(participant.teamNumber) !== Number(initiatorParticipant.teamNumber));
+}
+
+function getRematchParticipantIds(snapshot) {
+    return [...new Set(getSnapshotParticipants(snapshot).map(participant => participant.id).filter(Boolean))];
+}
+
+function getRematchFirstTo(snapshot) {
+    const firstTo = Number(snapshot?.firstTo);
+    return Number.isFinite(firstTo) && firstTo > 0 ? firstTo : 2;
+}
+
+function getRematchBestOf(firstTo) {
+    return Math.max(1, (Number(firstTo) * 2) - 1);
+}
+
+function getRematchPanelConfig(snapshot) {
+    return getPanelConfigByChannelId(snapshot?.channelId)
+        ?? getPanelConfigByGameType(snapshot?.gameType);
+}
+
+function renderRematchWaitingMessage(snapshot, initiatorParticipant, requiredResponders, expiresAt) {
+    const requiredMentions = requiredResponders.map(participant => participant.mention ?? `<@${participant.id}>`).join(' ');
+    const initiatorMention = initiatorParticipant.mention ?? `<@${initiatorParticipant.id}>`;
+    return renderTimedMessage(
+        `${initiatorMention} requested a rematch.\n${requiredMentions}, press **Rematch** to start a new match.`,
+        expiresAt,
+        '**5 minutes**'
+    );
+}
+
+function buildRematchSearch(participant, panelConfig, mode, firstTo, ratingProfile) {
+    const now = Date.now();
+    const bestOf = getRematchBestOf(firstTo);
+    return {
+        id: createId(),
+        channelId: panelConfig.channelId,
+        gameType: panelConfig.gameType,
+        mode,
+        userId: participant.id,
+        mention: participant.mention ?? `<@${participant.id}>`,
+        notificationInteraction: null,
+        username: participant.username ?? participant.id,
+        createdAt: now,
+        durationMinutes: DEFAULT_POOL_DURATION_MINUTES,
+        expiresAt: now + DEFAULT_POOL_DURATION_MINUTES * 60000,
+        warningAt: now + Math.max(DEFAULT_POOL_DURATION_MINUTES - CONFIG.EXPIRING_SOON_MINUTES, 0) * 60000,
+        hasWarnedExpiry: false,
+        matchedThreadUrl: null,
+        warningMessage: null,
+        warningMessageId: null,
+        warningToken: null,
+        options: {
+            minBestOf: bestOf,
+            maxBestOf: bestOf,
+            threshold: null
+        },
+        ratingProfile
+    };
+}
+
+async function buildRematchSearches(snapshot, panelConfig) {
+    const firstTo = getRematchFirstTo(snapshot);
+    const searches = [];
+    for (const participant of getSnapshotParticipants(snapshot)) {
+        const ratingProfile = await getPlayerQueueProfile(
+            participant.id,
+            snapshot.gameType,
+            snapshot.mode,
+            participant.username ?? participant.id
+        );
+        searches.push(buildRematchSearch(participant, panelConfig, snapshot.mode, firstTo, ratingProfile));
+    }
+    return searches;
+}
+
+function buildFixedRematchTeams(snapshot, searches) {
+    const searchesByUserId = new Map(searches.map(search => [search.userId, search]));
+    return [1, 2].map(teamNumber => {
+        const teamParticipants = getSnapshotParticipants(snapshot)
+            .filter(participant => Number(participant.teamNumber) === teamNumber);
+        if (teamParticipants.length === 0) {
+            throw new Error(`Cannot build rematch team ${teamNumber}: no participants found.`);
+        }
+
+        const members = teamParticipants.map(participant => {
+            const search = searchesByUserId.get(participant.id);
+            if (!search) {
+                throw new Error(`Cannot build rematch team ${teamNumber}: missing search for ${participant.id}.`);
+            }
+            return {
+                id: search.userId,
+                mention: search.mention,
+                username: search.username,
+                ratingProfile: {
+                    ...search.ratingProfile
+                }
+            };
+        });
+        const repParticipant = teamParticipants.find(participant => participant.isRepresentative === true)
+            ?? teamParticipants[0];
+        const repSearch = searchesByUserId.get(repParticipant.id);
+        return {
+            teamIndex: teamNumber,
+            members,
+            memberIds: members.map(member => member.id),
+            repUserId: repSearch.userId,
+            repMention: repSearch.mention
+        };
+    });
+}
+
+async function closeActiveSearchesForRematch(userIds, client) {
+    const affectedChannels = new Set();
+    for (const userId of userIds) {
+        const search = state.activeSearchesByUserId.get(userId);
+        if (!search?.id || !state.activeSearchesById.has(search.id)) {
+            continue;
+        }
+        affectedChannels.add(search.channelId);
+        await closeSearch(search, 'rematch', client);
+    }
+    for (const channelId of affectedChannels) {
+        schedulePanelStatusRefresh(channelId, client);
+    }
+}
+
+function getActiveMatchUserId(userIds) {
+    return userIds.find(userId => state.activeMatchesByUserId.has(userId)) ?? null;
+}
+
+function scheduleRematchTimeout(pending, client) {
+    clearRematchTimer(pending.matchId);
+    const delayMs = Math.max(pending.expiresAt - Date.now(), 0);
+    const timer = setTimeout(() => {
+        expirePendingRematch(pending.matchId, client).catch(error => {
+            logRatedError(client, pending.snapshot, 'rematch.timeout_failed', error, getMatchLogDetails(pending.snapshot));
+        });
+    }, delayMs);
+    timer.unref?.();
+    state.rematchTimersByMatchId.set(pending.matchId, timer);
+}
+
+async function expirePendingRematchUnlocked(matchId, client) {
+    const pending = state.pendingRematchesByMatchId.get(matchId);
+    if (!pending) return;
+    clearPendingRematch(matchId);
+    const thread = await client.channels.fetch(pending.snapshot.threadId).catch(() => null);
+    await thread?.send?.({
+        content: `${BL_TIME_EMOJI} Rematch request expired. Closing this match thread.`
+    }).catch(() => {});
+    logRatedInfo(client, pending.snapshot, 'rematch.expired', getMatchLogDetails(pending.snapshot, {
+        initiator: pending.initiatorId
+    }));
+    await finalizeCompletedThreadFromSnapshot(pending.snapshot, client, 'rematch_timeout');
+}
+
+async function expirePendingRematch(matchId, client) {
+    await withInteractionLock(`rematch:${matchId}`, async () => {
+        await expirePendingRematchUnlocked(matchId, client);
+    });
+}
+
 
 async function clearMatchNotifications(match) {
     if (!match.notificationInteractions) return;
@@ -4021,6 +4298,7 @@ async function resetCompetitiveRatedQueue(client) {
     }
     clearCompletedThreadCloseTimers();
     clearPendingCompletedThreadFinalizations();
+    clearPendingRematches();
     clearRuntimeLogTimers();
 
     state.activeMatchesById.clear();
@@ -4240,11 +4518,235 @@ async function handleReportIssueInteraction(interaction) {
     });
 }
 
+async function beginPendingRematch(interaction, snapshot, initiatorParticipant, requiredResponders) {
+    const busyReason = getCompetitiveRatedBusyReason(interaction.user.id);
+    if (busyReason) {
+        await safeReply(interaction, {
+            content: `Rematch cannot be requested: ${busyReason}`,
+            components: [],
+            ephemeral: true
+        });
+        return true;
+    }
+
+    const expiresAt = Date.now() + REMATCH_CONFIRM_TIMEOUT_MS;
+    const pending = {
+        matchId: snapshot.id,
+        snapshot,
+        initiatorId: interaction.user.id,
+        initiatorTeamNumber: initiatorParticipant.teamNumber,
+        requiredResponderIds: requiredResponders.map(participant => participant.id),
+        expiresAt
+    };
+
+    state.pendingRematchesByMatchId.set(snapshot.id, pending);
+    state.rematchInitiatorsByUserId.set(interaction.user.id, snapshot.id);
+    setCompletedThreadFinalizationDeadline(snapshot, expiresAt);
+    scheduleRematchTimeout(pending, interaction.client);
+
+    const thread = await interaction.client.channels.fetch(snapshot.threadId).catch(() => null);
+    await thread?.send?.({
+        content: renderRematchWaitingMessage(snapshot, initiatorParticipant, requiredResponders, expiresAt),
+        allowedMentions: {
+            users: [initiatorParticipant.id, ...pending.requiredResponderIds]
+        }
+    }).catch(error => {
+        logRatedWarn(interaction.client, snapshot, 'rematch.waiting_message_failed', getMatchLogDetails(snapshot, {
+            error: error.message
+        }));
+    });
+
+    logRatedInfo(interaction.client, snapshot, 'rematch.requested', getMatchLogDetails(snapshot, {
+        initiator: interaction.user.id,
+        responders: pending.requiredResponderIds.join(',')
+    }));
+    await safeReply(interaction, {
+        content: `Rematch requested. Waiting for ${requiredResponders.map(participant => participant.mention ?? `<@${participant.id}>`).join(' ')}.`,
+        components: [],
+        ephemeral: true
+    });
+    return true;
+}
+
+async function startConfirmedRematch(interaction, pending) {
+    const snapshot = pending.snapshot;
+    const participantIds = getRematchParticipantIds(snapshot);
+    const activeMatchUserId = getActiveMatchUserId(participantIds);
+    if (activeMatchUserId) {
+        clearPendingRematch(snapshot.id);
+        await finalizeCompletedThreadFromSnapshot(snapshot, interaction.client, 'rematch_aborted_active_match');
+        await safeReply(interaction, {
+            content: `Rematch cancelled because <@${activeMatchUserId}> is already in an active match.`,
+            components: [],
+            ephemeral: true
+        });
+        return true;
+    }
+
+    const conflictingRematchUserId = participantIds.find(userId => {
+        const pendingMatchId = state.rematchInitiatorsByUserId.get(userId);
+        return pendingMatchId && pendingMatchId !== snapshot.id;
+    });
+    if (conflictingRematchUserId) {
+        await safeReply(interaction, {
+            content: `Rematch cannot start because <@${conflictingRematchUserId}> is waiting for another rematch confirmation.`,
+            components: [],
+            ephemeral: true
+        });
+        return true;
+    }
+
+    clearPendingRematch(snapshot.id);
+    await closeActiveSearchesForRematch(participantIds, interaction.client);
+
+    const panelConfig = getRematchPanelConfig(snapshot);
+    if (!panelConfig) {
+        restoreCompletedThreadFinalization(snapshot, interaction.client, 'rematch_missing_panel');
+        await safeReply(interaction, {
+            content: 'Rematch cannot start because the rated panel channel is not configured.',
+            components: [],
+            ephemeral: true
+        });
+        return true;
+    }
+
+    let rematch = null;
+    try {
+        const searches = await buildRematchSearches(snapshot, panelConfig);
+        const teamsOverride = buildFixedRematchTeams(snapshot, searches);
+        rematch = await createCompetitiveRatedMatch(panelConfig, searches, interaction.client, {
+            skipReconcile: false,
+            firstToOverride: getRematchFirstTo(snapshot),
+            teamsOverride
+        });
+    } catch (error) {
+        logRatedError(interaction.client, snapshot, 'rematch.start_failed', error, getMatchLogDetails(snapshot));
+    }
+
+    if (!rematch) {
+        restoreCompletedThreadFinalization(snapshot, interaction.client, 'rematch_start_failed');
+        await safeReply(interaction, {
+            content: 'Could not start the rematch. You can join the Search Pool again.',
+            components: [],
+            ephemeral: true
+        });
+        return true;
+    }
+
+    const oldThread = await interaction.client.channels.fetch(snapshot.threadId).catch(() => null);
+    await oldThread?.send?.({
+        content: `${BL_CHECK_EMOJI} Rematch confirmed. New match thread: ${rematch.threadUrl}`
+    }).catch(() => {});
+    await finalizeCompletedThreadFromSnapshot(snapshot, interaction.client, 'rematch_confirmed');
+    logRatedInfo(interaction.client, snapshot, 'rematch.started', getMatchLogDetails(snapshot, {
+        newMatch: rematch.id,
+        newThread: rematch.threadId,
+        confirmedBy: interaction.user.id
+    }));
+    await safeReply(interaction, {
+        content: `Rematch started: ${rematch.threadUrl}`,
+        components: [],
+        ephemeral: true
+    });
+    return true;
+}
+
+async function handleRematchInteraction(interaction) {
+    const matchId = parseIdFromCustomId(interaction.customId);
+    if (!await ensureDeferredReply(interaction)) {
+        return true;
+    }
+
+    return await withInteractionLock(`rematch:${matchId}`, async () => {
+        const snapshot = await getReportableMatchSnapshot(matchId, interaction.client);
+        if (!snapshot || !isReportableMatch(snapshot)) {
+            await safeReply(interaction, {
+                content: 'Rematch is no longer available for this match.',
+                components: [],
+                ephemeral: true
+            });
+            return true;
+        }
+
+        const participant = findSnapshotParticipant(snapshot, interaction.user.id);
+        if (!participant) {
+            await safeReply(interaction, {
+                content: 'Only players from this match can request a rematch.',
+                components: [],
+                ephemeral: true
+            });
+            return true;
+        }
+        if (!isEligibleRematchParticipant(snapshot, participant)) {
+            await safeReply(interaction, {
+                content: 'Only the team representatives from this match can request a 2v2 rematch.',
+                components: [],
+                ephemeral: true
+            });
+            return true;
+        }
+
+        const pending = state.pendingRematchesByMatchId.get(matchId);
+        if (pending) {
+            if (Date.now() >= pending.expiresAt) {
+                await expirePendingRematchUnlocked(matchId, interaction.client);
+                await safeReply(interaction, {
+                    content: 'Rematch is no longer available for this match.',
+                    components: [],
+                    ephemeral: true
+                });
+                return true;
+            }
+            if (interaction.user.id === pending.initiatorId) {
+                await safeReply(interaction, {
+                    content: 'Waiting for the other side to confirm the rematch.',
+                    components: [],
+                    ephemeral: true
+                });
+                return true;
+            }
+            if (!pending.requiredResponderIds.includes(interaction.user.id)) {
+                await safeReply(interaction, {
+                    content: 'Only the other side can confirm this rematch request.',
+                    components: [],
+                    ephemeral: true
+                });
+                return true;
+            }
+            return await startConfirmedRematch(interaction, pending);
+        }
+
+        if (!isRematchWindowOpen(snapshot)) {
+            await safeReply(interaction, {
+                content: 'Rematch is no longer available for this match.',
+                components: [],
+                ephemeral: true
+            });
+            return true;
+        }
+
+        const requiredResponders = getRequiredRematchResponders(snapshot, participant);
+        if (requiredResponders.length === 0) {
+            await safeReply(interaction, {
+                content: 'Rematch cannot be requested because the other side could not be identified.',
+                components: [],
+                ephemeral: true
+            });
+            return true;
+        }
+
+        return await beginPendingRematch(interaction, snapshot, participant, requiredResponders);
+    });
+}
+
 async function handleMatchInteraction(interaction) {
     const matchId = parseIdFromCustomId(interaction.customId);
     const matchAction = interaction.customId.split(':')[3];
     if (matchAction === 'report_issue') {
         return await handleReportIssueInteraction(interaction);
+    }
+    if (matchAction === 'rematch') {
+        return await handleRematchInteraction(interaction);
     }
 
     const match = state.activeMatchesById.get(matchId);
@@ -4408,6 +4910,9 @@ function __resetState() {
     state.activeMatchesByThreadId.clear();
     state.activeMatchesByUserId.clear();
     state.reportableMatchesById.clear();
+    state.pendingRematchesByMatchId.clear();
+    state.rematchInitiatorsByUserId.clear();
+    state.rematchTimersByMatchId.clear();
     state.cachedOptionsByGameType.clear();
     state.operationQueues.clear();
     state.pendingMatchmakingChannels.clear();
@@ -4427,6 +4932,9 @@ function __getStateSnapshot() {
         activeSearchCount: state.activeSearchesById.size,
         activeMatchCount: state.activeMatchesById.size,
         reportableMatchCount: state.reportableMatchesById.size,
+        pendingRematchCount: state.pendingRematchesByMatchId.size,
+        rematchInitiatorCount: state.rematchInitiatorsByUserId.size,
+        rematchTimerCount: state.rematchTimersByMatchId.size,
         completedThreadCloseTimerCount: state.completedThreadCloseTimersByMatchId.size,
         pendingCompletedThreadFinalizationCount: state.pendingCompletedThreadFinalizationsByMatchId.size,
         panelCount: state.panelMetaByChannelId.size,
@@ -4444,6 +4952,7 @@ function __seedStateForTests({
     activeMatchUserIds = [],
     activeSearches = [],
     activeMatches = [],
+    reportableMatches = [],
     pendingCompletedThreadFinalizations = [],
     cachedOptionsByGameType = {}
 } = {}) {
@@ -4468,6 +4977,10 @@ function __seedStateForTests({
                 state.activeMatchesByUserId.set(memberId, match);
             }
         }
+    }
+
+    for (const reportableMatch of reportableMatches) {
+        state.reportableMatchesById.set(reportableMatch.id, reportableMatch);
     }
 
     for (const pending of pendingCompletedThreadFinalizations) {

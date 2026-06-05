@@ -17,22 +17,29 @@ function isReportableMatch(match) {
 }
 
 function createReportableMatchSnapshot(match, completedThreadName, finalMessageId = null) {
-    const participants = match.teams.flatMap(team =>
+    const participants = match.teams.flatMap((team, teamIndex) =>
         team.members.map(member => ({
             id: member.id,
             mention: member.mention,
-            username: member.username
+            username: member.username,
+            teamNumber: team.teamIndex ?? teamIndex + 1,
+            isRepresentative: member.id === team.repUserId
         }))
     );
 
     return {
         id: match.id,
+        ratedMatchId: match.ratedMatchId ?? null,
         mode: match.mode,
         gameType: match.gameType,
+        channelId: match.channelId ?? null,
         threadId: match.threadId,
         threadName: completedThreadName,
         threadUrl: match.threadUrl,
         finalMessageId,
+        firstTo: match.firstTo ?? null,
+        completedAtMs: Date.now(),
+        threadFinalizedAt: null,
         participants,
         participantIds: participants.map(participant => participant.id),
         issueThreadId: null,
