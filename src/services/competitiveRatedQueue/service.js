@@ -4534,6 +4534,7 @@ async function beginPendingRematch(interaction, snapshot, initiatorParticipant, 
         matchId: snapshot.id,
         snapshot,
         initiatorId: interaction.user.id,
+        initiatorInteraction: interaction,
         initiatorTeamNumber: initiatorParticipant.teamNumber,
         requiredResponderIds: requiredResponders.map(participant => participant.id),
         expiresAt
@@ -4637,6 +4638,16 @@ async function startConfirmedRematch(interaction, pending) {
     await oldThread?.send?.({
         content: `${BL_CHECK_EMOJI} Rematch confirmed. New match thread: ${rematch.threadUrl}`
     }).catch(() => {});
+    const rematchFoundPayload = buildMatchFoundPayload(
+        rematch.mode,
+        rematch.threadUrl,
+        getMatchParticipantMentions(rematch)
+    );
+    await deliverPrivateInteractionPayload(
+        pending.initiatorInteraction,
+        rematchFoundPayload,
+        'rematch match found notification'
+    );
     await finalizeCompletedThreadFromSnapshot(snapshot, interaction.client, 'rematch_confirmed');
     logRatedInfo(interaction.client, snapshot, 'rematch.started', getMatchLogDetails(snapshot, {
         newMatch: rematch.id,
@@ -4644,8 +4655,7 @@ async function startConfirmedRematch(interaction, pending) {
         confirmedBy: interaction.user.id
     }));
     await safeReply(interaction, {
-        content: `Rematch started: ${rematch.threadUrl}`,
-        components: [],
+        ...rematchFoundPayload,
         ephemeral: true
     });
     return true;
