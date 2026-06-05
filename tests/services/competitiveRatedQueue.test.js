@@ -889,6 +889,14 @@ describe('competitiveRatedQueue', () => {
 
         expect(mockRunPendingCompetitiveWhrRunner).toHaveBeenCalledTimes(1);
         expect(channel.send).not.toHaveBeenCalled();
+        const botOverwrite = channel.permissionOverwrites.edit.mock.calls
+            .find(([target]) => target === 'bot-user');
+        expect(botOverwrite?.[1]).toEqual(expect.objectContaining({
+            CreatePublicThreads: true,
+            SendMessagesInThreads: true,
+            ManageThreads: true
+        }));
+        expect(botOverwrite?.[1]).not.toHaveProperty('CreatePrivateThreads');
         expect(panelImageMessage.edit).not.toHaveBeenCalled();
         expect(panelMessage.edit).not.toHaveBeenCalled();
         expect(smsPanelImageMessage.edit).not.toHaveBeenCalled();
@@ -1380,9 +1388,9 @@ describe('competitiveRatedQueue', () => {
 
         expect(channel.threads.create).toHaveBeenCalledTimes(1);
         expect(channel.threads.create.mock.calls[0][0]).toEqual(expect.objectContaining({
-            type: ChannelType.PrivateThread,
-            invitable: false
+            type: ChannelType.PublicThread
         }));
+        expect(channel.threads.create.mock.calls[0][0]).not.toHaveProperty('invitable');
         expect(channel.send).not.toHaveBeenCalledWith(expect.objectContaining({
             content: expect.stringContaining('Opponent found')
         }));
@@ -1756,6 +1764,59 @@ describe('competitiveRatedQueue', () => {
             randomSpy.mockRestore();
             competitiveRatedQueue.__resetState();
             jest.useRealTimers();
+        }
+    });
+
+    it('shows Battle Dome as The Battle Dome in SMS stadium buttons', async () => {
+        const randomSpy = jest.spyOn(Math, 'random').mockReturnValue(0.9);
+        try {
+            competitiveRatedQueue.__seedStateForTests({
+                cachedOptionsByGameType: {
+                    SMS: {
+                        ...createMatchOptions(),
+                        stadiums: [
+                            { value: 'battledome', code: '930869139516559431', description: 'Battle Dome' },
+                            { value: 'bowserstadium', code: '930869106893279332', description: 'Bowser Stadium' },
+                            { value: 'craterfield', code: '930869067936567317', description: 'Crater Field' },
+                            { value: 'kongacoliseum', code: '930869207174897725', description: 'Konga Coliseum' },
+                            { value: 'palace', code: '930852684884480011', description: 'The Palace' },
+                            { value: 'pipeline', code: '930852734704431194', description: 'Pipeline Central' },
+                            { value: 'underground', code: '940276774191923231', description: 'The Underground' }
+                        ]
+                    }
+                }
+            });
+            const { channel, client, thread } = createMatchClientMock();
+            const searches = [
+                createCompetitiveRatedSearch({ id: 'search-1', userId: 'home-user', username: 'Home', createdAt: 1, gameType: 'SMS' }),
+                createCompetitiveRatedSearch({ id: 'search-2', userId: 'away-user', username: 'Away', createdAt: 2, gameType: 'SMS' })
+            ];
+
+            await competitiveRatedQueue.__createCompetitiveRatedMatchForTests(
+                { channelId: channel.id, gameType: 'SMS' },
+                searches,
+                client,
+                { skipReconcile: true }
+            );
+
+            const setupPayload = findThreadPayload(thread, payload =>
+                payload.components?.[0]?.toJSON().components[0].custom_id.includes(':match:start:')
+            );
+            const homeStart = createButtonInteractionMock({
+                customId: getFirstButtonCustomId(setupPayload),
+                userId: 'home-user',
+                client
+            });
+            await competitiveRatedQueue.handleInteraction(homeStart);
+
+            const labels = getButtonComponents(homeStart.editReply.mock.calls.at(-1)[0])
+                .map(component => component.label);
+            expect(labels[0]).toBe('THE BATTLE DOME');
+            expect(labels).toContain('BOWSER STADIUM');
+            expect(labels).toContain('THE UNDERGROUND');
+        } finally {
+            randomSpy.mockRestore();
+            competitiveRatedQueue.__resetState();
         }
     });
 

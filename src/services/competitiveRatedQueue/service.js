@@ -886,9 +886,24 @@ function chunkOptions(options, size) {
 
 function sortStadiumButtons(stadiums, gameType) {
     const order = STADIUM_BUTTON_ORDER_BY_GAME_TYPE[gameType] ?? [];
-    const byDescription = new Map(stadiums.map(option => [option.description, option]));
-    const ordered = order.map(description => byDescription.get(description)).filter(Boolean);
-    return ordered.length > 0 ? ordered : stadiums;
+    const byDescription = new Map(stadiums.map(option => [
+        normalizeButtonOptionKey(getStadiumDisplayDescription(option.description)),
+        option
+    ]));
+    const usedValues = new Set();
+    const ordered = [];
+
+    for (const description of order) {
+        const option = byDescription.get(normalizeButtonOptionKey(getStadiumDisplayDescription(description)));
+        if (!option || usedValues.has(option.value)) {
+            continue;
+        }
+        usedValues.add(option.value);
+        ordered.push(option);
+    }
+
+    const unmatched = stadiums.filter(option => !usedValues.has(option.value));
+    return ordered.length > 0 ? [...ordered, ...unmatched] : stadiums;
 }
 
 function normalizeButtonOptionKey(value) {
@@ -1709,7 +1724,7 @@ async function applyChannelLock(channel, gameType) {
                 ViewChannel: true,
                 SendMessages: true,
                 SendMessagesInThreads: true,
-                CreatePrivateThreads: true,
+                CreatePublicThreads: true,
                 ManageMessages: true,
                 ManageThreads: true,
                 ReadMessageHistory: true
@@ -2038,9 +2053,8 @@ async function createCompetitiveRatedMatch(panelConfig, searches, client, { skip
     try {
         thread = await channel.threads.create({
             name: threadName,
-            type: ChannelType.PrivateThread,
+            type: ChannelType.PublicThread,
             autoArchiveDuration: 60,
-            invitable: false,
             reason: `${panelConfig.gameType} Competitive Rated match`
         });
     } catch (error) {

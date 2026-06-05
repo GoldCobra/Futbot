@@ -118,7 +118,10 @@ const SCORE_EMOJIS = {
 const MATCH_TIMEOUT_PHASES = new Set(['start', 'game', 'loser_confirmation', 'loser_advantage']);
 const LOSER_CHOICE_TIMEOUT_MINUTES = 2;
 const SELECTION_TIMEOUT_MINUTES = 2;
-const STADIUM_DISPLAY_OVERRIDES = { 'Lava Pit': 'The Lava Pit' };
+const STADIUM_DISPLAY_OVERRIDES = {
+    'Battle Dome': 'The Battle Dome',
+    'Lava Pit': 'The Lava Pit'
+};
 const CAPTAIN_DISPLAY_OVERRIDES = { Diddy: 'Diddy Kong' };
 
 module.exports = {
