@@ -103,7 +103,7 @@ class RatedMatchDao {
         try {
             const existing = await runRequest(
                 transaction,
-                `SELECT TOP 1 Id, MatchNumber, SeasonMatchNumber
+                `SELECT TOP 1 Id, MatchNumber, SeasonMatchNumber, Status
                  FROM ${T.ratedMatch}
                  WHERE MatchCode = @matchCode`,
                 { matchCode }
@@ -114,7 +114,9 @@ class RatedMatchDao {
                     id: existing.recordset[0].Id,
                     matchNumber: existing.recordset[0].MatchNumber,
                     seasonMatchNumber: existing.recordset[0].SeasonMatchNumber,
-                    seasonId
+                    seasonId,
+                    status: existing.recordset[0].Status,
+                    existing: true
                 };
             }
 
@@ -205,7 +207,9 @@ class RatedMatchDao {
                 id: matchId,
                 matchNumber,
                 seasonMatchNumber,
-                seasonId
+                seasonId,
+                status: 'creating',
+                existing: false
             };
         } catch (err) {
             await transaction.rollback().catch(() => {});
@@ -308,13 +312,15 @@ class RatedMatchDao {
             awayTeamNumber,
             guildId
         });
-        await this.activateMatch({
-            matchId: header.id,
-            panelChannelId,
-            threadId,
-            threadUrl,
-            participants
-        });
+        if (!header.existing || String(header.status ?? '').toLowerCase() === 'creating') {
+            await this.activateMatch({
+                matchId: header.id,
+                panelChannelId,
+                threadId,
+                threadUrl,
+                participants
+            });
+        }
         return header.id;
     }
 

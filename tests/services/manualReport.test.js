@@ -201,4 +201,23 @@ describe('manual report service', () => {
         expect(mockExecuteQuery).not.toHaveBeenCalled();
         expect(mockCreateMatch).not.toHaveBeenCalled();
     });
+
+    it('does not link WHR sync or report success when Competitive ELO returns no result', async () => {
+        mockRecordCompetitiveResult.mockResolvedValue(null);
+
+        await expect(manualReport.recordManualReport1v1({
+            interaction: createInteraction(),
+            p1: { id: '111', username: 'One' },
+            p2: { id: '222', username: 'Two' },
+            p1Wins: 2,
+            p2Wins: 0,
+            gametype: 'MSBL',
+            guildid: 'guild-1'
+        })).rejects.toThrow('Competitive rating update failed');
+
+        expect(mockExecuteQuery).toHaveBeenCalled();
+        expect(mockCreateMatch).toHaveBeenCalled();
+        expect(mockRecordCompetitiveResult).toHaveBeenCalled();
+        expect(mockLinkExistingLegacyMirror).not.toHaveBeenCalled();
+    });
 });

@@ -164,6 +164,9 @@ async function createCompletedManualRatedMatch({
         guildId,
         skipWhrSync: true
     });
+    if (!competitiveResult) {
+        throw new Error(`Competitive rating update failed for ${matchCode}.`);
+    }
 
     await competitiveWhrSyncDao.linkExistingLegacyMirror({
         ratedMatchId,
