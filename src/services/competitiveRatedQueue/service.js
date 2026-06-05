@@ -202,6 +202,16 @@ async function ignoreMatchInteraction(interaction, match, event, reason, extra =
 
 const SEASON_UNAVAILABLE_MESSAGE = 'Season ended. New Season will start soon.';
 const QUEUE_JOIN_SEASON_UNAVAILABLE_MESSAGE = 'Season has not started yet. Rated matches open soon.';
+const LFG_ROLE_ID_BY_GAME_TYPE = {
+    MSBL: '944150830972538923',
+    MSC: '680810288605298744',
+    SMS: '781487757176209428'
+};
+
+function getLfgRoleIdForPanel(channelId) {
+    const panelConfig = getPanelConfigByChannelId(channelId);
+    return panelConfig ? LFG_ROLE_ID_BY_GAME_TYPE[panelConfig.gameType] ?? null : null;
+}
 
 function buildPanelMessage(channelId = CONFIG.PANEL_CHANNELS[0].channelId) {
     const row = new ActionRowBuilder().addComponents(
@@ -220,18 +230,40 @@ function buildPanelMessage(channelId = CONFIG.PANEL_CHANNELS[0].channelId) {
     };
 }
 
-function buildStatusMessageContent(counts) {
+function buildStatusMessageContent(counts, channelId = null) {
     const lines = [];
+    const hasSingles = (counts['1v1'] ?? 0) > 0;
+    const hasDoubles = (counts['2v2'] ?? 0) > 0;
 
-    if ((counts['1v1'] ?? 0) > 0) {
+    if (hasSingles || hasDoubles) {
+        const roleId = getLfgRoleIdForPanel(channelId);
+        if (roleId) {
+            lines.push(`<@&${roleId}>`);
+        }
+    }
+
+    if (hasSingles) {
         lines.push(`Players in 1vs1 Pool: **${PLAYER_COUNT_EMOJI} ${counts['1v1']}**`);
     }
 
-    if ((counts['2v2'] ?? 0) > 0) {
+    if (hasDoubles) {
         lines.push(`Players in 2vs2 Pool: **👥 ${counts['2v2']}**`);
     }
 
     return lines.join('\n');
+}
+
+function buildStatusMessagePayload(panelConfig, counts) {
+    const roleId = LFG_ROLE_ID_BY_GAME_TYPE[panelConfig?.gameType];
+    const payload = {
+        content: buildStatusMessageContent(counts, panelConfig?.channelId),
+        components: [],
+        allowedMentions: { parse: [] }
+    };
+    if (roleId) {
+        payload.allowedMentions.roles = [roleId];
+    }
+    return payload;
 }
 
 function buildExtendButtons(search) {
@@ -1446,10 +1478,7 @@ async function reconcilePanelChannel(client, panelConfig) {
 
     const statusMessage = findStatusMessage(existingMessages, client.user?.id);
     if (hasAnySearches) {
-        const statusPayload = {
-            content: buildStatusMessageContent(counts),
-            components: []
-        };
+        const statusPayload = buildStatusMessagePayload(panelConfig, counts);
         if (statusMessage) {
             panelMeta.statusMessageId = statusMessage.id;
             await statusMessage.edit(statusPayload).catch(err =>
@@ -1505,10 +1534,7 @@ async function refreshPanelStatus(channelId, client) {
     const statusMessage = await fetchPanelMessageById(channel, panelMeta.statusMessageId);
 
     if (hasAnySearches) {
-        const statusPayload = {
-            content: buildStatusMessageContent(counts),
-            components: []
-        };
+        const statusPayload = buildStatusMessagePayload(panelConfig, counts);
 
         if (statusMessage) {
             await statusMessage.edit(statusPayload).catch(err => {
@@ -1671,7 +1697,7 @@ function findStatusMessage(messages, botUserId) {
     return messages.find(message =>
         message.author?.id === botUserId
             && typeof message.content === 'string'
-            && message.content.startsWith('Players in ')
+            && message.content.includes('Players in ')
     ) ?? null;
 }
 

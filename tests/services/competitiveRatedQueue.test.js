@@ -1011,6 +1011,39 @@ describe('competitiveRatedQueue', () => {
         }
     });
 
+    it('posts pool status with the game LFG role mention enabled', async () => {
+        jest.useFakeTimers({ doNotFake: ['performance'] });
+        jest.setSystemTime(1_000_000);
+        try {
+            const { channel, client } = createMatchClientMock();
+            const interaction = createButtonInteractionMock({
+                customId: 'rated:competitive:join:1501486517464600657:1v1',
+                userId: '12345',
+                client
+            });
+
+            await competitiveRatedQueue.handleInteraction(interaction);
+            jest.advanceTimersByTime(500);
+            await flushAsyncTasks();
+
+            const statusPayload = channel.send.mock.calls
+                .map(([payload]) => payload)
+                .find(payload => String(payload.content || '').includes('Players in 1vs1 Pool'));
+
+            expect(statusPayload).toEqual(expect.objectContaining({
+                content: '<@&680810288605298744>\nPlayers in 1vs1 Pool: **👤 1**',
+                components: [],
+                allowedMentions: {
+                    parse: [],
+                    roles: ['680810288605298744']
+                }
+            }));
+        } finally {
+            competitiveRatedQueue.__resetState();
+            jest.useRealTimers();
+        }
+    });
+
     it('shows current competitive rank in pool join reply when a rating row exists', async () => {
         const nowSpy = jest.spyOn(Date, 'now').mockReturnValue(1_000_000);
         try {
@@ -1283,6 +1316,15 @@ describe('competitiveRatedQueue', () => {
     it('renders a counts-only status message', () => {
         expect(competitiveRatedQueue.buildStatusMessageContent({ '1v1': 2, '2v2': 1 }))
             .toBe('Players in 1vs1 Pool: **👤 2**\nPlayers in 2vs2 Pool: **👥 1**');
+    });
+
+    it('prefixes status messages with the panel game LFG role mention', () => {
+        expect(competitiveRatedQueue.buildStatusMessageContent({ '1v1': 1, '2v2': 0 }, '1501486517464600657'))
+            .toBe('<@&680810288605298744>\nPlayers in 1vs1 Pool: **👤 1**');
+        expect(competitiveRatedQueue.buildStatusMessageContent({ '1v1': 1, '2v2': 0 }, '1504056016629927966'))
+            .toBe('<@&781487757176209428>\nPlayers in 1vs1 Pool: **👤 1**');
+        expect(competitiveRatedQueue.buildStatusMessageContent({ '1v1': 1, '2v2': 1 }, '1502350088431992852'))
+            .toBe('<@&944150830972538923>\nPlayers in 1vs1 Pool: **👤 1**\nPlayers in 2vs2 Pool: **👥 1**');
     });
 
     it('omits zero-count pool lines from the status message', () => {
