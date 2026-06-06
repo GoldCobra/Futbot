@@ -13,7 +13,10 @@ describe('/report1v1', () => {
     beforeEach(() => {
         jest.spyOn(manualReport, 'recordManualReport1v1').mockResolvedValue({
             legacyMatchId: 12345,
-            ratedMatchId: 67890
+            ratedMatchId: 67890,
+            gameType: 'MSBL',
+            mode: '1v1',
+            matchNumber: 20
         });
         jest.spyOn(manualReport, 'buildReportReply').mockReturnValue('report reply');
         jest.clearAllMocks();
@@ -74,6 +77,13 @@ describe('/report1v1', () => {
             setUri: ''
         });
         expect(startgg.updateSet).not.toHaveBeenCalled();
+        expect(manualReport.buildReportReply).toHaveBeenCalledWith({
+            legacyMatchId: 12345,
+            ratedMatchId: 67890,
+            gameType: 'MSBL',
+            mode: '1v1',
+            matchNumber: 20
+        });
         expect(interaction.editReply).toHaveBeenCalledWith('report reply');
     });
 

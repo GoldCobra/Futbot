@@ -297,7 +297,7 @@ class RatedMatchDao {
         }
     }
 
-    async createMatch({
+    async createMatchWithDetails({
         matchCode,
         gameType,
         gameId,
@@ -332,7 +332,19 @@ class RatedMatchDao {
                 participants
             });
         }
-        return header.id;
+        return {
+            id: header.id,
+            matchNumber: header.matchNumber,
+            seasonMatchNumber: header.seasonMatchNumber,
+            seasonId: header.seasonId,
+            status: header.status,
+            existing: header.existing
+        };
+    }
+
+    async createMatch(input) {
+        const match = await this.createMatchWithDetails(input);
+        return match.id;
     }
 
     async recordGame({

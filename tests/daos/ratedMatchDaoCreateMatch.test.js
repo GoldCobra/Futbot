@@ -7,7 +7,7 @@ describe('RatedMatchDao.createMatch', () => {
 
     function createMatchInput() {
         return {
-            matchCode: 'manual-report:match:123',
+            matchCode: 'manual:1:123',
             gameId: 3,
             mode: '1v1',
             firstTo: 2,
@@ -41,6 +41,35 @@ describe('RatedMatchDao.createMatch', () => {
 
         expect(result).toBe(99);
         expect(activateMatch).not.toHaveBeenCalled();
+    });
+
+    it('returns match numbering details from createMatchWithDetails', async () => {
+        const dao = new RatedMatchDao();
+        jest.spyOn(dao, 'createMatchHeader').mockResolvedValue({
+            id: 99,
+            matchNumber: 7,
+            seasonMatchNumber: 3,
+            seasonId: 2,
+            status: 'creating',
+            existing: false
+        });
+        const activateMatch = jest.spyOn(dao, 'activateMatch').mockResolvedValue([]);
+
+        const input = createMatchInput();
+        const result = await dao.createMatchWithDetails(input);
+
+        expect(result).toEqual({
+            id: 99,
+            matchNumber: 7,
+            seasonMatchNumber: 3,
+            seasonId: 2,
+            status: 'creating',
+            existing: false
+        });
+        expect(activateMatch).toHaveBeenCalledWith(expect.objectContaining({
+            matchId: 99,
+            participants: input.participants
+        }));
     });
 
     it('still activates an existing creating match code so interrupted creates can recover', async () => {

@@ -58,10 +58,23 @@ function extractLegacyId(rows) {
     return row.Id ?? row.ID ?? row.Match ?? row.LegacyMatchId ?? null;
 }
 
-function buildReportReply({ legacyMatchId, ratedMatchId }) {
+function buildManualMatchCode({ legacyMatchId = null, legacyMultiMatchId = null }) {
+    if (legacyMatchId) {
+        return `manual:1:${legacyMatchId}`;
+    }
+    if (legacyMultiMatchId) {
+        return `manual:2:${legacyMultiMatchId}`;
+    }
+    throw new Error('Cannot build manual Competitive match code without a legacy match id.');
+}
+
+function buildReportReply({ legacyMatchId, ratedMatchId, gameType, mode, matchNumber }) {
     const legacyMatchIdLine = legacyMatchId ? `\nMatch Id: ${legacyMatchId}` : '';
+    const competitiveMatchLine = gameType && mode && matchNumber
+        ? `\nRecorded as: ${gameType} ${mode} #${matchNumber}`
+        : '';
     const ratedMatchIdLine = ratedMatchId ? `\nCompetitive Match Id: ${ratedMatchId}` : '';
-    return `Thanks for playing!\n\nResult recorded. Competitive ELO updated. Legacy ELO unchanged.${legacyMatchIdLine}${ratedMatchIdLine}`;
+    return `Thanks for playing!\n\nResult recorded. Competitive ELO updated. Legacy ELO unchanged.${competitiveMatchLine}${legacyMatchIdLine}${ratedMatchIdLine}`;
 }
 
 async function getActiveCompetitiveSeasonOrThrow() {
@@ -129,12 +142,10 @@ async function createCompletedManualRatedMatch({
 }) {
     const normalizedGameType = normalizeGameType(gameType);
     const gameId = CONSTANTS.SQL_GAME_TYPE_TO_NUMBER[normalizedGameType];
-    const matchCode = legacyMatchId
-        ? `manual-report:match:${legacyMatchId}`
-        : `manual-report:multi:${legacyMultiMatchId}`;
+    const matchCode = buildManualMatchCode({ legacyMatchId, legacyMultiMatchId });
     const winnerTeamNumber = team1Score > team2Score ? 1 : 2;
 
-    const ratedMatchId = await ratedMatchDao.createMatch({
+    const ratedMatch = await ratedMatchDao.createMatchWithDetails({
         matchCode,
         gameId,
         mode,
@@ -150,7 +161,7 @@ async function createCompletedManualRatedMatch({
     });
 
     const competitiveResult = await competitiveRating.recordCompetitiveResult({
-        ratedMatchId,
+        ratedMatchId: ratedMatch.id,
         matchCode,
         seasonId: season.Id,
         gameType: gameId,
@@ -169,13 +180,18 @@ async function createCompletedManualRatedMatch({
     }
 
     await competitiveWhrSyncDao.linkExistingLegacyMirror({
-        ratedMatchId,
+        ratedMatchId: ratedMatch.id,
         legacyMatchId,
         legacyMultiMatchId
     });
 
     return {
-        ratedMatchId,
+        ratedMatchId: ratedMatch.id,
+        matchCode,
+        matchNumber: ratedMatch.matchNumber,
+        seasonMatchNumber: ratedMatch.seasonMatchNumber,
+        gameType: normalizedGameType,
+        mode,
         competitiveResult
     };
 }
@@ -310,6 +326,7 @@ module.exports = {
     _private: {
         reportScoreSQLV2,
         reportScore2SQLV2,
+        buildManualMatchCode,
         normalizeGameType
     }
 };

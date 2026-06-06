@@ -1,7 +1,7 @@
 describe('manual report service', () => {
     let manualReport;
     let mockExecuteQuery;
-    let mockCreateMatch;
+    let mockCreateMatchWithDetails;
     let mockGetActiveSeason;
     let mockRecordCompetitiveResult;
     let mockLinkExistingLegacyMirror;
@@ -11,7 +11,14 @@ describe('manual report service', () => {
         mockExecuteQuery = jest.fn(async query => ({
             recordset: [{ Id: query.includes('reportScore2') ? 22345 : 12345 }]
         }));
-        mockCreateMatch = jest.fn(async () => 67890);
+        mockCreateMatchWithDetails = jest.fn(async ({ mode }) => ({
+            id: 67890,
+            matchNumber: mode === '2v2' ? 8 : 7,
+            seasonMatchNumber: mode === '2v2' ? 4 : 3,
+            seasonId: 2,
+            status: 'creating',
+            existing: false
+        }));
         mockGetActiveSeason = jest.fn(async () => ({ Id: 2, DisplayName: 'Burst Season 2026' }));
         mockRecordCompetitiveResult = jest.fn(async () => ({
             seasonId: 2,
@@ -24,7 +31,7 @@ describe('manual report service', () => {
             executeQuery: (...args) => mockExecuteQuery(...args)
         }));
         jest.doMock('../../src/db/daos/ratedMatchDao', () => jest.fn().mockImplementation(() => ({
-            createMatch: mockCreateMatch
+            createMatchWithDetails: mockCreateMatchWithDetails
         })));
         jest.doMock('../../src/db/daos/competitiveWhrSyncDao', () => jest.fn().mockImplementation(() => ({
             linkExistingLegacyMirror: mockLinkExistingLegacyMirror
@@ -76,8 +83,8 @@ describe('manual report service', () => {
                 score: '2-1'
             })
         );
-        expect(mockCreateMatch).toHaveBeenCalledWith(expect.objectContaining({
-            matchCode: 'manual-report:match:12345',
+        expect(mockCreateMatchWithDetails).toHaveBeenCalledWith(expect.objectContaining({
+            matchCode: 'manual:1:12345',
             gameId: 2,
             mode: '1v1',
             seasonId: 2,
@@ -89,7 +96,7 @@ describe('manual report service', () => {
         }));
         expect(mockRecordCompetitiveResult).toHaveBeenCalledWith(expect.objectContaining({
             ratedMatchId: 67890,
-            matchCode: 'manual-report:match:12345',
+            matchCode: 'manual:1:12345',
             seasonId: 2,
             gameType: 2,
             mode: '1v1',
@@ -105,7 +112,12 @@ describe('manual report service', () => {
         });
         expect(result).toEqual(expect.objectContaining({
             legacyMatchId: 12345,
-            ratedMatchId: 67890
+            ratedMatchId: 67890,
+            matchCode: 'manual:1:12345',
+            gameType: 'SMS',
+            mode: '1v1',
+            matchNumber: 7,
+            seasonMatchNumber: 3
         }));
     });
 
@@ -133,8 +145,8 @@ describe('manual report service', () => {
                 score: '1-2'
             })
         );
-        expect(mockCreateMatch).toHaveBeenCalledWith(expect.objectContaining({
-            matchCode: 'manual-report:multi:22345',
+        expect(mockCreateMatchWithDetails).toHaveBeenCalledWith(expect.objectContaining({
+            matchCode: 'manual:2:22345',
             gameId: 1,
             mode: '2v2',
             seasonId: 2,
@@ -148,7 +160,7 @@ describe('manual report service', () => {
         }));
         expect(mockRecordCompetitiveResult).toHaveBeenCalledWith(expect.objectContaining({
             ratedMatchId: 67890,
-            matchCode: 'manual-report:multi:22345',
+            matchCode: 'manual:2:22345',
             seasonId: 2,
             gameType: 1,
             mode: '2v2',
@@ -164,8 +176,33 @@ describe('manual report service', () => {
         });
         expect(result).toEqual(expect.objectContaining({
             legacyMultiMatchId: 22345,
-            ratedMatchId: 67890
+            ratedMatchId: 67890,
+            matchCode: 'manual:2:22345',
+            gameType: 'MSC',
+            mode: '2v2',
+            matchNumber: 8,
+            seasonMatchNumber: 4
         }));
+    });
+
+    it('builds short stable manual match codes that fit the current RatedMatch schema', () => {
+        const singlesCode = manualReport._private.buildManualMatchCode({ legacyMatchId: 1234567890 });
+        const doublesCode = manualReport._private.buildManualMatchCode({ legacyMultiMatchId: 2234567890 });
+
+        expect(singlesCode).toBe('manual:1:1234567890');
+        expect(doublesCode).toBe('manual:2:2234567890');
+        expect(singlesCode.length).toBeLessThanOrEqual(24);
+        expect(doublesCode.length).toBeLessThanOrEqual(24);
+    });
+
+    it('includes the shared Competitive match number in the report reply', () => {
+        expect(manualReport.buildReportReply({
+            legacyMatchId: 12345,
+            ratedMatchId: 67890,
+            gameType: 'MSC',
+            mode: '1v1',
+            matchNumber: 20
+        })).toContain('Recorded as: MSC 1v1 #20');
     });
 
     it('rejects draw reports before writing legacy or Competitive data', async () => {
@@ -180,7 +217,7 @@ describe('manual report service', () => {
         })).rejects.toThrow('Draw reports are not supported');
 
         expect(mockExecuteQuery).not.toHaveBeenCalled();
-        expect(mockCreateMatch).not.toHaveBeenCalled();
+        expect(mockCreateMatchWithDetails).not.toHaveBeenCalled();
         expect(mockRecordCompetitiveResult).not.toHaveBeenCalled();
         expect(mockLinkExistingLegacyMirror).not.toHaveBeenCalled();
     });
@@ -199,7 +236,7 @@ describe('manual report service', () => {
         })).rejects.toThrow('No active Competitive season');
 
         expect(mockExecuteQuery).not.toHaveBeenCalled();
-        expect(mockCreateMatch).not.toHaveBeenCalled();
+        expect(mockCreateMatchWithDetails).not.toHaveBeenCalled();
     });
 
     it('does not link WHR sync or report success when Competitive ELO returns no result', async () => {
@@ -216,7 +253,7 @@ describe('manual report service', () => {
         })).rejects.toThrow('Competitive rating update failed');
 
         expect(mockExecuteQuery).toHaveBeenCalled();
-        expect(mockCreateMatch).toHaveBeenCalled();
+        expect(mockCreateMatchWithDetails).toHaveBeenCalled();
         expect(mockRecordCompetitiveResult).toHaveBeenCalled();
         expect(mockLinkExistingLegacyMirror).not.toHaveBeenCalled();
     });

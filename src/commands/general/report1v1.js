@@ -148,7 +148,10 @@ module.exports = {
 
             await interaction.editReply(manualReport.buildReportReply({
                 legacyMatchId: report.legacyMatchId,
-                ratedMatchId: report.ratedMatchId
+                ratedMatchId: report.ratedMatchId,
+                gameType: report.gameType,
+                mode: report.mode,
+                matchNumber: report.matchNumber
             }));
         } catch (err) {
             console.error(err);

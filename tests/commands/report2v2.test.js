@@ -6,7 +6,10 @@ describe('/report2v2', () => {
     beforeEach(() => {
         jest.spyOn(manualReport, 'recordManualReport2v2').mockResolvedValue({
             legacyMultiMatchId: 22345,
-            ratedMatchId: 67890
+            ratedMatchId: 67890,
+            gameType: 'MSC',
+            mode: '2v2',
+            matchNumber: 8
         });
         jest.spyOn(manualReport, 'buildReportReply').mockReturnValue('report reply');
         jest.clearAllMocks();
@@ -60,6 +63,13 @@ describe('/report2v2', () => {
             tournament: 'Cup',
             stage: 'Winners Final',
             setUri: 'https://start.gg/set'
+        });
+        expect(manualReport.buildReportReply).toHaveBeenCalledWith({
+            legacyMatchId: 22345,
+            ratedMatchId: 67890,
+            gameType: 'MSC',
+            mode: '2v2',
+            matchNumber: 8
         });
         expect(interaction.editReply).toHaveBeenCalledWith('report reply');
     });
