@@ -1563,16 +1563,30 @@ async function refreshPanelStatus(channelId, client) {
     const panelMeta = getOrCreatePanelMeta(channel.id);
     const counts = buildSearchCounts(channel.id);
     const hasAnySearches = counts['1v1'] > 0 || counts['2v2'] > 0;
-    const statusMessage = await fetchPanelMessageById(channel, panelMeta.statusMessageId);
+    let statusMessage = await fetchPanelMessageById(channel, panelMeta.statusMessageId);
+    let existingStatusMessages = [];
+
+    if (!statusMessage) {
+        const recentMessages = await fetchRecentMessages(channel, 100);
+        existingStatusMessages = findStatusMessages(recentMessages, client.user?.id);
+        statusMessage = existingStatusMessages[0] ?? null;
+        panelMeta.statusMessageId = statusMessage?.id ?? null;
+    }
 
     if (hasAnySearches) {
         const statusPayload = buildStatusMessagePayload(panelConfig, counts);
 
         if (statusMessage) {
+            if (existingStatusMessages.length === 0) {
+                const recentMessages = await fetchRecentMessages(channel, 100);
+                existingStatusMessages = findStatusMessages(recentMessages, client.user?.id);
+            }
             await statusMessage.edit(statusPayload).catch(err => {
                 console.warn(`[RatedQueue] Failed to edit status message in ${channel.id}: ${err.message}`);
                 logRatedWarn(client, panelConfig, 'panel.status.edit_failed', { channel: channel.id, error: err.message });
             });
+            panelMeta.statusMessageId = statusMessage.id;
+            await deleteDuplicateStatusMessages(existingStatusMessages, statusMessage.id, panelConfig, channel, client);
             return;
         }
 
@@ -1586,12 +1600,19 @@ async function refreshPanelStatus(channelId, client) {
         return;
     }
 
+    const deletedStatusMessageIds = new Set();
+    if (statusMessage && existingStatusMessages.length === 0) {
+        const recentMessages = await fetchRecentMessages(channel, 100);
+        existingStatusMessages = findStatusMessages(recentMessages, client.user?.id);
+    }
     if (statusMessage) {
         await statusMessage.delete().catch(err => {
             console.warn(`[RatedQueue] Failed to delete status message in ${channel.id}: ${err.message}`);
             logRatedWarn(client, panelConfig, 'panel.status.delete_failed', { channel: channel.id, error: err.message });
         });
+        deletedStatusMessageIds.add(statusMessage.id);
     }
+    await deleteDuplicateStatusMessages(existingStatusMessages, null, panelConfig, channel, client, deletedStatusMessageIds);
     panelMeta.statusMessageId = null;
 }
 
@@ -1731,6 +1752,31 @@ function findStatusMessage(messages, botUserId) {
             && typeof message.content === 'string'
             && message.content.includes('Players in ')
     ) ?? null;
+}
+
+function findStatusMessages(messages, botUserId) {
+    return messages.filter(message =>
+        message.author?.id === botUserId
+            && typeof message.content === 'string'
+            && message.content.includes('Players in ')
+    );
+}
+
+async function deleteDuplicateStatusMessages(statusMessages, keepMessageId, panelConfig, channel, client, skipMessageIds = new Set()) {
+    for (const message of statusMessages) {
+        if (message.id === keepMessageId || skipMessageIds.has(message.id)) {
+            continue;
+        }
+
+        await message.delete().catch(err => {
+            console.warn(`[RatedQueue] Failed to delete duplicate status message in ${channel.id}: ${err.message}`);
+            logRatedWarn(client, panelConfig, 'panel.status.duplicate_delete_failed', {
+                channel: channel.id,
+                message: message.id,
+                error: err.message
+            });
+        });
+    }
 }
 
 async function applyChannelLock(channel, gameType) {

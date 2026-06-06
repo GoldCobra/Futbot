@@ -367,7 +367,15 @@ function createMatchClientMock() {
                     some: () => false
                 },
                 createdTimestamp: Date.now(),
-                edit: jest.fn(async () => message),
+                edit: jest.fn(async nextPayload => {
+                    message.payload = {
+                        ...message.payload,
+                        ...nextPayload
+                    };
+                    message.content = message.payload.content;
+                    message.components = message.payload.components;
+                    return message;
+                }),
                 delete: jest.fn(async () => {
                     sentChannelMessages.delete(message.id);
                 })
@@ -1116,6 +1124,110 @@ describe('competitiveRatedQueue', () => {
                     roles: ['680810288605298744']
                 }
             }));
+        } finally {
+            competitiveRatedQueue.__resetState();
+            jest.useRealTimers();
+        }
+    });
+
+    it('reuses an existing pool status message and deletes duplicates when status metadata was lost', async () => {
+        jest.useFakeTimers({ doNotFake: ['performance'] });
+        jest.setSystemTime(1_000_000);
+        try {
+            const { channel, client } = createMatchClientMock();
+            const existingStatus = await channel.send({
+                content: '<@&680810288605298744>\nPlayers in 1vs1 Pool: **👤 1**',
+                components: [],
+                allowedMentions: { parse: [], roles: ['680810288605298744'] }
+            });
+            const duplicateStatus = await channel.send({
+                content: '<@&680810288605298744>\nPlayers in 1vs1 Pool: **👤 1**',
+                components: [],
+                allowedMentions: { parse: [], roles: ['680810288605298744'] }
+            });
+            competitiveRatedQueue.__resetState();
+            channel.send.mockClear();
+
+            const interaction = createButtonInteractionMock({
+                customId: 'rated:competitive:join:1501486517464600657:1v1',
+                userId: '12345',
+                client
+            });
+
+            await competitiveRatedQueue.handleInteraction(interaction);
+            jest.advanceTimersByTime(500);
+            await flushAsyncTasks();
+
+            expect(channel.send).not.toHaveBeenCalledWith(expect.objectContaining({
+                content: expect.stringContaining('Players in 1vs1 Pool')
+            }));
+            expect(existingStatus.edit).toHaveBeenCalledWith(expect.objectContaining({
+                content: '<@&680810288605298744>\nPlayers in 1vs1 Pool: **👤 1**',
+                components: [],
+                allowedMentions: {
+                    parse: [],
+                    roles: ['680810288605298744']
+                }
+            }));
+            expect(duplicateStatus.delete).toHaveBeenCalledTimes(1);
+            expect(channel.__sentMessages.has(existingStatus.id)).toBe(true);
+            expect(channel.__sentMessages.has(duplicateStatus.id)).toBe(false);
+        } finally {
+            competitiveRatedQueue.__resetState();
+            jest.useRealTimers();
+        }
+    });
+
+    it('deletes duplicate pool status messages even when the current status id is known', async () => {
+        jest.useFakeTimers({ doNotFake: ['performance'] });
+        jest.setSystemTime(1_000_000);
+        try {
+            const { channel, client } = createMatchClientMock();
+            const firstInteraction = createButtonInteractionMock({
+                customId: 'rated:competitive:join:1501486517464600657:2v2',
+                userId: 'status-user-1',
+                client
+            });
+
+            await competitiveRatedQueue.handleInteraction(firstInteraction);
+            jest.advanceTimersByTime(500);
+            await flushAsyncTasks();
+
+            const statusMessage = [...channel.__sentMessages.values()]
+                .find(message => String(message.content || '').includes('Players in 2vs2 Pool'));
+            expect(statusMessage).toBeDefined();
+
+            const duplicateStatus = await channel.send({
+                content: statusMessage.content,
+                components: [],
+                allowedMentions: { parse: [], roles: ['680810288605298744'] }
+            });
+            channel.send.mockClear();
+
+            const secondInteraction = createButtonInteractionMock({
+                customId: 'rated:competitive:join:1501486517464600657:2v2',
+                userId: 'status-user-2',
+                client
+            });
+
+            await competitiveRatedQueue.handleInteraction(secondInteraction);
+            jest.advanceTimersByTime(500);
+            await flushAsyncTasks();
+
+            expect(channel.send).not.toHaveBeenCalledWith(expect.objectContaining({
+                content: expect.stringContaining('Players in 2vs2 Pool')
+            }));
+            expect(statusMessage.edit).toHaveBeenCalledWith(expect.objectContaining({
+                content: '<@&680810288605298744>\nPlayers in 2vs2 Pool: **👥 2**',
+                components: [],
+                allowedMentions: {
+                    parse: [],
+                    roles: ['680810288605298744']
+                }
+            }));
+            expect(duplicateStatus.delete).toHaveBeenCalledTimes(1);
+            expect(channel.__sentMessages.has(statusMessage.id)).toBe(true);
+            expect(channel.__sentMessages.has(duplicateStatus.id)).toBe(false);
         } finally {
             competitiveRatedQueue.__resetState();
             jest.useRealTimers();
