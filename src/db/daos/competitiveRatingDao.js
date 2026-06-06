@@ -693,7 +693,8 @@ class CompetitiveRatingDao {
         team1Score,
         team2Score,
         homeTeamNumber,
-        awayTeamNumber
+        awayTeamNumber,
+        completedAtUtc = null
     }, calculateDelta) {
         const pool = await getPool();
         const transaction = new sql.Transaction(pool);
@@ -889,7 +890,7 @@ class CompetitiveRatingDao {
                      HomeTeamNumber = @homeTeamNumber,
                      AwayTeamNumber = @awayTeamNumber,
                      WinnerTeamNumber = @winnerTeamNumber,
-                     CompletedAtUtc = SYSUTCDATETIME(),
+                     CompletedAtUtc = COALESCE(@completedAtUtc, SYSUTCDATETIME()),
                      CancelledAtUtc = NULL,
                      CancelReason = NULL
                  WHERE (@ratedMatchId IS NOT NULL AND Id = @ratedMatchId)
@@ -901,7 +902,8 @@ class CompetitiveRatingDao {
                     team2Score,
                     homeTeamNumber,
                     awayTeamNumber,
-                    winnerTeamNumber
+                    winnerTeamNumber,
+                    completedAtUtc
                 }
             );
 
@@ -1094,6 +1096,42 @@ class CompetitiveRatingDao {
             });
             await transaction.commit();
             return result;
+        } catch (err) {
+            await transaction.rollback().catch(() => {});
+            throw err;
+        }
+    }
+
+    async rebuildRatingPartition({ seasonId, gameId, mode }, calculateDelta) {
+        const pool = await getPool();
+        const transaction = new sql.Transaction(pool);
+        await transaction.begin(sql.ISOLATION_LEVEL.SERIALIZABLE);
+
+        try {
+            await this._acquirePartitionLock(transaction, seasonId, gameId, mode);
+
+            const seasonStatus = await runRequest(
+                transaction,
+                `SELECT TOP 1 IsCompleted FROM ${T.season} WHERE Id = @seasonId`,
+                { seasonId }
+            );
+            const seasonCompleted = Boolean(seasonStatus.recordset[0]?.IsCompleted);
+            const result = await this._rebuildRatingPartition(transaction, {
+                seasonId,
+                gameId,
+                mode,
+                calculateDelta,
+                writeFinalRewards: seasonCompleted
+            });
+            const awardRebuild = seasonCompleted
+                ? await this._rebuildAwardPartition(transaction, { seasonId, gameId, mode })
+                : null;
+
+            await transaction.commit();
+            return {
+                ...result,
+                recalculatedAwardResultCount: awardRebuild?.insertedAwardResults ?? 0
+            };
         } catch (err) {
             await transaction.rollback().catch(() => {});
             throw err;

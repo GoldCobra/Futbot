@@ -94,6 +94,30 @@ describe('competitiveRating WHR/TST sync hooks', () => {
         expect(mockSyncCompletedMatch).not.toHaveBeenCalled();
     });
 
+    it('passes historical completion timestamps through for report backfills', async () => {
+        const completedAtUtc = new Date('2026-06-04T18:22:52.000Z');
+
+        await recordCompetitiveResult({
+            ratedMatchId: 77,
+            matchCode: 'manual:1:22685',
+            gameType: 1,
+            mode: '1v1',
+            winnerTeamNumber: 1,
+            team1Score: 3,
+            team2Score: 0,
+            homeTeamNumber: 1,
+            awayTeamNumber: 2,
+            skipWhrSync: true,
+            completedAtUtc
+        });
+
+        expect(mockRecordMatchCompletion).toHaveBeenCalledWith(expect.objectContaining({
+            ratedMatchId: 77,
+            matchCode: 'manual:1:22685',
+            completedAtUtc
+        }), expect.any(Function));
+    });
+
     it('marks the WHR/TST sync row rolled back after a competitive rollback', async () => {
         mockRollbackMatchByNumber.mockResolvedValue({
             status: 'rolled_back',

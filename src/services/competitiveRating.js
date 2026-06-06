@@ -128,7 +128,8 @@ async function recordCompetitiveResult({
     awayTeamNumber,
     client,
     guildId,
-    skipWhrSync = false
+    skipWhrSync = false,
+    completedAtUtc = null
 }) {
     const season = seasonId
         ? await dao.getSeasonById(seasonId)
@@ -145,7 +146,8 @@ async function recordCompetitiveResult({
         team1Score,
         team2Score,
         homeTeamNumber,
-        awayTeamNumber
+        awayTeamNumber,
+        completedAtUtc
     }, calculateCompetitiveEloDelta);
 
     if (mode === '1v1') {
@@ -160,6 +162,10 @@ async function recordCompetitiveResult({
         seasonId: season.Id,
         changes
     };
+}
+
+async function rebuildRatingPartition({ seasonId, gameId, mode }) {
+    return dao.rebuildRatingPartition({ seasonId, gameId, mode }, calculateCompetitiveEloDelta);
 }
 
 async function rollbackCompetitiveMatch({
@@ -288,6 +294,7 @@ module.exports = {
     getDefaultCompetitiveRating,
     clearRankThresholdCache,
     calculateCompetitiveEloDelta,
+    rebuildRatingPartition,
     scheduleCompetitiveWhrSync,
     recoverPendingCompetitiveWhrSync
 };
