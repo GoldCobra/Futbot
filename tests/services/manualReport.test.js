@@ -23,7 +23,13 @@ describe('manual report service', () => {
         mockRecordCompetitiveResult = jest.fn(async () => ({
             seasonId: 2,
             seasonName: 'Burst Season 2026',
-            changes: []
+            changes: [{
+                playerId: 11,
+                placementBefore: 0,
+                placementAfter: 1,
+                placementComplete: false
+            }],
+            rewardProgress: { progressRowsTouched: 0, earnedRowsInserted: 0 }
         }));
         mockLinkExistingLegacyMirror = jest.fn(async () => ({ id: 55 }));
 
@@ -119,6 +125,15 @@ describe('manual report service', () => {
             matchNumber: 7,
             seasonMatchNumber: 3
         }));
+        expect(result.competitiveResult.changes[0]).toEqual(expect.objectContaining({
+            placementBefore: 0,
+            placementAfter: 1,
+            placementComplete: false
+        }));
+        expect(result.competitiveResult.rewardProgress).toEqual({
+            progressRowsTouched: 0,
+            earnedRowsInserted: 0
+        });
     });
 
     it('records 2v2 legacy history with zero legacy deltas and completes Competitive 2v2 ELO', async () => {
