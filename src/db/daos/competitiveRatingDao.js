@@ -26,6 +26,7 @@ const T = {
     ratedGame: competitiveTable('RatedMatchGame'),
     rollback: competitiveTable('CompetitiveMatchRollback'),
     rollbackSnapshot: competitiveTable('CompetitiveMatchRollbackChangeSnapshot'),
+    whrSync: competitiveTable('CompetitiveWhrSync'),
     seasonMatchSequence: competitiveTable('CompetitiveSeasonMatchSequence'),
     rewardProgress: competitiveTable('CompetitiveSeasonRewardProgress'),
     rewardEarned: competitiveTable('CompetitiveSeasonRewardEarned'),
@@ -1079,6 +1080,80 @@ class CompetitiveRatingDao {
              WHERE Id = @rollbackId`,
             { rollbackId, threadNoticeMessageId, threadFinalizeStatus }
         );
+    }
+
+    async getRollbackCommitState({ gameId, mode, matchNumber }) {
+        const result = await executeQuery(
+            `SELECT TOP 1
+                    rm.Id AS MatchId,
+                    rm.Status AS MatchStatus,
+                    rm.SeasonId,
+                    rm.GameId,
+                    rm.ModeCode,
+                    rm.MatchNumber,
+                    rm.MatchCode,
+                    game.Code AS GameCode,
+                    rollback.Id AS RollbackId,
+                    rollback.RatedMatchId AS RollbackRatedMatchId,
+                    rollback.RolledBackByDiscordId,
+                    rollback.Reason,
+                    ISNULL(snapshotStats.SnapshotCount, 0) AS RollbackSnapshotCount,
+                    ISNULL(changeStats.ChangeCount, 0) AS CurrentChangeCount,
+                    whr.Id AS WhrSyncId,
+                    whr.SyncStatus AS WhrSyncStatus,
+                    whr.LegacyMatchId,
+                    whr.LegacyMultiMatchId
+             FROM ${T.ratedMatch} rm
+             INNER JOIN ${T.game} game ON game.Id = rm.GameId
+             OUTER APPLY (
+                SELECT TOP 1 rb.*
+                FROM ${T.rollback} rb
+                WHERE rb.RatedMatchId = rm.Id
+                ORDER BY rb.Id DESC
+             ) rollback
+             OUTER APPLY (
+                SELECT COUNT(1) AS SnapshotCount
+                FROM ${T.rollbackSnapshot} snapshot
+                WHERE snapshot.RollbackId = rollback.Id
+             ) snapshotStats
+             OUTER APPLY (
+                SELECT COUNT(1) AS ChangeCount
+                FROM ${T.change} crc
+                WHERE crc.RatedMatchId = rm.Id
+             ) changeStats
+             OUTER APPLY (
+                SELECT TOP 1 sync.*
+                FROM ${T.whrSync} sync
+                WHERE sync.RatedMatchId = rm.Id
+                ORDER BY sync.Id DESC
+             ) whr
+             WHERE rm.GameId = @gameId
+               AND rm.ModeCode = @mode
+               AND rm.MatchNumber = @matchNumber`,
+            { gameId, mode, matchNumber }
+        );
+        const row = result.recordset[0];
+        if (!row) return null;
+        return {
+            matchId: row.MatchId,
+            matchStatus: row.MatchStatus,
+            seasonId: row.SeasonId,
+            gameId: row.GameId,
+            mode: row.ModeCode,
+            matchNumber: row.MatchNumber,
+            matchCode: row.MatchCode,
+            gameCode: row.GameCode,
+            rollbackId: row.RollbackId ?? null,
+            rollbackRatedMatchId: row.RollbackRatedMatchId ?? null,
+            rolledBackByDiscordId: row.RolledBackByDiscordId ?? null,
+            reason: row.Reason ?? null,
+            rollbackSnapshotCount: toNumber(row.RollbackSnapshotCount),
+            currentChangeCount: toNumber(row.CurrentChangeCount),
+            whrSyncId: row.WhrSyncId ?? null,
+            whrSyncStatus: row.WhrSyncStatus ?? null,
+            legacyMatchId: row.LegacyMatchId ?? null,
+            legacyMultiMatchId: row.LegacyMultiMatchId ?? null
+        };
     }
 
     async rebuildSeasonRewardProgress({ seasonId, gameId, mode }) {

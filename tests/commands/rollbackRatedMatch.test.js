@@ -85,6 +85,14 @@ describe('rollbackratedmatch command', () => {
             snapshotCount: 4,
             replayedMatchCount: 3,
             recalculatedChangeCount: 6,
+            dbVerification: {
+                verified: true,
+                rollbackId: 44,
+                matchStatus: 'rolled_back',
+                rollbackSnapshotCount: 4,
+                currentChangeCount: 2,
+                whrSyncStatus: 'rolled_back'
+            },
             changes: [
                 { discordId: 'winner-1', eloBefore: 1000, eloAfter: 1050, eloDelta: 50 },
                 { discordId: 'loser-1', eloBefore: 1000, eloAfter: 1000, eloDelta: 0 }
@@ -114,5 +122,21 @@ describe('rollbackratedmatch command', () => {
             threadFinalizeStatus: 'posted'
         });
         expect(interaction.editReply).toHaveBeenCalledWith(expect.stringContaining('Match rolled back: MSC 1v1 #12'));
+        expect(interaction.editReply).toHaveBeenCalledWith(expect.stringContaining('DB verification: RatedMatch #100 is rolled_back; rollback audit #44 confirmed.'));
+    });
+
+    it('does not report success when rollback DB verification fails in the service', async () => {
+        const interaction = buildInteraction();
+        const consoleError = jest.spyOn(console, 'error').mockImplementation(() => {});
+        mockRollbackCompetitiveMatch.mockRejectedValue(new Error("Rollback DB verification failed for MSC 1v1 #12: RatedMatch status is 'completed', expected 'rolled_back'"));
+
+        try {
+            await command.execute(interaction);
+        } finally {
+            consoleError.mockRestore();
+        }
+
+        expect(mockUpdateRollbackThreadStatus).not.toHaveBeenCalled();
+        expect(interaction.editReply).toHaveBeenCalledWith(expect.stringContaining('Rollback DB verification failed'));
     });
 });

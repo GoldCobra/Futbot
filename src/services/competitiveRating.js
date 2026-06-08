@@ -168,6 +168,62 @@ async function rebuildRatingPartition({ seasonId, gameId, mode }) {
     return dao.rebuildRatingPartition({ seasonId, gameId, mode }, calculateCompetitiveEloDelta);
 }
 
+function buildRollbackVerification(rollback, state) {
+    const errors = [];
+
+    if (!state) {
+        errors.push('match readback returned no row');
+    } else {
+        if (Number(state.matchId) !== Number(rollback.matchId)) {
+            errors.push(`readback match id ${state.matchId} did not match rollback match id ${rollback.matchId}`);
+        }
+        if (state.matchStatus !== 'rolled_back') {
+            errors.push(`RatedMatch status is '${state.matchStatus}', expected 'rolled_back'`);
+        }
+        if (!state.rollbackId) {
+            errors.push('rollback audit row is missing');
+        } else if (Number(state.rollbackId) !== Number(rollback.rollbackId)) {
+            errors.push(`rollback audit row is #${state.rollbackId}, expected #${rollback.rollbackId}`);
+        }
+        if (!state.rollbackRatedMatchId) {
+            errors.push('rollback audit row is not linked to a RatedMatch');
+        } else if (Number(state.rollbackRatedMatchId) !== Number(rollback.matchId)) {
+            errors.push(`rollback audit row points to RatedMatch ${state.rollbackRatedMatchId}, expected ${rollback.matchId}`);
+        }
+        if (!rollback.alreadyRolledBack && Number(state.rollbackSnapshotCount) < Number(rollback.snapshotCount ?? 0)) {
+            errors.push(`rollback snapshot count is ${state.rollbackSnapshotCount}, expected at least ${rollback.snapshotCount}`);
+        }
+        if (rollback.whrSync?.syncStatus === 'rolled_back' && state.whrSyncStatus !== 'rolled_back') {
+            errors.push(`WHR/TST sync status is '${state.whrSyncStatus ?? 'missing'}', expected 'rolled_back'`);
+        }
+    }
+
+    return {
+        verified: errors.length === 0,
+        errors,
+        matchId: state?.matchId ?? null,
+        matchStatus: state?.matchStatus ?? null,
+        rollbackId: state?.rollbackId ?? null,
+        rollbackSnapshotCount: state?.rollbackSnapshotCount ?? 0,
+        currentChangeCount: state?.currentChangeCount ?? 0,
+        whrSyncId: state?.whrSyncId ?? null,
+        whrSyncStatus: state?.whrSyncStatus ?? null
+    };
+}
+
+async function verifyRollbackCommitted(rollback) {
+    const state = await dao.getRollbackCommitState({
+        gameId: rollback.gameId,
+        mode: rollback.mode,
+        matchNumber: rollback.matchNumber
+    });
+    const verification = buildRollbackVerification(rollback, state);
+    if (!verification.verified) {
+        throw new Error(`Rollback DB verification failed for ${rollback.gameCode} ${rollback.mode} #${rollback.matchNumber}: ${verification.errors.join('; ')}`);
+    }
+    return verification;
+}
+
 async function rollbackCompetitiveMatch({
     gameId,
     mode,
@@ -195,6 +251,8 @@ async function rollbackCompetitiveMatch({
         };
         console.warn(`[CompetitiveRating] Rollback WHR/TST sync failed: ${error.message}`);
     }
+
+    rollback.dbVerification = await verifyRollbackCommitted(rollback);
 
     if (rollback.mode === '1v1') {
         setTimeout(() => {
@@ -296,5 +354,8 @@ module.exports = {
     calculateCompetitiveEloDelta,
     rebuildRatingPartition,
     scheduleCompetitiveWhrSync,
-    recoverPendingCompetitiveWhrSync
+    recoverPendingCompetitiveWhrSync,
+    __private: {
+        buildRollbackVerification
+    }
 };

@@ -97,12 +97,16 @@ function renderStaffSummary(rollback, threadResult) {
         : rollback.whrSync?.syncStatus
             ? `WHR/TST sync: ${rollback.whrSync.syncStatus}.`
             : 'WHR/TST sync: no mirrored WHR/TST row found.';
+    const dbVerificationLine = rollback.dbVerification?.verified
+        ? `DB verification: RatedMatch #${rollback.matchId} is rolled_back; rollback audit #${rollback.dbVerification.rollbackId} confirmed.`
+        : 'DB verification: not available.';
 
     return [
         rollback.alreadyRolledBack
             ? `Match was already rolled back: ${rollback.gameCode} ${rollback.mode} #${rollback.matchNumber}.`
             : `Match rolled back: ${rollback.gameCode} ${rollback.mode} #${rollback.matchNumber}.`,
         `Audit row: #${rollback.rollbackId}`,
+        dbVerificationLine,
         `Snapshot rows: ${rollback.snapshotCount}`,
         `Replayed matches: ${rollback.replayedMatchCount}`,
         `Recalculated rating changes: ${rollback.recalculatedChangeCount}`,

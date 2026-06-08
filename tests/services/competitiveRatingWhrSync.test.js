@@ -1,5 +1,6 @@
 const mockRecordMatchCompletion = jest.fn();
 const mockRollbackMatchByNumber = jest.fn();
+const mockGetRollbackCommitState = jest.fn();
 const mockGetActiveSeason = jest.fn();
 const mockGetSeasonQueueAvailability = jest.fn();
 const mockSyncCompletedMatch = jest.fn();
@@ -10,7 +11,8 @@ jest.mock('../../src/db/daos/competitiveRatingDao', () => jest.fn().mockImplemen
     getActiveSeason: (...args) => mockGetActiveSeason(...args),
     getSeasonQueueAvailability: (...args) => mockGetSeasonQueueAvailability(...args),
     recordMatchCompletion: (...args) => mockRecordMatchCompletion(...args),
-    rollbackMatchByNumber: (...args) => mockRollbackMatchByNumber(...args)
+    rollbackMatchByNumber: (...args) => mockRollbackMatchByNumber(...args),
+    getRollbackCommitState: (...args) => mockGetRollbackCommitState(...args)
 })));
 
 jest.mock('../../src/db/daos/competitiveWhrSyncDao', () => jest.fn().mockImplementation(() => ({
@@ -30,6 +32,7 @@ describe('competitiveRating WHR/TST sync hooks', () => {
     beforeEach(() => {
         mockRecordMatchCompletion.mockReset();
         mockRollbackMatchByNumber.mockReset();
+        mockGetRollbackCommitState.mockReset();
         mockGetActiveSeason.mockReset();
         mockGetSeasonQueueAvailability.mockReset();
         mockSyncCompletedMatch.mockReset();
@@ -49,6 +52,16 @@ describe('competitiveRating WHR/TST sync hooks', () => {
         ]);
         mockSyncCompletedMatch.mockResolvedValue({ syncStatus: 'synced' });
         mockMarkRolledBack.mockResolvedValue({ syncStatus: 'rolled_back' });
+        mockGetRollbackCommitState.mockResolvedValue({
+            matchId: 88,
+            matchStatus: 'rolled_back',
+            rollbackId: 9,
+            rollbackRatedMatchId: 88,
+            rollbackSnapshotCount: 2,
+            currentChangeCount: 2,
+            whrSyncId: 14,
+            whrSyncStatus: 'rolled_back'
+        });
         mockSyncPendingCompletedMatches.mockResolvedValue([{ ratedMatchId: 77, syncStatus: 'synced' }]);
     });
 
@@ -122,7 +135,12 @@ describe('competitiveRating WHR/TST sync hooks', () => {
         mockRollbackMatchByNumber.mockResolvedValue({
             status: 'rolled_back',
             matchId: 88,
-            mode: '2v2'
+            rollbackId: 9,
+            gameId: 1,
+            gameCode: 'MSBL',
+            mode: '2v2',
+            matchNumber: 12,
+            snapshotCount: 2
         });
 
         const result = await rollbackCompetitiveMatch({
@@ -134,7 +152,49 @@ describe('competitiveRating WHR/TST sync hooks', () => {
         });
 
         expect(mockMarkRolledBack).toHaveBeenCalledWith({ ratedMatchId: 88 });
+        expect(mockGetRollbackCommitState).toHaveBeenCalledWith({
+            gameId: 1,
+            mode: '2v2',
+            matchNumber: 12
+        });
         expect(result.whrSync).toEqual({ syncStatus: 'rolled_back' });
+        expect(result.dbVerification).toEqual(expect.objectContaining({
+            verified: true,
+            matchStatus: 'rolled_back',
+            rollbackId: 9,
+            whrSyncStatus: 'rolled_back'
+        }));
+    });
+
+    it('rejects a rollback success response when the DB readback does not show the match rolled back', async () => {
+        mockRollbackMatchByNumber.mockResolvedValue({
+            status: 'rolled_back',
+            matchId: 88,
+            rollbackId: 9,
+            gameId: 1,
+            gameCode: 'MSBL',
+            mode: '1v1',
+            matchNumber: 12,
+            snapshotCount: 2
+        });
+        mockGetRollbackCommitState.mockResolvedValue({
+            matchId: 88,
+            matchStatus: 'completed',
+            rollbackId: 9,
+            rollbackRatedMatchId: 88,
+            rollbackSnapshotCount: 2,
+            currentChangeCount: 2,
+            whrSyncId: 14,
+            whrSyncStatus: 'rolled_back'
+        });
+
+        await expect(rollbackCompetitiveMatch({
+            gameId: 1,
+            mode: '1v1',
+            matchNumber: 12,
+            reason: 'wrong report',
+            rolledBackByDiscordId: 'staff-1'
+        })).rejects.toThrow("RatedMatch status is 'completed', expected 'rolled_back'");
     });
 
     it('exposes DB-backed WHR/TST sync recovery for startup and tick retries', async () => {

@@ -155,3 +155,58 @@ describe('CompetitiveRatingDao season queue availability', () => {
         expect(executeQuery).toHaveBeenCalledTimes(1);
     });
 });
+
+describe('CompetitiveRatingDao rollback commit readback', () => {
+    beforeEach(() => {
+        executeQuery.mockReset();
+    });
+
+    it('reads committed rollback status, audit and WHR/TST sync state from the DB', async () => {
+        executeQuery.mockResolvedValueOnce({
+            recordset: [{
+                MatchId: 88,
+                MatchStatus: 'rolled_back',
+                SeasonId: 2,
+                GameId: 3,
+                ModeCode: '1v1',
+                MatchNumber: 41,
+                MatchCode: 'manual:1:22751',
+                GameCode: 'MSBL',
+                RollbackId: 9,
+                RollbackRatedMatchId: 88,
+                RolledBackByDiscordId: 'staff-1',
+                Reason: 'duplicate report',
+                RollbackSnapshotCount: 12,
+                CurrentChangeCount: 2,
+                WhrSyncId: 14,
+                WhrSyncStatus: 'rolled_back',
+                LegacyMatchId: 22751,
+                LegacyMultiMatchId: null
+            }]
+        });
+
+        const dao = new CompetitiveRatingDao();
+        const result = await dao.getRollbackCommitState({
+            gameId: 3,
+            mode: '1v1',
+            matchNumber: 41
+        });
+
+        expect(result).toEqual(expect.objectContaining({
+            matchId: 88,
+            matchStatus: 'rolled_back',
+            rollbackId: 9,
+            rollbackSnapshotCount: 12,
+            whrSyncStatus: 'rolled_back'
+        }));
+        const [query, inputs] = executeQuery.mock.calls[0];
+        expect(query).toContain('CompetitiveMatchRollback');
+        expect(query).toContain('CompetitiveMatchRollbackChangeSnapshot');
+        expect(query).toContain('CompetitiveWhrSync');
+        expect(inputs).toEqual({
+            gameId: 3,
+            mode: '1v1',
+            matchNumber: 41
+        });
+    });
+});
