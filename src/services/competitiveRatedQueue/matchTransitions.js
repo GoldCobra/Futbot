@@ -31,18 +31,22 @@ async function runMatchTransition({
     withInteractionLock,
     handleExpiredMatch,
     transition,
+    onReceived,
     onAckFailed,
+    onAcked,
     onQueued,
     onStarted,
     onFinished
 }) {
     const replyAcknowledgement = ensureImmediateReply ?? ensureDeferredReply;
+    await onReceived?.();
     const acknowledged = await acknowledgeMatchAction(interaction, matchAction, replyAcknowledgement, ensureDeferredUpdate);
     if (!acknowledged) {
         await onAckFailed?.();
         return true;
     }
 
+    await onAcked?.();
     rememberPrivateDeliveryInteraction(match, interaction);
     await onQueued?.();
 

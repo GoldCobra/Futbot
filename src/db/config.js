@@ -4,6 +4,7 @@ const config = {
     user: process.env.DB_USER,
     password: process.env.DB_PASS,
     server: 'yew.arvixe.com',
+    port: Number(process.env.DB_PORT ?? 1433),
     database: 'MarioStrikers',
     connectionTimeout: Number(process.env.DB_CONNECTION_TIMEOUT_MS ?? 15000),
     requestTimeout: Number(process.env.DB_REQUEST_TIMEOUT_MS ?? 30000),
@@ -15,7 +16,6 @@ const config = {
     options: {
         encrypt: true,
         trustServerCertificate: true,
-        port: 443,
         cryptoCredentialsDetails: {
               minVersion: 'TLSv1'
           }

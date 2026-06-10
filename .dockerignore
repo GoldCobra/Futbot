@@ -8,6 +8,7 @@ node_modules
 !.env.example
 
 coverage
+runtime
 *.log
 npm-debug.log*
 yarn-debug.log*

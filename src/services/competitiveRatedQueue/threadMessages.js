@@ -1,5 +1,48 @@
 const { buildThreadTextPayload, quoteThreadPayload } = require('./formatting');
 
+const REQUIRED_THREAD_OP_ATTEMPTS = 3;
+
+function sleep(ms) {
+    return new Promise(resolve => setTimeout(resolve, ms));
+}
+
+function getRetryDelayMs(attempt) {
+    if (process.env.NODE_ENV === 'test') return 0;
+    return Math.min(250 * attempt, 1000);
+}
+
+function isRetryableDiscordError(error) {
+    if (!error) return false;
+    if ([500, 502, 503, 504, 520, 522, 524].includes(Number(error.status))) return true;
+    if ([50001, 50013, 10003, 10008].includes(Number(error.code))) return false;
+    if ([500, 502, 503, 504].includes(Number(error.code))) return true;
+    const message = `${error.message ?? ''} ${error.stack ?? ''}`;
+    return [
+        'ECONNRESET',
+        'ETIMEDOUT',
+        'EAI_AGAIN',
+        'rate limit',
+        'Request timed out',
+        'socket hang up'
+    ].some(pattern => message.includes(pattern));
+}
+
+async function runRequiredThreadOperation(operation, { attempts = REQUIRED_THREAD_OP_ATTEMPTS } = {}) {
+    let lastError = null;
+    for (let attempt = 1; attempt <= attempts; attempt += 1) {
+        try {
+            return await operation(attempt);
+        } catch (error) {
+            lastError = error;
+            if (!isRetryableDiscordError(error) || attempt >= attempts) {
+                throw error;
+            }
+            await sleep(getRetryDelayMs(attempt));
+        }
+    }
+    throw lastError;
+}
+
 async function fetchThreadMessage(thread, messageId) {
     if (!messageId || !thread?.messages?.fetch) {
         return null;
@@ -19,6 +62,35 @@ async function editOrSendThreadMessage(thread, messageId, payload) {
     }
 
     return await thread.send(threadPayload);
+}
+
+async function sendRequiredThreadMessage(thread, payload, options = {}) {
+    const threadPayload = quoteThreadPayload(payload);
+    if (!thread?.send) {
+        throw new Error('Thread is not available for required send');
+    }
+    return await runRequiredThreadOperation(() => thread.send(threadPayload), options);
+}
+
+async function editOrSendRequiredThreadMessage(thread, messageId, payload, options = {}) {
+    const threadPayload = quoteThreadPayload(payload);
+    if (!thread?.send) {
+        throw new Error('Thread is not available for required edit/send');
+    }
+
+    const existingMessage = await fetchThreadMessage(thread, messageId);
+    if (existingMessage) {
+        try {
+            await runRequiredThreadOperation(() => existingMessage.edit(threadPayload), options);
+            return existingMessage;
+        } catch (error) {
+            if (Number(error?.code) !== 10008 && !isRetryableDiscordError(error)) {
+                throw error;
+            }
+        }
+    }
+
+    return await sendRequiredThreadMessage(thread, payload, options);
 }
 
 async function deleteSetupMessageAndPostConfirmation(thread, setupMessageId, confirmationMessageId, payload) {
@@ -48,6 +120,10 @@ async function clearSetupMessageComponents(thread, messageId) {
 
 async function deleteThreadMessage(thread, messageId) {
     if (!thread?.send || !messageId) return;
+    if (thread?.messages?.delete) {
+        const deleted = await thread.messages.delete(messageId).then(() => true).catch(() => false);
+        if (deleted) return;
+    }
     const msg = await fetchThreadMessage(thread, messageId);
     if (msg) await msg.delete().catch(() => {});
 }
@@ -100,5 +176,7 @@ module.exports = {
     deleteSetupMessageAndPostConfirmation,
     deleteThreadMessage,
     editOrSendThreadMessage,
+    editOrSendRequiredThreadMessage,
+    sendRequiredThreadMessage,
     fetchThreadMessage
 };

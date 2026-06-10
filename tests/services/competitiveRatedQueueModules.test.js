@@ -1,3 +1,7 @@
+const fs = require('node:fs/promises');
+const os = require('node:os');
+const path = require('node:path');
+
 const customIds = require('../../src/services/competitiveRatedQueue/customIds');
 const formatting = require('../../src/services/competitiveRatedQueue/formatting');
 const matchLogic = require('../../src/services/competitiveRatedQueue/matchLogic');
@@ -5,12 +9,14 @@ const matchState = require('../../src/services/competitiveRatedQueue/matchState'
 const matchTransitions = require('../../src/services/competitiveRatedQueue/matchTransitions');
 const messages = require('../../src/services/competitiveRatedQueue/messages');
 const privatePrompts = require('../../src/services/competitiveRatedQueue/privatePrompts');
+const runtimeState = require('../../src/services/competitiveRatedQueue/runtimeState');
 const competitiveRatedQueue = require('../../src/services/competitiveRatedQueue');
 
 describe('competitiveRatedQueue internal modules', () => {
     it('keeps the public competitiveRatedQueue facade API stable', () => {
         expect(Object.keys(competitiveRatedQueue).sort()).toEqual([
             '__createCompetitiveRatedMatchForTests',
+            '__flushOutputQueuesForTests',
             '__flushRuntimeLogsForTests',
             '__getStateSnapshot',
             '__resetState',
@@ -194,5 +200,54 @@ describe('competitiveRatedQueue internal modules', () => {
         await privatePrompts.clearWinnerWaitingPrompt(match);
 
         expect(match.privatePromptHandles.winnerWaiting).toBeNull();
+    });
+
+    it('persists runtime matches without restoring stale timers', async () => {
+        const previousRuntimeDir = process.env.FUTBOT_RUNTIME_DIR;
+        const previousRuntimeTestFlag = process.env.FUTBOT_RUNTIME_STATE_TEST;
+        const runtimeDir = await fs.mkdtemp(path.join(os.tmpdir(), 'futbot-runtime-'));
+        process.env.FUTBOT_RUNTIME_DIR = runtimeDir;
+        process.env.FUTBOT_RUNTIME_STATE_TEST = '1';
+
+        try {
+            await runtimeState.saveCompetitiveRatedRuntimeState({
+                activeMatches: [{
+                    id: 'match-1',
+                    threadId: 'thread-1',
+                    teams: [{ memberIds: ['home-user'] }, { memberIds: ['away-user'] }],
+                    score: { team1: 1, team2: 0 },
+                    stage: 'awaiting_winner',
+                    timeoutPhase: 'game',
+                    timeoutDeadlineAt: 12345,
+                    timeoutTimer: { ignored: true },
+                    participantIdByDiscordId: new Map([['home-user', 7000]])
+                }],
+                pendingCompetitiveDbOps: [{
+                    key: 'record_game:5000:1',
+                    type: 'record_game',
+                    payload: { ratedMatchId: 5000, gameNumber: 1 }
+                }]
+            });
+
+            const loaded = await runtimeState.loadCompetitiveRatedRuntimeState();
+            expect(loaded.activeMatches).toHaveLength(1);
+            expect(loaded.activeMatches[0].participantIdByDiscordId.get('home-user')).toBe(7000);
+            expect(loaded.activeMatches[0].timeoutPhase).toBeNull();
+            expect(loaded.activeMatches[0].timeoutDeadlineAt).toBeNull();
+            expect(loaded.activeMatches[0].recoveredRuntimeTimeoutPhase).toBe('game');
+            expect(loaded.pendingCompetitiveDbOps).toHaveLength(1);
+        } finally {
+            if (previousRuntimeDir === undefined) {
+                delete process.env.FUTBOT_RUNTIME_DIR;
+            } else {
+                process.env.FUTBOT_RUNTIME_DIR = previousRuntimeDir;
+            }
+            if (previousRuntimeTestFlag === undefined) {
+                delete process.env.FUTBOT_RUNTIME_STATE_TEST;
+            } else {
+                process.env.FUTBOT_RUNTIME_STATE_TEST = previousRuntimeTestFlag;
+            }
+            await fs.rm(runtimeDir, { recursive: true, force: true });
+        }
     });
 });

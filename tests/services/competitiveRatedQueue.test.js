@@ -161,7 +161,8 @@ const mockExecuteQuery = jest.fn(async (query, params = {}) => {
 });
 
 jest.mock('../../src/db/sqlClient', () => ({
-    executeQuery: (...args) => mockExecuteQuery(...args)
+    executeQuery: (...args) => mockExecuteQuery(...args),
+    isTransientDbError: err => Boolean(err?.transientDbError)
 }));
 
 jest.mock('../../src/services/competitiveRating', () => ({
@@ -736,8 +737,8 @@ function expectPublicThreadTextIsQuoted(thread) {
 }
 
 function threadHasPublicSelectionButtons(thread) {
-    return thread.send.mock.calls.some(([payload]) =>
-        getButtonCustomIds(payload).some(customId =>
+    return [...thread.__sentMessages.values()].some(message =>
+        getButtonCustomIds(message.payload).some(customId =>
             customId.includes(':match:stadium:') || customId.includes(':match:captain:')
         )
     );
@@ -751,6 +752,11 @@ function threadHasImagePayload(thread, imageName) {
 
 async function flushRuntimeLogs() {
     await competitiveRatedQueue.__flushRuntimeLogsForTests();
+    await flushAsyncTasks();
+}
+
+async function flushOutputQueues() {
+    await competitiveRatedQueue.__flushOutputQueuesForTests();
     await flushAsyncTasks();
 }
 
@@ -1855,6 +1861,7 @@ describe('competitiveRatedQueue', () => {
                 userId: 'away-user',
                 client
             }));
+            await flushOutputQueues();
 
             expect(findThreadPayload(thread, payload => payload.components?.[0]?.toJSON().components[0].label === 'GAME WIN'))
                 .toBeDefined();
@@ -1920,28 +1927,28 @@ describe('competitiveRatedQueue', () => {
             await competitiveRatedQueue.handleInteraction(homeStart);
             expect(homeStart.editReply.mock.calls.at(-1)[0].content).toContain('STADIUM');
             expect(homeStart.editReply.mock.calls.at(-1)[0].content).toContain('Time remaining:');
-            expect(homeStart.editReply.mock.calls.at(-1)[0].content).toContain(relativeTimestamp(1_120_000));
+            expect(homeStart.editReply.mock.calls.at(-1)[0].content).toContain('**2 mins**');
             expect(homeStart.editReply.mock.calls.at(-1)[0].components[0].toJSON().components[0].custom_id)
                 .toContain(':match:stadium:');
-            expect(findThreadPayload(thread, payload =>
-                payload.components?.[0]?.toJSON().components[0]?.custom_id?.includes(':match:stadium:')
-            )).toBeUndefined();
+            await flushOutputQueues();
+            expect(threadHasPublicSelectionButtons(thread)).toBe(true);
 
             const awayStart = createButtonInteractionMock({ customId: startCustomId, userId: 'away-user', client });
             await competitiveRatedQueue.handleInteraction(awayStart);
             expect(awayStart.editReply.mock.calls.at(-1)[0].content).toContain('CAPTAIN');
             expect(awayStart.editReply.mock.calls.at(-1)[0].content).toContain('Time remaining:');
-            expect(awayStart.editReply.mock.calls.at(-1)[0].content).toContain(relativeTimestamp(1_120_000));
+            expect(awayStart.editReply.mock.calls.at(-1)[0].content).toContain('**2 mins**');
             expect(awayStart.editReply.mock.calls.at(-1)[0].components[0].toJSON().components[0].custom_id)
                 .toContain(':match:captain:');
-            expect(findThreadPayload(thread, payload =>
-                payload.components?.[0]?.toJSON().components[0]?.custom_id?.includes(':match:captain:')
-            )).toBeUndefined();
+            await flushOutputQueues();
+            expect(threadHasPublicSelectionButtons(thread)).toBe(true);
             expect(threadHasImagePayload(thread, 'g1.png')).toBe(true);
             expectFileNotImmediatelyBefore(thread, 'sep.png', 'g1.png');
             expectPublicThreadTextIsQuoted(thread);
             expect(setupMessage.delete).toHaveBeenCalled();
-            expect(setupMessage.edit).not.toHaveBeenCalled();
+            expect(setupMessage.edit).toHaveBeenCalledWith(expect.objectContaining({
+                content: expect.stringContaining(relativeTimestamp(1_300_000))
+            }));
         } finally {
             randomSpy.mockRestore();
             competitiveRatedQueue.__resetState();
@@ -2042,9 +2049,10 @@ describe('competitiveRatedQueue', () => {
             expect(replyContents).not.toContain('That action is already being processed.');
             expect(homeStart.editReply.mock.calls.at(-1)[0].content).toContain('STADIUM');
             expect(awayStart.editReply.mock.calls.at(-1)[0].content).toContain('CAPTAIN');
+            await flushOutputQueues();
             expect(threadHasImagePayload(thread, 'g1.png')).toBe(true);
             expectFileNotImmediatelyBefore(thread, 'sep.png', 'g1.png');
-            expect(threadHasPublicSelectionButtons(thread)).toBe(false);
+            expect(threadHasPublicSelectionButtons(thread)).toBe(true);
         } finally {
             randomSpy.mockRestore();
             competitiveRatedQueue.__resetState();
@@ -2226,13 +2234,13 @@ describe('competitiveRatedQueue', () => {
             expect(findThreadPayload(thread, payload =>
                 getButtonComponents(payload).some(component => component.label === 'Start Match')
             )).toBeUndefined();
-            const winnerPayload = findThreadPayload(thread, payload =>
+            const winnerMessage = findThreadMessage(thread, payload =>
                 getButtonComponents(payload).some(component => component.label === 'GAME WIN')
             );
-            expect(winnerPayload).toBeDefined();
-            expect(winnerPayload.content).toContain('Press **GAME WIN** when the game is over.');
-            expect(winnerPayload.content).toContain('Time remaining:');
-            expect(winnerPayload.content).toContain(relativeTimestamp(2_800_000));
+            expect(winnerMessage).toBeDefined();
+            expect(winnerMessage.content).toContain('Press **GAME WIN** when the game is over.');
+            expect(winnerMessage.content).toContain('Time remaining:');
+            expect(winnerMessage.content).toContain(relativeTimestamp(2_800_000));
             expect(threadHasPublicSelectionButtons(thread)).toBe(false);
             expect(competitiveRatedQueue.__getStateSnapshot().activeMatchCount).toBe(1);
         } finally {
@@ -2267,6 +2275,7 @@ describe('competitiveRatedQueue', () => {
                 userId: 'home-user',
                 client
             }));
+            await flushOutputQueues();
 
             const confirmMessage = findThreadMessage(thread, message =>
                 getButtonComponents(message).some(component => component.label === 'Confirm Game Loss')
@@ -2289,6 +2298,7 @@ describe('competitiveRatedQueue', () => {
                 client
             });
             await competitiveRatedQueue.handleInteraction(confirmInteraction);
+            await flushOutputQueues();
 
             expect(confirmInteraction.editReply).not.toHaveBeenCalled();
             expect(confirmInteraction.deleteReply).toHaveBeenCalled();
@@ -2398,6 +2408,7 @@ describe('competitiveRatedQueue', () => {
             client
         });
         await competitiveRatedQueue.handleInteraction(winInteraction);
+        await flushOutputQueues();
 
         expect(competitiveRatedQueue.__getStateSnapshot().activeMatchCount).toBe(1);
         expect(findThreadPayload(thread, payload => payload.content?.includes('WINS THE MATCH'))).toBeUndefined();
@@ -2486,6 +2497,7 @@ describe('competitiveRatedQueue', () => {
                 competitiveRatedQueue.handleInteraction(createButtonInteractionMock({ customId: stadiumCustomId, userId: 'home-user', client })),
                 competitiveRatedQueue.handleInteraction(createButtonInteractionMock({ customId: captainCustomId, userId: 'away-user', client }))
             ]);
+            await flushOutputQueues();
 
             expect(countThreadPayloads(thread, payload => payload.content?.includes('chose'))).toBe(1);
             expect(countThreadPayloads(thread, payload => threadPayloadHasFile(payload, 'g1.png'))).toBe(1);
@@ -2496,6 +2508,52 @@ describe('competitiveRatedQueue', () => {
             randomSpy.mockRestore();
             competitiveRatedQueue.__resetState();
         }
+    });
+
+    it('does not block a setup selection interaction on slow ordered thread output', async () => {
+        const { client, thread } = createMatchClientMock();
+        const options = createMatchOptions();
+        const match = createMatchFixture({
+            stage: 'awaiting_start',
+            selectedStadium: options.stadiums[0]
+        });
+        competitiveRatedQueue.__seedStateForTests({
+            activeMatches: [match],
+            cachedOptionsByGameType: { MSC: options }
+        });
+
+        const originalSendImpl = thread.send.getMockImplementation();
+        let releaseSend;
+        thread.send.mockImplementationOnce(payload => new Promise(resolve => {
+            releaseSend = async () => resolve(await originalSendImpl(payload));
+        }));
+
+        const handlePromise = competitiveRatedQueue.handleInteraction(createButtonInteractionMock({
+            customId: 'rated:competitive:match:captain:match-1:10:1',
+            userId: 'away-user',
+            client
+        }));
+        const completedBeforeSlowSend = await Promise.race([
+            handlePromise.then(() => true),
+            new Promise(resolve => setTimeout(() => resolve(false), 10))
+        ]);
+
+        expect(completedBeforeSlowSend).toBe(true);
+        expect(match.stage).toBe('awaiting_winner');
+        expect(competitiveRatedQueue.__getStateSnapshot().pendingOutputQueueCount).toBe(1);
+        expect(findThreadMessage(thread, payload => threadPayloadHasFile(payload, 'g1.png'))).toBeUndefined();
+
+        for (let attempt = 0; attempt < 5 && !releaseSend; attempt += 1) {
+            await Promise.resolve();
+        }
+        expect(releaseSend).toEqual(expect.any(Function));
+        await releaseSend();
+        await flushOutputQueues();
+
+        expect(threadHasImagePayload(thread, 'g1.png')).toBe(true);
+        expect(findThreadPayload(thread, payload =>
+            getButtonComponents(payload).some(component => component.label === 'GAME WIN')
+        )).toBeDefined();
     });
 
     it('keeps MSC Game Win and Confirm Game Loss in one public control and delays result until next setup picks', async () => {
@@ -2532,6 +2590,7 @@ describe('competitiveRatedQueue', () => {
             client
         });
         await competitiveRatedQueue.handleInteraction(winInteraction);
+        await flushOutputQueues();
 
         expect(match.score.team1).toBe(1);
         expect(match.stage).toBe('awaiting_loser_confirmation');
@@ -2578,6 +2637,7 @@ describe('competitiveRatedQueue', () => {
             userId: 'home-user',
             client
         }));
+        await flushOutputQueues();
 
         const resultIndex = findThreadPayloadIndex(thread, payload => payload.content?.includes('wins **Game 1**'));
         const gameImageIndex = findThreadPayloadIndex(thread, payload => threadPayloadHasFile(payload, 'g2.png'));
@@ -2605,6 +2665,7 @@ describe('competitiveRatedQueue', () => {
             client
         });
         await competitiveRatedQueue.handleInteraction(winInteraction);
+        await flushOutputQueues();
 
         expect(match.stage).toBe('awaiting_loser_confirmation');
         expect(threadHasImagePayload(thread, 'g2.png')).toBe(false);
@@ -2642,6 +2703,7 @@ describe('competitiveRatedQueue', () => {
             userId: 'home-user',
             client
         }));
+        await flushOutputQueues();
 
         const delayedResultIndex = findThreadPayloadIndex(thread, payload => payload.content?.includes('wins **Game 1**'));
         const delayedGameImageIndex = findThreadPayloadIndex(thread, payload => threadPayloadHasFile(payload, 'g2.png'));
@@ -2684,10 +2746,12 @@ describe('competitiveRatedQueue', () => {
             await competitiveRatedQueue.handleInteraction(
                 createButtonInteractionMock({ customId: startCustomId, userId: 'away-user', client })
             );
+            await flushOutputQueues();
 
             jest.advanceTimersByTime(2 * 60_000);
             await flushAsyncTasks();
             await flushAsyncTasks();
+            await flushOutputQueues();
 
             // Both players auto-selected → combined confirmation message appears
             const confPayload = findThreadPayload(thread, payload => payload.content?.includes('chose'));
@@ -2745,6 +2809,7 @@ describe('competitiveRatedQueue', () => {
 
             jest.advanceTimersByTime(2 * 60_000);
             await Promise.all([pickPromise, flushAsyncTasks()]);
+            await flushOutputQueues();
 
             expect(match.selectedStadium).not.toBeNull();
             expect(match.selectedCaptain).not.toBeNull();
@@ -2838,6 +2903,7 @@ describe('competitiveRatedQueue', () => {
             userId: 'home-user',
             client
         }));
+        await flushOutputQueues();
 
         const gameImageIndex = findThreadPayloadIndex(thread, payload => threadPayloadHasFile(payload, 'g2.png'));
         const resultIndex = findThreadPayloadIndex(thread, payload => payload.content?.includes('wins **Game 1**'));
@@ -2932,6 +2998,7 @@ describe('competitiveRatedQueue', () => {
             userId: 'home-user',
             client
         }));
+        await flushOutputQueues();
 
         const delayedResultIndex = findThreadPayloadIndex(thread, payload => payload.content?.includes('wins **Game 1**'));
         const selectionsIndex = findThreadPayloadIndex(thread, payload => payload.content?.includes('chose'));
@@ -3071,6 +3138,210 @@ describe('competitiveRatedQueue', () => {
         )).toBe(0);
     });
 
+    it('keeps loser advantage available as a public thread control and starts the timer after it is visible', async () => {
+        jest.useFakeTimers({ doNotFake: ['performance'] });
+        jest.setSystemTime(1_000_000);
+
+        try {
+            const { client, thread } = createMatchClientMock();
+            const match = createMatchFixture({
+                score: { team1: 1, team2: 0 },
+                stage: 'awaiting_loser_confirmation',
+                loserTeamIndex: 2,
+                loserRepMention: '<@away-user>',
+                pendingResultGameNumber: 1,
+                pendingResult: {
+                    gameNumber: 1,
+                    winnerTeamIndex: 1,
+                    winnerMention: '<@home-user>',
+                    loserTeamIndex: 2,
+                    reporterDiscordId: 'home-user',
+                    homeTeamNumber: 1,
+                    stadiumCode: 'bowser',
+                    captainCode: 'mario'
+                }
+            });
+            const initialControl = await thread.send({
+                content: 'confirm',
+                components: competitiveRatedQueue.buildMatchComponents(match, createMatchOptions())
+            });
+            const originalEdit = initialControl.edit;
+            let releaseEdit = null;
+            let shouldBlockEdit = true;
+            initialControl.edit = jest.fn(nextPayload => {
+                if (!shouldBlockEdit) {
+                    return originalEdit(nextPayload);
+                }
+                shouldBlockEdit = false;
+                return new Promise(resolve => {
+                    releaseEdit = async () => {
+                        resolve(await originalEdit(nextPayload));
+                    };
+                });
+            });
+            match.controlMessageId = initialControl.id;
+            competitiveRatedQueue.__seedStateForTests({
+                activeMatches: [match],
+                cachedOptionsByGameType: { MSC: createMatchOptions() }
+            });
+
+            await competitiveRatedQueue.handleInteraction(createButtonInteractionMock({
+                customId: 'rated:competitive:match:loser_confirm:match-1:1',
+                userId: 'away-user',
+                client
+            }));
+
+            expect(match.loserAdvantagePromptShown).toBe(true);
+
+            const flushPromise = flushOutputQueues();
+            await flushAsyncTasks();
+            await flushAsyncTasks();
+
+            expect(initialControl.edit).toHaveBeenCalled();
+            expect(match.timeoutPhase).toBe(null);
+
+            await releaseEdit();
+            await flushPromise;
+
+            expect(match.timeoutPhase).toBe('loser_advantage');
+            expect(initialControl.payload.content).toContain('choose your advantage');
+            expect(getButtonCustomIdByLabel(initialControl.payload, 'Choose Home')).toContain(':loser_advantage:');
+            expect(getButtonCustomIdByLabel(initialControl.payload, 'Choose Captain First')).toContain(':loser_advantage:');
+            expect(getButtonCustomIdByLabel(initialControl.payload, 'Confirm Game Loss')).toBeUndefined();
+            expect(mockRatedMatchDao.recordGame).toHaveBeenCalledTimes(1);
+        } finally {
+            competitiveRatedQueue.__resetState();
+            jest.useRealTimers();
+        }
+    });
+
+    it('keeps the public loser advantage control usable when private prompt delivery fails completely', async () => {
+        const errorSpy = jest.spyOn(console, 'error').mockImplementation(() => {});
+        try {
+            const { client, thread } = createMatchClientMock();
+            const match = createMatchFixture({
+                score: { team1: 1, team2: 0 },
+                stage: 'awaiting_loser_confirmation',
+                loserTeamIndex: 2,
+                loserRepMention: '<@away-user>',
+                pendingResultGameNumber: 1,
+                pendingResult: {
+                    gameNumber: 1,
+                    winnerTeamIndex: 1,
+                    winnerMention: '<@home-user>',
+                    loserTeamIndex: 2,
+                    reporterDiscordId: 'home-user',
+                    homeTeamNumber: 1,
+                    stadiumCode: 'bowser',
+                    captainCode: 'mario'
+                }
+            });
+            competitiveRatedQueue.__seedStateForTests({
+                activeMatches: [match],
+                cachedOptionsByGameType: { MSC: createMatchOptions() }
+            });
+
+            const confirmInteraction = createButtonInteractionMock({
+                customId: 'rated:competitive:match:loser_confirm:match-1:1',
+                userId: 'away-user',
+                client
+            });
+            confirmInteraction.editReply.mockRejectedValueOnce(new Error('expired interaction token'));
+            confirmInteraction.followUp.mockRejectedValueOnce(new Error('Unknown interaction'));
+
+            await competitiveRatedQueue.handleInteraction(confirmInteraction);
+            await flushOutputQueues();
+
+            const publicAdvantagePayload = findThreadPayload(thread, payload =>
+                getButtonComponents(payload).some(component => component.label === 'Choose Home')
+            );
+            expect(publicAdvantagePayload).toBeDefined();
+            expect(getButtonCustomIdByLabel(publicAdvantagePayload, 'Choose Home')).toContain(':loser_advantage:');
+            expect(match.timeoutPhase).toBe('loser_advantage');
+            expect(findThreadPayload(thread, payload =>
+                payload.content?.includes('MATCH CANCELLED DUE TO SETUP ERROR')
+            )).toBeUndefined();
+        } finally {
+            errorSpy.mockRestore();
+        }
+    });
+
+    it('watchdog restores a missing GAME WIN control without changing match state', async () => {
+        jest.useFakeTimers({ doNotFake: ['performance'] });
+        jest.setSystemTime(1_000_000);
+
+        try {
+            const { client, thread } = createMatchClientMock();
+            const match = createMatchFixture({
+                stage: 'awaiting_winner',
+                selectedStadium: { code: 'bowser', value: 'bowser', description: 'Bowser Stadium' },
+                selectedCaptain: { code: 'mario', value: 'mario', description: 'Mario' }
+            });
+            const staleControl = await thread.send({
+                content: 'stale winner control',
+                components: competitiveRatedQueue.buildMatchComponents(match, createMatchOptions())
+            });
+            match.controlMessageId = staleControl.id;
+            await staleControl.delete();
+            competitiveRatedQueue.__seedStateForTests({
+                activeMatches: [match],
+                cachedOptionsByGameType: { MSC: createMatchOptions() }
+            });
+
+            await competitiveRatedQueue.__tickForTests(client);
+            await flushOutputQueues();
+
+            expect(match.stage).toBe('awaiting_winner');
+            expect(match.timeoutPhase).toBe('game');
+            const restoredControl = findThreadMessage(thread, payload =>
+                getButtonComponents(payload).some(component => component.label === 'GAME WIN')
+            );
+            expect(restoredControl).toBeDefined();
+            expect(restoredControl.id).toBe(match.controlMessageId);
+            expect(restoredControl.id).not.toBe(staleControl.id);
+        } finally {
+            competitiveRatedQueue.__resetState();
+            jest.useRealTimers();
+        }
+    });
+
+    it('watchdog refreshes an existing GAME WIN control when runtime recovery has no active timer', async () => {
+        jest.useFakeTimers({ doNotFake: ['performance'] });
+        jest.setSystemTime(1_000_000);
+
+        try {
+            const { client, thread } = createMatchClientMock();
+            const match = createMatchFixture({
+                stage: 'awaiting_winner',
+                selectedStadium: { code: 'bowser', value: 'bowser', description: 'Bowser Stadium' },
+                selectedCaptain: { code: 'mario', value: 'mario', description: 'Mario' },
+                timeoutPhase: null,
+                timeoutDeadlineAt: null
+            });
+            const existingControl = await thread.send({
+                content: 'existing winner control',
+                components: competitiveRatedQueue.buildMatchComponents(match, createMatchOptions())
+            });
+            match.controlMessageId = existingControl.id;
+            competitiveRatedQueue.__seedStateForTests({
+                activeMatches: [match],
+                cachedOptionsByGameType: { MSC: createMatchOptions() }
+            });
+
+            await competitiveRatedQueue.__tickForTests(client);
+            await flushOutputQueues();
+
+            expect(match.stage).toBe('awaiting_winner');
+            expect(match.timeoutPhase).toBe('game');
+            expect(match.controlMessageId).toBe(existingControl.id);
+            expect(existingControl.edit).toHaveBeenCalled();
+            expect(getButtonCustomIdByLabel(existingControl.payload, 'GAME WIN')).toContain(':winner:');
+        } finally {
+            competitiveRatedQueue.__resetState();
+            jest.useRealTimers();
+        }
+    });
+
     it.each(['MSC', 'SMS'])('does not record the same %s game again when the loser advantage prompt times out', async (gameType) => {
         jest.useFakeTimers({ doNotFake: ['performance'] });
         jest.setSystemTime(1_000_000);
@@ -3103,12 +3374,15 @@ describe('competitiveRatedQueue', () => {
             }));
 
             expect(mockRatedMatchDao.recordGame).toHaveBeenCalledTimes(1);
+            expect(match.timeoutPhase).toBe(null);
+            await flushOutputQueues();
             expect(match.timeoutPhase).toBe('loser_advantage');
             expect(match.loserAdvantagePromptShown).toBe(true);
 
             jest.advanceTimersByTime(2 * 60_000 + 1);
             await flushAsyncTasks();
             await flushAsyncTasks();
+            await flushOutputQueues();
 
             expect(mockRatedMatchDao.recordGame).toHaveBeenCalledTimes(1);
             expect(match.stage).toBe('awaiting_winner');
@@ -3159,12 +3433,15 @@ describe('competitiveRatedQueue', () => {
             }));
 
             expect(mockRatedMatchDao.recordGame).toHaveBeenCalledTimes(1);
+            expect(match.timeoutPhase).toBe(null);
+            await flushOutputQueues();
             expect(match.timeoutPhase).toBe('loser_advantage');
             clearTimeout(match.timeoutTimer);
             match.timeoutTimer = null;
 
             jest.advanceTimersByTime(2 * 60_000 + 1);
             await competitiveRatedQueue.__tickForTests(client);
+            await flushOutputQueues();
 
             expect(mockRatedMatchDao.recordGame).toHaveBeenCalledTimes(1);
             expect(competitiveRatedQueue.__getStateSnapshot().activeMatchCount).toBe(1);
@@ -3273,6 +3550,7 @@ describe('competitiveRatedQueue', () => {
             client
         });
         await competitiveRatedQueue.handleInteraction(winnerInteraction);
+        await flushOutputQueues();
 
         expect(threadHasImagePayload(thread, 'g3.png')).toBe(true);
         const resultIndex = findThreadPayloadIndex(thread, payload => payload.content?.includes('wins **Game 3**'));
@@ -3343,7 +3621,7 @@ describe('competitiveRatedQueue', () => {
         }
     });
 
-    it('reopens Start Match instead of cancelling when the winner private controls cannot be delivered by edit or follow-up', async () => {
+    it('keeps thread setup controls available when the winner private controls cannot be delivered by edit or follow-up', async () => {
         const { client, thread } = createMatchClientMock();
         const { winnerInteraction, chooseHomeCustomId } = await prepareLoserAdvantagePrompt(client);
         winnerInteraction.editReply.mockRejectedValueOnce(new Error('expired interaction token'));
@@ -3362,16 +3640,83 @@ describe('competitiveRatedQueue', () => {
                 payload.content?.includes('MATCH CANCELLED DUE TO SETUP ERROR')
             );
             expect(cancelPayload).toBeUndefined();
-            expect(threadHasPublicSelectionButtons(thread)).toBe(false);
+            await flushOutputQueues();
+            expect(threadHasPublicSelectionButtons(thread)).toBe(true);
             expect(findThreadPayload(thread, payload =>
                 getButtonComponents(payload).some(component => component.label === 'Start Match')
-            )).toBeDefined();
+            )).toBeUndefined();
             expect(thread.setName).not.toHaveBeenCalledWith('🚫 1v1 #1 | Home VS Away');
             expect(thread.setLocked).not.toHaveBeenCalled();
             expect(thread.setArchived).not.toHaveBeenCalled();
             expect(competitiveRatedQueue.__getStateSnapshot().activeMatchCount).toBe(1);
         } finally {
             errorSpy.mockRestore();
+        }
+    });
+
+    it('lets players complete next setup from thread controls when private winner controls are unavailable', async () => {
+        jest.useFakeTimers({ doNotFake: ['performance'] });
+        jest.setSystemTime(1_000_000);
+        const randomSpy = jest.spyOn(Math, 'random').mockReturnValue(0.99);
+        const { client, thread } = createMatchClientMock();
+        const { match, winnerInteraction, chooseHomeCustomId } = await prepareLoserAdvantagePrompt(client);
+        winnerInteraction.editReply.mockRejectedValueOnce(new Error('expired interaction token'));
+        winnerInteraction.followUp.mockRejectedValueOnce(new Error('Unknown interaction'));
+        const errorSpy = jest.spyOn(console, 'error').mockImplementation(() => {});
+
+        try {
+            await competitiveRatedQueue.handleInteraction(createButtonInteractionMock({
+                customId: chooseHomeCustomId,
+                userId: 'away-user',
+                client
+            }));
+            await flushOutputQueues();
+
+            const stadiumMessage = findThreadMessage(thread, payload =>
+                getButtonCustomIds(payload).some(customId => customId.includes(':match:stadium:'))
+            );
+            const captainMessage = findThreadMessage(thread, payload =>
+                getButtonCustomIds(payload).some(customId => customId.includes(':match:captain:'))
+            );
+            expect(stadiumMessage).toBeDefined();
+            expect(captainMessage).toBeDefined();
+
+            const stadiumCustomId = getButtonCustomIds(stadiumMessage.payload)
+                .find(customId => customId.includes(':match:stadium:'));
+            const captainCustomId = getButtonCustomIds(captainMessage.payload)
+                .find(customId => customId.includes(':match:captain:'));
+            randomSpy.mockClear();
+
+            await competitiveRatedQueue.handleInteraction(createButtonInteractionMock({
+                customId: stadiumCustomId,
+                userId: 'away-user',
+                client
+            }));
+            await flushOutputQueues();
+            await competitiveRatedQueue.handleInteraction(createButtonInteractionMock({
+                customId: captainCustomId,
+                userId: 'home-user',
+                client
+            }));
+            await flushOutputQueues();
+
+            jest.advanceTimersByTime(2 * 60_000 + 1);
+            await flushAsyncTasks();
+            await flushOutputQueues();
+
+            expect(match.selectedStadium?.description).toBe('Bowser Stadium');
+            expect(match.selectedCaptain?.description).toBe('Mario');
+            expect(randomSpy).not.toHaveBeenCalled();
+            expect(match.stage).toBe('awaiting_winner');
+            expect(findThreadPayload(thread, payload =>
+                getButtonComponents(payload).some(component => component.label === 'GAME WIN')
+            )).toBeDefined();
+            expect(threadHasPublicSelectionButtons(thread)).toBe(false);
+        } finally {
+            errorSpy.mockRestore();
+            randomSpy.mockRestore();
+            competitiveRatedQueue.__resetState();
+            jest.useRealTimers();
         }
     });
 

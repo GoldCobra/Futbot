@@ -9,7 +9,7 @@ const {
     PermissionsBitField
 } = require('discord.js');
 
-const { executeQuery } = require('../../db/sqlClient');
+const { executeQuery, isTransientDbError } = require('../../db/sqlClient');
 const { fetchChannel, safeFollowUp, safeReply } = require('../../utils/discord');
 const {
     recordCompetitiveResult,
@@ -77,6 +77,7 @@ const {
     buildTerminalThreadName,
     buildThreadTextPayload,
     buildThreadUrl,
+    quoteThreadPayload,
     quoteThreadBlock,
     quoteThreadLines,
     renderCountdownLine,
@@ -147,11 +148,17 @@ const {
     replaceWinnerWaitingPrompt
 } = require('./privatePrompts');
 const {
+    isRuntimeStateEnabled,
+    loadCompetitiveRatedRuntimeState,
+    saveCompetitiveRatedRuntimeState
+} = require('./runtimeState');
+const {
     clearCurrentControlMessage,
     clearSetupMessageComponents,
     deleteSetupMessageAndPostConfirmation,
     deleteThreadMessage,
     editOrSendThreadMessage,
+    editOrSendRequiredThreadMessage,
     fetchThreadMessage
 } = require('./threadMessages');
 const { runMatchTransition } = require('./matchTransitions');
@@ -177,6 +184,95 @@ function isManagedPanelChannel(channelId) {
     return Boolean(getPanelConfigByChannelId(channelId));
 }
 
+const MATCH_OUTPUT_WARN_MS = 5000;
+const RUNTIME_STATE_SAVE_DELAY_MS = 250;
+let runtimeStatePersistTimer = null;
+let runtimeStatePersistPromise = Promise.resolve();
+let runtimeStateRecovered = false;
+
+function getMatchOutputMeta(matchId) {
+    const key = String(matchId);
+    const meta = state.outputQueueMetaByMatchId.get(key) ?? {
+        pending: 0,
+        lastLabel: null,
+        queuedAt: null,
+        required: false,
+        attempt: 0,
+        nextRetryAt: null,
+        lastError: null
+    };
+    state.outputQueueMetaByMatchId.set(key, meta);
+    return meta;
+}
+
+function queueMatchOutput(match, client, label, worker, details = {}) {
+    if (!match?.id || typeof worker !== 'function') {
+        return Promise.resolve(null);
+    }
+
+    const matchId = String(match.id);
+    const queuedAt = Date.now();
+    const meta = getMatchOutputMeta(matchId);
+    meta.pending += 1;
+    meta.lastLabel = label;
+    meta.queuedAt = queuedAt;
+    meta.required = Boolean(details.required);
+    meta.attempt += 1;
+    meta.nextRetryAt = null;
+    meta.lastError = null;
+
+    logRatedInfo(client, match, 'match.output_queued', getMatchLogDetails(match, {
+        label,
+        pending: meta.pending,
+        ...details
+    }));
+
+    const previous = state.outputQueuesByMatchId.get(matchId) ?? Promise.resolve();
+    const queued = previous.catch(() => {}).then(async () => {
+        const startedAt = Date.now();
+        logRatedInfo(client, match, 'match.output.started', getMatchLogDetails(match, {
+            label,
+            queuedMs: startedAt - queuedAt
+        }));
+
+        try {
+            return await worker();
+        } catch (error) {
+            meta.lastError = error.message;
+            logRatedError(client, match, 'match.output.failed', error, getMatchLogDetails(match, {
+                label,
+                required: Boolean(details.required)
+            }));
+            return null;
+        } finally {
+            const durationMs = Date.now() - startedAt;
+            const log = durationMs > MATCH_OUTPUT_WARN_MS ? logRatedWarn : logRatedInfo;
+            log(client, match, durationMs > MATCH_OUTPUT_WARN_MS ? 'match.output.slow' : 'match.output.finished', getMatchLogDetails(match, {
+                label,
+                durationMs
+            }));
+            meta.pending = Math.max(0, meta.pending - 1);
+        }
+    });
+
+    const cleanup = queued.finally(() => {
+        if (state.outputQueuesByMatchId.get(matchId) === cleanup) {
+            state.outputQueuesByMatchId.delete(matchId);
+        }
+        if (meta.pending === 0 && state.outputQueuesByMatchId.get(matchId) !== cleanup) {
+            state.outputQueueMetaByMatchId.delete(matchId);
+        }
+        scheduleRuntimeStatePersist(`output:${label}`);
+    });
+
+    state.outputQueuesByMatchId.set(matchId, cleanup);
+    return cleanup;
+}
+
+async function flushMatchOutputQueuesForTests() {
+    await Promise.all([...state.outputQueuesByMatchId.values()].map(queue => queue.catch(() => {})));
+}
+
 function getSearchLogDetails(search) {
     return {
         search: search?.id,
@@ -193,6 +289,274 @@ function getMatchLogDetails(match, extra = {}) {
         stage: match?.stage,
         ...extra
     };
+}
+
+function buildRuntimeStateSnapshotForPersist() {
+    return {
+        activeMatches: [...state.activeMatchesById.values()],
+        pendingCompetitiveDbOps: [...state.pendingCompetitiveDbOpsByKey.values()]
+    };
+}
+
+async function flushRuntimeStatePersist(reason = 'state_change') {
+    if (!isRuntimeStateEnabled()) {
+        return false;
+    }
+
+    runtimeStatePersistPromise = runtimeStatePersistPromise
+        .catch(() => {})
+        .then(async () => {
+            await saveCompetitiveRatedRuntimeState(buildRuntimeStateSnapshotForPersist());
+            logRatedInfo(state.client, { all: true }, 'runtime_state.persisted', {
+                reason,
+                activeMatches: state.activeMatchesById.size,
+                pendingCompetitiveDbOps: state.pendingCompetitiveDbOpsByKey.size
+            });
+            return true;
+        })
+        .catch(error => {
+            logRatedError(state.client, { all: true }, 'runtime_state.persist_failed', error, {
+                reason
+            });
+            return false;
+        });
+
+    return await runtimeStatePersistPromise;
+}
+
+function scheduleRuntimeStatePersist(reason = 'state_change') {
+    if (!isRuntimeStateEnabled()) {
+        return;
+    }
+
+    if (runtimeStatePersistTimer) {
+        clearTimeout(runtimeStatePersistTimer);
+    }
+    runtimeStatePersistTimer = setTimeout(() => {
+        runtimeStatePersistTimer = null;
+        flushRuntimeStatePersist(reason).catch(error => {
+            logRatedError(state.client, { all: true }, 'runtime_state.persist_timer_failed', error, {
+                reason
+            });
+        });
+    }, RUNTIME_STATE_SAVE_DELAY_MS);
+    runtimeStatePersistTimer.unref?.();
+}
+
+function restoreRuntimeMatchIndexes(match) {
+    state.activeMatchesById.set(match.id, match);
+    state.activeMatchesByThreadId.set(match.threadId, match);
+    for (const team of match.teams ?? []) {
+        for (const memberId of team.memberIds ?? []) {
+            state.activeMatchesByUserId.set(memberId, match);
+        }
+    }
+}
+
+async function recoverRuntimeState(client) {
+    if (runtimeStateRecovered || !isRuntimeStateEnabled()) {
+        return;
+    }
+    runtimeStateRecovered = true;
+
+    const runtimeState = await loadCompetitiveRatedRuntimeState();
+    let restoredMatches = 0;
+    for (const match of runtimeState.activeMatches) {
+        if (state.activeMatchesById.has(match.id)) {
+            continue;
+        }
+        restoreRuntimeMatchIndexes(match);
+        restoredMatches += 1;
+        logRatedWarn(client, match, 'runtime_state.match_recovered', getMatchLogDetails(match, {
+            recoveredTimeoutPhase: match.recoveredRuntimeTimeoutPhase ?? null,
+            recoveredTimeoutDeadlineAt: match.recoveredRuntimeTimeoutDeadlineAt ?? null
+        }));
+    }
+
+    let restoredDbOps = 0;
+    for (const op of runtimeState.pendingCompetitiveDbOps) {
+        if (!state.pendingCompetitiveDbOpsByKey.has(op.key)) {
+            state.pendingCompetitiveDbOpsByKey.set(op.key, op);
+            restoredDbOps += 1;
+        }
+    }
+
+    if (restoredMatches || restoredDbOps) {
+        logRatedWarn(client, { all: true }, 'runtime_state.recovered', {
+            activeMatches: restoredMatches,
+            pendingCompetitiveDbOps: restoredDbOps
+        });
+        await reconcileActiveMatchControls(client);
+        scheduleRuntimeStatePersist('runtime_recovered');
+    }
+}
+
+function getCompetitiveDbOpKey(type, payload) {
+    if (type === 'record_game') {
+        return `${type}:${payload.ratedMatchId}:${payload.gameNumber}`;
+    }
+    if (type === 'complete_competitive') {
+        return `${type}:${payload.ratedMatchId}`;
+    }
+    return `${type}:${payload.matchCode ?? payload.ratedMatchId ?? createId()}`;
+}
+
+function enqueueCompetitiveDbOp(type, payload, match, client, reason) {
+    const key = getCompetitiveDbOpKey(type, payload);
+    const existing = state.pendingCompetitiveDbOpsByKey.get(key);
+    const op = existing ?? {
+        key,
+        type,
+        payload,
+        matchId: match?.id ?? payload.matchCode ?? null,
+        threadId: match?.threadId ?? payload.threadId ?? null,
+        createdAt: Date.now(),
+        attempts: 0,
+        lastError: null,
+        nextRetryAt: Date.now()
+    };
+    op.payload = payload;
+    op.reason = reason;
+    op.updatedAt = Date.now();
+    state.pendingCompetitiveDbOpsByKey.set(key, op);
+    if (match) {
+        match.competitiveDbPending = true;
+    }
+    logRatedWarn(client, match ?? { all: true }, 'competitive_db.op_queued', getMatchLogDetails(match, {
+        key,
+        type,
+        reason
+    }));
+    scheduleRuntimeStatePersist('competitive_db_op_queued');
+    return op;
+}
+
+function hasPendingCompetitiveDbOpsForMatch(match) {
+    if (!match?.ratedMatchId) return false;
+    return [...state.pendingCompetitiveDbOpsByKey.values()]
+        .some(op => Number(op.payload?.ratedMatchId) === Number(match.ratedMatchId));
+}
+
+function hasPendingRecordGameOpsForRatedMatch(ratedMatchId) {
+    return [...state.pendingCompetitiveDbOpsByKey.values()]
+        .some(op => op.type === 'record_game' && Number(op.payload?.ratedMatchId) === Number(ratedMatchId));
+}
+
+function buildRecordGameDbPayload(match, confirmedByDiscordId = null) {
+    return {
+        ratedMatchId: match.ratedMatchId,
+        matchCode: match.id,
+        threadId: match.threadId,
+        gameNumber: match.pendingResult.gameNumber,
+        winnerTeamNumber: match.pendingResult.winnerTeamIndex,
+        homeTeamNumber: match.pendingResult.homeTeamNumber ?? match.homeTeamIndex,
+        stadiumCode: match.pendingResult.stadiumCode ?? null,
+        captainCode: match.pendingResult.captainCode ?? null,
+        reportedByParticipantId: match.participantIdByDiscordId?.get(String(match.pendingResult.reporterDiscordId)),
+        confirmedByParticipantId: match.participantIdByDiscordId?.get(String(confirmedByDiscordId)),
+        reportedByDiscordId: match.pendingResult.reporterDiscordId ?? null,
+        confirmedByDiscordId
+    };
+}
+
+function buildCompleteCompetitiveDbPayload(match, winnerTeamNumber) {
+    return {
+        ratedMatchId: match.ratedMatchId,
+        matchCode: match.id,
+        threadId: match.threadId,
+        seasonId: match.seasonId,
+        gameType: CONSTANTS.SQL_GAME_TYPE_TO_NUMBER[match.gameType],
+        mode: match.mode,
+        winnerTeamNumber,
+        team1Score: match.score.team1,
+        team2Score: match.score.team2,
+        homeTeamNumber: match.homeTeamIndex,
+        awayTeamNumber: match.awayTeamIndex,
+        guildId: CONSTANTS.GUILD_ID
+    };
+}
+
+async function postCompetitiveDbPendingNotice(match, client, thread = null) {
+    thread ??= await client.channels.fetch(match.threadId).catch(() => null);
+    if (!thread?.send) return null;
+
+    const payload = buildThreadTextPayload(
+        `${BL_TIME_EMOJI} **Competitive DB sync pending.** The match can continue; Competitive ELO will be synced automatically when the database is reachable again.`,
+        'line',
+        { components: [] }
+    );
+    try {
+        const message = await editOrSendRequiredThreadMessage(
+            thread,
+            match.competitiveDbPendingNoticeMessageId,
+            payload
+        );
+        match.competitiveDbPendingNoticeMessageId = message.id;
+        return message;
+    } catch (error) {
+        logRatedError(client, match, 'competitive_db.pending_notice_failed', error, getMatchLogDetails(match));
+        return null;
+    }
+}
+
+async function runPendingCompetitiveDbOps(client) {
+    const now = Date.now();
+    const ops = [...state.pendingCompetitiveDbOpsByKey.values()]
+        .filter(op => !op.nextRetryAt || op.nextRetryAt <= now)
+        .sort((a, b) => a.createdAt - b.createdAt);
+
+    for (const op of ops) {
+        try {
+            if (op.type === 'record_game') {
+                await ratedMatchDao.recordGame(op.payload);
+            } else if (op.type === 'complete_competitive') {
+                if (hasPendingRecordGameOpsForRatedMatch(op.payload.ratedMatchId)) {
+                    continue;
+                }
+                const result = await recordCompetitiveResult({
+                    ...op.payload,
+                    client,
+                    guildId: op.payload.guildId ?? CONSTANTS.GUILD_ID
+                });
+                const thread = await client.channels.fetch(op.threadId).catch(() => null);
+                if (thread?.send && Array.isArray(result?.changes) && result.changes.length > 0) {
+                    await thread.send(buildThreadTextPayload(
+                        `${BL_CHECK_EMOJI} **Competitive DB sync completed.**\n${renderCompetitiveRatingSummaryMessage(result)}`,
+                        'line',
+                        { components: [] }
+                    )).catch(error => {
+                        logRatedWarn(client, { id: op.matchId, threadId: op.threadId }, 'competitive_db.sync_notice_failed', {
+                            match: op.matchId,
+                            thread: op.threadId,
+                            error: error.message
+                        });
+                    });
+                }
+            }
+            state.pendingCompetitiveDbOpsByKey.delete(op.key);
+            scheduleRuntimeStatePersist('competitive_db_op_completed');
+            logRatedInfo(client, { id: op.matchId, threadId: op.threadId }, 'competitive_db.op_completed', {
+                match: op.matchId,
+                thread: op.threadId,
+                key: op.key,
+                type: op.type
+            });
+        } catch (error) {
+            op.attempts += 1;
+            op.lastError = error.message;
+            op.nextRetryAt = Date.now() + Math.min(60000, 5000 * Math.max(op.attempts, 1));
+            scheduleRuntimeStatePersist('competitive_db_op_retry_scheduled');
+            logRatedWarn(client, { id: op.matchId, threadId: op.threadId }, 'competitive_db.op_retry_scheduled', {
+                match: op.matchId,
+                thread: op.threadId,
+                key: op.key,
+                type: op.type,
+                attempts: op.attempts,
+                nextRetryAt: op.nextRetryAt,
+                error: error.message
+            });
+        }
+    }
 }
 
 function hasExpectedMatchStageAndToken(match, interaction, expectedStage, gameNumber = getNextGameNumber(match)) {
@@ -624,6 +988,30 @@ function renderAwaySelectionPrompt(match) {
     );
 }
 
+function getSetupPromptConfig(player) {
+    if (player === 'home') {
+        return {
+            player,
+            selectedKey: 'selectedStadium',
+            promptIdKey: 'homeSelectionPromptId',
+            buildRows: buildStadiumButtonRows,
+            renderPrompt: renderHomeSelectionPrompt
+        };
+    }
+
+    if (player === 'away') {
+        return {
+            player,
+            selectedKey: 'selectedCaptain',
+            promptIdKey: 'awaySelectionPromptId',
+            buildRows: buildCaptainButtonRows,
+            renderPrompt: renderAwaySelectionPrompt
+        };
+    }
+
+    return null;
+}
+
 function getSetupSelectionConfig(match, userId) {
     const homeRepId = match.teams[match.homeTeamIndex - 1].repUserId;
     const awayRepId = match.teams[match.awayTeamIndex - 1].repUserId;
@@ -790,6 +1178,12 @@ function renderMatchControlContent(match) {
     if (match.stage === 'awaiting_loser_confirmation') {
         const loserTeam = match.teams[getPendingResultLoserTeamIndex(match) - 1];
         const countdownLine = getMatchCountdownLine(match, LOSER_CHOICE_TIMEOUT_MINUTES);
+        if (requiresSetup(match.gameType) && match.loserAdvantagePromptShown) {
+            return quoteThreadLines(
+                `${describeTeam(loserTeam)}, choose your advantage for the next game.\n` +
+                countdownLine
+            );
+        }
         if (!requiresSetup(match.gameType)) {
             return quoteThreadLines(
                 `${describeTeam(loserTeam)}, press **Confirm Game Loss** to confirm the result.\n` +
@@ -865,6 +1259,21 @@ function buildFinalMatchComponents(match) {
     return isReportableMatch(match)
         ? [buildFinalMatchActionRow(match.id)]
         : [];
+}
+
+function buildLoserAdvantageComponents(match, gameNumber = getPendingResultGameNumber(match)) {
+    return [
+        new ActionRowBuilder().addComponents(
+            new ButtonBuilder()
+                .setCustomId(loserAdvantageCustomId(match.id, 'home', getMatchActionToken(match, gameNumber)))
+                .setLabel('Choose Home')
+                .setStyle(ButtonStyle.Primary),
+            new ButtonBuilder()
+                .setCustomId(loserAdvantageCustomId(match.id, 'captain', getMatchActionToken(match, gameNumber)))
+                .setLabel('Choose Captain First')
+                .setStyle(ButtonStyle.Secondary)
+        )
+    ];
 }
 
 function buildWelcomeRulesPayload(match, homeRating = null, awayRating = null) {
@@ -1037,6 +1446,9 @@ function buildMatchComponents(match, options) {
 
     if (match.stage === 'awaiting_loser_confirmation') {
         const gameNumber = getPendingResultGameNumber(match);
+        if (requiresSetup(match.gameType) && match.loserAdvantagePromptShown) {
+            return buildLoserAdvantageComponents(match, gameNumber);
+        }
         return [
             new ActionRowBuilder().addComponents(
                 new ButtonBuilder()
@@ -1096,6 +1508,18 @@ async function getOptionsForGameType(gameType) {
 
     state.cachedOptionsByGameType.set(gameType, options);
     return options;
+}
+
+async function prewarmOptionsForPanelGameTypes(client) {
+    const gameTypes = [...new Set(CONFIG.PANEL_CHANNELS.map(panel => panel.gameType).filter(Boolean))];
+    await Promise.all(gameTypes.map(async gameType => {
+        try {
+            await getOptionsForGameType(gameType);
+            logRatedInfo(client, { gameType }, 'queue.options.prewarmed', { gameType });
+        } catch (error) {
+            logRatedError(client, { gameType }, 'queue.options.prewarm_failed', error, { gameType });
+        }
+    }));
 }
 
 async function getPlayerQueueProfile(discordId, gameType, mode = '1v1', displayName = null) {
@@ -1291,7 +1715,7 @@ function getMatchTimeoutMinutes(phase) {
 
 function scheduleMatchTimeout(match, phase, client) {
     if (!match || !MATCH_TIMEOUT_PHASES.has(phase)) {
-        return;
+        return false;
     }
 
     clearMatchTimers(match);
@@ -1316,6 +1740,11 @@ function scheduleMatchTimeout(match, phase, client) {
         phase,
         minutes: getMatchTimeoutMinutes(phase)
     }));
+    logRatedInfo(client, match, 'match.output.timer_started', getMatchLogDetails(match, {
+        phase,
+        deadlineAt
+    }));
+    return true;
 }
 
 function ensureMatchTimeoutScheduled(match, phase, client) {
@@ -1328,8 +1757,7 @@ function ensureMatchTimeoutScheduled(match, phase, client) {
         return false;
     }
 
-    scheduleMatchTimeout(match, phase, client);
-    return true;
+    return scheduleMatchTimeout(match, phase, client);
 }
 
 function removeMatchFromState(match) {
@@ -1341,6 +1769,7 @@ function removeMatchFromState(match) {
             state.activeMatchesByUserId.delete(memberId);
         }
     }
+    scheduleRuntimeStatePersist('match_removed');
 }
 
 async function deleteSearchWarningMessage(search, client) {
@@ -2197,11 +2626,14 @@ async function createCompetitiveRatedMatch(panelConfig, searches, client, {
         privateDeliveryInteractionsByUserId: new Map(searches.map(s => [s.userId, s.notificationInteraction]).filter(([, i]) => i)),
         privatePromptHandles: {},
         ratedMatchId: matchHeader.id,
-        participantIdByDiscordId: new Map()
+        participantIdByDiscordId: new Map(),
+        competitiveDbPending: false,
+        competitiveDbPendingNoticeMessageId: null
     };
 
     state.activeMatchesById.set(match.id, match);
     state.activeMatchesByThreadId.set(thread.id, match);
+    scheduleRuntimeStatePersist('match_created');
     const participantMentions = getMatchParticipantMentions(match);
     for (const search of searches) {
         search.matchedThreadUrl = threadUrl;
@@ -2274,7 +2706,6 @@ async function createCompetitiveRatedMatch(panelConfig, searches, client, {
     }));
 
     if (requiresSetup(match.gameType)) {
-        scheduleMatchTimeout(match, 'start', client);
         await updateMatchControlMessage(match, client);
     } else {
         logRatedInfo(client, match, 'match.auto_start', getMatchLogDetails(match, {
@@ -2326,6 +2757,10 @@ async function postGameImageIfMissing(match, client, thread = null) {
             game: nextGameNumber,
             message: msg.id,
             separator: separatorMessage?.id
+        }));
+        logRatedInfo(client, match, 'match.output.image_sent', getMatchLogDetails(match, {
+            game: nextGameNumber,
+            message: msg.id
         }));
     } else {
         logRatedWarn(client, match, 'game.image.failed', getMatchLogDetails(match, {
@@ -2383,11 +2818,9 @@ async function postDelayedGameResultIfMissing(match, client, thread = null) {
 
 async function clearStartButtonComponents(thread, block) {
     if (!block?.startMessageId) return;
-    const msg = await fetchThreadMessage(thread, block.startMessageId);
-    if (msg) {
-        await msg.delete().catch(() => {});
-        block.startMessageId = null;
-    }
+    if (!thread?.send) return;
+    await deleteThreadMessage(thread, block.startMessageId);
+    block.startMessageId = null;
 }
 
 function clearSelectionTimers(match) {
@@ -2432,6 +2865,97 @@ function scheduleSelectionTimeout(match, player, client) {
             }),
         delayMs
     );
+}
+
+async function sendThreadSetupSelectionPrompt(match, thread, player, options) {
+    const config = getSetupPromptConfig(player);
+    if (!config || match?.stage !== 'awaiting_start' || match[config.selectedKey]) {
+        return null;
+    }
+
+    const block = getOrCreateGameBlock(match);
+    const payload = buildThreadTextPayload(config.renderPrompt(match), 'line', {
+        components: config.buildRows(match, options)
+    });
+    const message = await editOrSendRequiredThreadMessage(thread, block[config.promptIdKey], payload);
+    block[config.promptIdKey] = message.id;
+    return { message, config };
+}
+
+async function armVisibleSelectionPromptTimer(match, client, thread, player, message, options) {
+    const config = getSetupPromptConfig(player);
+    if (!config) {
+        return false;
+    }
+
+    if (match?.stage !== 'awaiting_start' || match[config.selectedKey]) {
+        clearSelectionTimer(match, player);
+        const block = getOrCreateGameBlock(match);
+        if (block[config.promptIdKey] === message?.id) {
+            await deleteThreadMessage(thread, message.id);
+            block[config.promptIdKey] = null;
+        }
+        return false;
+    }
+
+    scheduleSelectionTimeout(match, player, client);
+    await message.edit?.(quoteThreadPayload({
+        content: config.renderPrompt(match),
+        components: config.buildRows(match, options)
+    })).catch(error => {
+        logRatedWarn(client, match, 'setup.selection_control.deadline_refresh_failed', getMatchLogDetails(match, {
+            player,
+            message: message.id,
+            error: error.message
+        }));
+    });
+
+    logRatedInfo(client, match, 'setup.selection_control.posted', getMatchLogDetails(match, {
+        player,
+        message: message.id
+    }));
+    return true;
+}
+
+async function postVisibleSetupSelectionControls(match, client, players, details = {}) {
+    const uniquePlayers = [...new Set(players)].filter(player => player === 'home' || player === 'away');
+    if (!uniquePlayers.length || match?.stage !== 'awaiting_start') {
+        return [];
+    }
+
+    const thread = await client.channels.fetch(match.threadId).catch(() => null);
+    if (!thread?.send) {
+        logRatedWarn(client, match, 'setup.selection_control.thread_missing', getMatchLogDetails(match, details));
+        return [];
+    }
+
+    const options = await getOptionsForGameType(match.gameType);
+    const posted = [];
+    for (const player of uniquePlayers) {
+        try {
+            const result = await sendThreadSetupSelectionPrompt(match, thread, player, options);
+            if (result) {
+                posted.push({ player, ...result });
+            }
+        } catch (error) {
+            clearSelectionTimer(match, player);
+            logRatedError(client, match, 'setup.selection_control.post_failed', error, getMatchLogDetails(match, {
+                player,
+                ...details
+            }));
+        }
+    }
+
+    if (!posted.length || match.stage !== 'awaiting_start') {
+        return posted;
+    }
+
+    ensureMatchTimeoutScheduled(match, 'start', client);
+    for (const item of posted) {
+        await armVisibleSelectionPromptTimer(match, client, thread, item.player, item.message, options);
+    }
+
+    return posted;
 }
 
 async function autoRandomizeSelection(matchId, player, client, expectedActionToken = null) {
@@ -2487,7 +3011,7 @@ async function autoRandomizeSelection(matchId, player, client, expectedActionTok
         }
 
         if (match.selectedStadium && match.selectedCaptain) {
-            await advanceMatchToWinnerControlAfterSelections(match, client, thread);
+            queueAdvanceMatchToWinnerControlAfterSelections(match, client, thread, 'auto_selection_timeout');
         }
     });
 }
@@ -3394,8 +3918,9 @@ async function postInitialGameSetup(match, client) {
         return;
     }
 
-    if (requiresSetup(match.gameType)) {
-        ensureMatchTimeoutScheduled(match, 'start', client);
+    const shouldScheduleStartTimeout = requiresSetup(match.gameType);
+    if (shouldScheduleStartTimeout && match.timeoutPhase !== 'start') {
+        clearMatchTimers(match);
     }
 
     const block = getOrCreateGameBlock(match);
@@ -3423,8 +3948,19 @@ async function postInitialGameSetup(match, client) {
             match.rulesImageMessageId = msg.id;
             logRatedInfo(client, match, 'setup.rules.posted', getMatchLogDetails(match, { message: msg.id }));
         } else if (item.type === 'start') {
-            const msg = await editOrSendThreadMessage(thread, block.startMessageId, item.payload);
+            const msg = await editOrSendRequiredThreadMessage(thread, block.startMessageId, item.payload);
             block.startMessageId = msg.id;
+            const timerStarted = shouldScheduleStartTimeout
+                ? ensureMatchTimeoutScheduled(match, 'start', client)
+                : false;
+            if (timerStarted && msg?.edit) {
+                await msg.edit(quoteThreadPayload(buildStartPayload(match))).catch(error => {
+                    logRatedWarn(client, match, 'setup.start_control.deadline_refresh_failed', getMatchLogDetails(match, {
+                        message: msg.id,
+                        error: error.message
+                    }));
+                });
+            }
             logRatedInfo(client, match, 'setup.start_control.posted', getMatchLogDetails(match, { message: msg.id }));
         }
     }
@@ -3442,12 +3978,24 @@ async function advanceMatchToWinnerControlAfterSelections(match, client, thread 
         if (confMsg) block.selectionsMessageId = confMsg.id;
         if (confMsg) {
             logRatedInfo(client, match, 'setup.selections.posted', getMatchLogDetails(match, { message: confMsg.id }));
+            logRatedInfo(client, match, 'match.output.selection_message_sent', getMatchLogDetails(match, { message: confMsg.id }));
         }
     }
 
     match.stage = 'awaiting_winner';
     if (thread) await clearStartButtonComponents(thread, block);
-    await postWinnerControl(match, client);
+    await postWinnerControl(match, client, thread);
+}
+
+function queueAdvanceMatchToWinnerControlAfterSelections(match, client, thread = null, source = 'manual_selection') {
+    match.stage = 'awaiting_winner';
+    return queueMatchOutput(match, client, 'advance_to_winner_control_after_selections', async () => {
+        await advanceMatchToWinnerControlAfterSelections(match, client, thread);
+    }, {
+        source,
+        required: true,
+        game: getNextGameNumber(match)
+    });
 }
 
 async function postWinnerControl(match, client, thread = null) {
@@ -3456,16 +4004,37 @@ async function postWinnerControl(match, client, thread = null) {
         return;
     }
 
-    ensureMatchTimeoutScheduled(match, 'game', client);
+    if (match.timeoutPhase !== 'game') {
+        clearMatchTimers(match);
+    }
     const options = await getOptionsForGameType(match.gameType);
 
     const payload = {
         content: renderMatchControlContent(match),
         components: buildMatchComponents(match, options)
     };
-    const controlMessage = await editOrSendThreadMessage(thread, match.controlMessageId, payload);
+    const controlMessage = await editOrSendRequiredThreadMessage(thread, match.controlMessageId, payload);
     match.controlMessageId = controlMessage.id;
+    const timerStarted = ensureMatchTimeoutScheduled(match, 'game', client);
+    if (timerStarted && controlMessage?.edit) {
+        const timedPayload = {
+            content: renderMatchControlContent(match),
+            components: buildMatchComponents(match, options)
+        };
+        await controlMessage.edit(quoteThreadPayload(timedPayload)).catch(error => {
+            logRatedWarn(client, match, 'control.winner.deadline_refresh_failed', getMatchLogDetails(match, {
+                game: getNextGameNumber(match),
+                message: controlMessage.id,
+                error: error.message
+            }));
+        });
+    }
     logRatedInfo(client, match, 'control.winner.posted', getMatchLogDetails(match, {
+        game: getNextGameNumber(match),
+        message: controlMessage.id
+    }));
+    logRatedInfo(client, match, 'match.output.control_sent', getMatchLogDetails(match, {
+        phase: 'game',
         game: getNextGameNumber(match),
         message: controlMessage.id
     }));
@@ -3482,7 +4051,16 @@ async function recoverNextSetupViaStartGate(match, client, reason) {
     await updateMatchControlMessage(match, client);
 }
 
-async function updateMatchControlMessage(match, client) {
+function getLoserControlTimeoutPhase(match) {
+    if (match.stage !== 'awaiting_loser_confirmation') {
+        return null;
+    }
+    return requiresSetup(match.gameType) && match.loserAdvantagePromptShown
+        ? 'loser_advantage'
+        : 'loser_confirmation';
+}
+
+async function updateMatchControlMessage(match, client, thread = null) {
     if (match.stage === 'awaiting_start') {
         await postInitialGameSetup(match, client);
         return;
@@ -3493,13 +4071,14 @@ async function updateMatchControlMessage(match, client) {
         return;
     }
 
-    const thread = await client.channels.fetch(match.threadId).catch(() => null);
+    thread ??= await client.channels.fetch(match.threadId).catch(() => null);
     if (!thread?.send) {
         return;
     }
 
-    if (match.stage === 'awaiting_loser_confirmation') {
-        ensureMatchTimeoutScheduled(match, 'loser_confirmation', client);
+    const timeoutPhase = getLoserControlTimeoutPhase(match);
+    if (timeoutPhase && match.timeoutPhase !== timeoutPhase) {
+        clearMatchTimers(match);
     }
 
     const options = await getOptionsForGameType(match.gameType);
@@ -3507,8 +4086,200 @@ async function updateMatchControlMessage(match, client) {
         content: renderMatchControlContent(match),
         components: buildMatchComponents(match, options)
     };
-    const controlMessage = await editOrSendThreadMessage(thread, match.controlMessageId, payload);
+    const controlMessage = await editOrSendRequiredThreadMessage(thread, match.controlMessageId, payload);
     match.controlMessageId = controlMessage.id;
+    const timerStarted = timeoutPhase
+        ? ensureMatchTimeoutScheduled(match, timeoutPhase, client)
+        : false;
+    if (timerStarted && controlMessage?.edit) {
+        const timedPayload = {
+            content: renderMatchControlContent(match),
+            components: buildMatchComponents(match, options)
+        };
+        await controlMessage.edit(quoteThreadPayload(timedPayload)).catch(error => {
+            logRatedWarn(client, match, 'control.loser_confirmation.deadline_refresh_failed', getMatchLogDetails(match, {
+                message: controlMessage.id,
+                error: error.message
+            }));
+        });
+    }
+    if (timeoutPhase) {
+        logRatedInfo(client, match, 'match.output.control_sent', getMatchLogDetails(match, {
+            phase: timeoutPhase,
+            game: getPendingResultGameNumber(match),
+            message: controlMessage.id
+        }));
+    }
+}
+
+function hasPendingMatchOutput(match) {
+    const meta = state.outputQueueMetaByMatchId.get(String(match?.id));
+    return Boolean(meta?.pending);
+}
+
+function needsAwaitingWinnerSetupOutputRecovery(match) {
+    if (
+        match?.stage !== 'awaiting_winner'
+        || !requiresSetup(match.gameType)
+        || !match.selectedStadium
+        || !match.selectedCaptain
+    ) {
+        return false;
+    }
+
+    const block = getOrCreateGameBlock(match);
+    return Boolean(block.delayedResult && !block.delayedResultMessageId)
+        || !block.gameImageMessageId
+        || !block.selectionsMessageId;
+}
+
+async function threadMessageExists(thread, messageId) {
+    if (!messageId) return false;
+    return Boolean(await fetchThreadMessage(thread, messageId));
+}
+
+async function queueControlWatchdogRecovery(match, client, label, worker, details = {}) {
+    if (hasPendingMatchOutput(match)) {
+        return;
+    }
+    logRatedWarn(client, match, 'control.watchdog.recovery_queued', getMatchLogDetails(match, {
+        label,
+        ...details
+    }));
+    queueMatchOutput(match, client, label, worker, {
+        source: 'watchdog',
+        required: true,
+        ...details
+    });
+}
+
+async function reconcileActiveMatchControl(match, client) {
+    if (!match || match.stage === 'complete' || match.stage === 'cancelled' || hasPendingMatchOutput(match)) {
+        return;
+    }
+
+    const thread = await client.channels.fetch(match.threadId).catch(() => null);
+    if (!thread?.send) {
+        logRatedWarn(client, match, 'control.watchdog.thread_missing', getMatchLogDetails(match));
+        return;
+    }
+
+    if (match.stage === 'awaiting_winner' || match.stage === 'awaiting_loser_confirmation') {
+        const phase = match.stage === 'awaiting_winner'
+            ? 'game'
+            : getLoserControlTimeoutPhase(match);
+        const controlExists = await threadMessageExists(thread, match.controlMessageId);
+        const needsFullWinnerOutputRecovery = match.stage === 'awaiting_winner'
+            && needsAwaitingWinnerSetupOutputRecovery(match);
+        if (
+            controlExists
+            && !needsFullWinnerOutputRecovery
+            && match.timeoutPhase === phase
+            && match.timeoutTimer
+            && Number.isFinite(match.timeoutDeadlineAt)
+            && match.timeoutDeadlineAt > Date.now()
+        ) {
+            return;
+        }
+        const recoveryLabel = needsFullWinnerOutputRecovery
+            ? 'watchdog_recover_winner_output'
+            : controlExists ? 'watchdog_refresh_match_control_timer' : 'watchdog_restore_match_control';
+        await queueControlWatchdogRecovery(match, client, recoveryLabel, async () => {
+            if (needsFullWinnerOutputRecovery) {
+                await advanceMatchToWinnerControlAfterSelections(match, client, thread);
+            } else {
+                await updateMatchControlMessage(match, client, thread);
+            }
+        }, {
+            phase,
+            refreshTimer: controlExists,
+            fullOutputRecovery: needsFullWinnerOutputRecovery,
+            missingMessage: match.controlMessageId ?? null
+        });
+        return;
+    }
+
+    if (match.stage !== 'awaiting_start' || !requiresSetup(match.gameType)) {
+        return;
+    }
+
+    const block = getOrCreateGameBlock(match);
+    const isInitialStartGate = getNextGameNumber(match) === 1
+        && !match.selectedStadium
+        && !match.selectedCaptain
+        && !match.startClickedUserIds?.length;
+    if (isInitialStartGate) {
+        const startExists = await threadMessageExists(thread, block.startMessageId);
+        if (
+            startExists
+            && match.timeoutPhase === 'start'
+            && match.timeoutTimer
+            && Number.isFinite(match.timeoutDeadlineAt)
+            && match.timeoutDeadlineAt > Date.now()
+        ) {
+            return;
+        }
+        await queueControlWatchdogRecovery(match, client, startExists ? 'watchdog_refresh_start_timer' : 'watchdog_restore_start_control', async () => {
+            await postInitialGameSetup(match, client);
+        }, {
+            phase: 'start',
+            refreshTimer: startExists,
+            missingMessage: block.startMessageId ?? null
+        });
+        return;
+    }
+
+    const missingPlayers = [];
+    const homeSelectionExists = await threadMessageExists(thread, block.homeSelectionPromptId);
+    const awaySelectionExists = await threadMessageExists(thread, block.awaySelectionPromptId);
+    if (!match.selectedStadium && (!homeSelectionExists || !match.homeSelectionTimer)) {
+        missingPlayers.push('home');
+    }
+    if (!match.selectedCaptain && (!awaySelectionExists || !match.awaySelectionTimer)) {
+        missingPlayers.push('away');
+    }
+    if (!missingPlayers.length) {
+        return;
+    }
+
+    await queueControlWatchdogRecovery(match, client, 'watchdog_restore_setup_selection_controls', async () => {
+        await postVisibleSetupSelectionControls(match, client, missingPlayers, {
+            source: 'watchdog',
+            players: missingPlayers.join(',')
+        });
+    }, {
+        phase: 'selection',
+        players: missingPlayers.join(',')
+    });
+}
+
+async function reconcileActiveMatchControls(client) {
+    const matches = [...state.activeMatchesById.values()];
+    for (const match of matches) {
+        await reconcileActiveMatchControl(match, client).catch(error => {
+            logRatedError(client, match, 'control.watchdog.failed', error, getMatchLogDetails(match));
+        });
+    }
+}
+
+function clearCurrentControlMessageBestEffort(match, client, thread = null, reason = 'cleanup') {
+    const controlMessageId = match?.controlMessageId;
+    if (!controlMessageId) {
+        return;
+    }
+
+    match.controlMessageId = null;
+    const cleanupSnapshot = {
+        ...match,
+        controlMessageId
+    };
+    clearCurrentControlMessage(cleanupSnapshot, client, null, thread).catch(error => {
+        logRatedWarn(client, match, 'control.cleanup_failed', getMatchLogDetails(match, {
+            reason,
+            message: controlMessageId,
+            error: error.message
+        }));
+    });
 }
 
 async function recordConfirmedGameResult(match, client, confirmedByDiscordId = null) {
@@ -3524,20 +4295,25 @@ async function recordConfirmedGameResult(match, client, confirmedByDiscordId = n
     }
 
     try {
-        await ratedMatchDao.recordGame({
-            matchId: match.ratedMatchId,
-            gameNumber: match.pendingResult.gameNumber,
-            winnerTeamNumber: match.pendingResult.winnerTeamIndex,
-            homeTeamNumber: match.pendingResult.homeTeamNumber ?? match.homeTeamIndex,
-            stadiumCode: match.pendingResult.stadiumCode ?? null,
-            captainCode: match.pendingResult.captainCode ?? null,
-            reportedByParticipantId: match.participantIdByDiscordId?.get(String(match.pendingResult.reporterDiscordId)),
-            confirmedByParticipantId: match.participantIdByDiscordId?.get(String(confirmedByDiscordId)),
-            reportedByDiscordId: match.pendingResult.reporterDiscordId ?? null,
-            confirmedByDiscordId
-        });
+        await ratedMatchDao.recordGame(buildRecordGameDbPayload(match, confirmedByDiscordId));
         return true;
     } catch (err) {
+        if (isTransientDbError(err)) {
+            enqueueCompetitiveDbOp(
+                'record_game',
+                buildRecordGameDbPayload(match, confirmedByDiscordId),
+                match,
+                client,
+                'transient_record_game_failure'
+            );
+            logRatedWarn(client, match, 'rated_match.game_record_pending', getMatchLogDetails(match, {
+                game: match.pendingResult.gameNumber,
+                error: err.message
+            }));
+            await postCompetitiveDbPendingNotice(match, client);
+            return true;
+        }
+
         match.competitiveDbFailed = true;
         logRatedError(client, match, 'rated_match.game_record_failed', err, getMatchLogDetails(match, {
             game: match.pendingResult.gameNumber
@@ -3570,6 +4346,40 @@ async function finishMatchWithCompetitiveDbFailure(match, client, thread, comple
     removeMatchFromState(match);
 }
 
+async function finishMatchWithCompetitiveDbPending(match, winnerMention, client, thread, completedThreadName, winnerTeamNumber) {
+    const op = enqueueCompetitiveDbOp(
+        'complete_competitive',
+        buildCompleteCompetitiveDbPayload(match, winnerTeamNumber),
+        match,
+        client,
+        'pending_game_or_transient_completion_dependency'
+    );
+    const finalResultMessage = await clearCurrentControlMessage(
+        match,
+        client,
+        await renderFinalMatchResultMessage(winnerMention, match, null),
+        thread,
+        []
+    );
+    const pendingNoticeMessage = await postTerminalThreadNotice(
+        thread,
+        match,
+        client,
+        `${BL_TIME_EMOJI} **Competitive DB sync pending.** Results are saved for retry and Competitive ELO will be synced automatically when the database is reachable again.`,
+        buildFinalMatchComponents(match),
+        'competitive_db.final_pending_notice_failed'
+    );
+    const completionMessage = pendingNoticeMessage ?? finalResultMessage;
+    storeReportableMatch(match, completedThreadName, completionMessage?.id ?? null);
+    logRatedWarn(client, match, 'match.complete_pending_competitive_db', getMatchLogDetails(match, {
+        op: op.key,
+        message: completionMessage?.id
+    }));
+    await clearMatchNotifications(match);
+    removeMatchFromState(match);
+    scheduleCompletedThreadClose(match, client);
+}
+
 async function completeMatch(match, winnerMention, client) {
     match.stage = 'complete';
     const thread = await client.channels.fetch(match.threadId).catch(() => null);
@@ -3591,6 +4401,11 @@ async function completeMatch(match, winnerMention, client) {
             'comp.rating.prerequisite_failed',
             new Error('Competitive DB setup or game write failed before match completion')
         );
+        return;
+    }
+
+    if (reportableMatch && hasPendingCompetitiveDbOpsForMatch(match)) {
+        await finishMatchWithCompetitiveDbPending(match, winnerMention, client, thread, completedThreadName, winnerTeamNumber);
         return;
     }
 
@@ -3626,6 +4441,10 @@ async function completeMatch(match, winnerMention, client) {
                 throw new Error('Competitive rating write produced no rating changes');
             }
         } catch (err) {
+            if (isTransientDbError(err)) {
+                await finishMatchWithCompetitiveDbPending(match, winnerMention, client, thread, completedThreadName, winnerTeamNumber);
+                return;
+            }
             await finishMatchWithCompetitiveDbFailure(
                 match,
                 client,
@@ -3757,9 +4576,19 @@ async function handleWinnerSelection(interaction, match) {
     match.stage = 'awaiting_loser_confirmation';
 
     if (!requiresSetup(match.gameType)) {
-        await interaction.deleteReply().catch(() => {});
-        ensureMatchTimeoutScheduled(match, 'loser_confirmation', interaction.client);
-        await updateMatchControlMessage(match, interaction.client);
+        interaction.deleteReply().catch(error => {
+            logRatedWarn(interaction.client, match, 'game.win_private_cleanup_failed', getMatchLogDetails(match, {
+                game: completedGameNumber,
+                error: error.message
+            }));
+        });
+        queueMatchOutput(match, interaction.client, 'post_loss_confirmation_control_after_win', async () => {
+            await updateMatchControlMessage(match, interaction.client);
+        }, {
+            source: 'winner_selection_no_setup',
+            required: true,
+            game: completedGameNumber
+        });
         logRatedInfo(interaction.client, match, 'game.awaiting_loss_confirm', getMatchLogDetails(match, {
             game: completedGameNumber,
             loserTeam: match.loserTeamIndex
@@ -3776,8 +4605,13 @@ async function handleWinnerSelection(interaction, match) {
         rememberWinnerWaitingPrompt(match, interaction, waitingPrompt);
     }
 
-    ensureMatchTimeoutScheduled(match, 'loser_confirmation', interaction.client);
-    await updateMatchControlMessage(match, interaction.client);
+    queueMatchOutput(match, interaction.client, 'post_loss_confirmation_control_after_win', async () => {
+        await updateMatchControlMessage(match, interaction.client);
+    }, {
+        source: 'winner_selection',
+        required: true,
+        game: completedGameNumber
+    });
 }
 
 async function handleLoserConfirm(interaction, match) {
@@ -3825,18 +4659,30 @@ async function handleLoserConfirm(interaction, match) {
         clearPendingResult(match);
         match.startClickedUserIds = [];
         match.stage = 'awaiting_winner';
-        await clearCurrentControlMessage(match, interaction.client, confirmedResultMessage);
         logRatedInfo(interaction.client, match, 'game.loss_confirmed', getMatchLogDetails(match, {
             game: confirmedGameNumber,
             loser: interaction.user.id
         }));
-        logRatedInfo(interaction.client, match, 'game.result.posted', getMatchLogDetails(match, {
-            game: confirmedGameNumber,
-            mode: 'no_setup'
-        }));
-        await interaction.deleteReply().catch(() => {});
-        await postGameImageIfMissing(match, interaction.client);
-        await updateMatchControlMessage(match, interaction.client);
+        interaction.deleteReply().catch(error => {
+            logRatedWarn(interaction.client, match, 'game.loss_confirm_private_cleanup_failed', getMatchLogDetails(match, {
+                game: confirmedGameNumber,
+                error: error.message
+            }));
+        });
+        queueMatchOutput(match, interaction.client, 'advance_no_setup_after_loss_confirm', async () => {
+            const thread = await interaction.client.channels.fetch(match.threadId).catch(() => null);
+            await clearCurrentControlMessage(match, interaction.client, confirmedResultMessage, thread);
+            logRatedInfo(interaction.client, match, 'game.result.posted', getMatchLogDetails(match, {
+                game: confirmedGameNumber,
+                mode: 'no_setup'
+            }));
+            await postGameImageIfMissing(match, interaction.client, thread);
+            await postWinnerControl(match, interaction.client, thread);
+        }, {
+            source: 'loss_confirm_no_setup',
+            required: true,
+            game: confirmedGameNumber
+        });
         return;
     }
 
@@ -3862,53 +4708,67 @@ async function handleLoserConfirm(interaction, match) {
         return;
     }
 
-    const thread = await interaction.client.channels.fetch(match.threadId).catch(() => null);
-    await clearCurrentControlMessage(match, interaction.client, null, thread);
     if (!await recordConfirmedGameResult(match, interaction.client, interaction.user.id)) {
         await interaction.deleteReply().catch(() => {});
         return;
     }
-    scheduleMatchTimeout(match, 'loser_advantage', interaction.client);
+    clearMatchTimers(match);
     const advantagePromptContent = renderTimedMessage(
         'Choose your advantage for the next game:',
         match.timeoutDeadlineAt,
         `${LOSER_CHOICE_TIMEOUT_MINUTES} minutes`
     );
+    const advantageComponents = buildLoserAdvantageComponents(match, confirmedGameNumber);
 
     const prompt = await deliverPrivateInteractionPayload(interaction, {
         content: advantagePromptContent,
-        components: [
-            new ActionRowBuilder().addComponents(
-                new ButtonBuilder()
-                    .setCustomId(loserAdvantageCustomId(match.id, 'home', getMatchActionToken(match, confirmedGameNumber)))
-                    .setLabel('Choose Home')
-                    .setStyle(ButtonStyle.Primary),
-                new ButtonBuilder()
-                    .setCustomId(loserAdvantageCustomId(match.id, 'captain', getMatchActionToken(match, confirmedGameNumber)))
-                    .setLabel('Choose Captain First')
-                    .setStyle(ButtonStyle.Secondary)
-            )
-        ]
+        components: advantageComponents
     }, 'loser advantage prompt');
+
+    storeDelayedGameResult(match, confirmedGameNumber, getPendingResultWinnerMention(match));
+    match.loserAdvantagePromptShown = true;
+    await replaceWinnerWaitingPrompt(match, {
+        content: '⏳ Waiting for your opponent to choose the next-game advantage...',
+        components: []
+    }, 'winner waiting advantage message');
+
+    queueMatchOutput(match, interaction.client, 'post_loser_advantage_control_after_loss_confirm', async () => {
+        const thread = await interaction.client.channels.fetch(match.threadId).catch(() => null);
+        await updateMatchControlMessage(match, interaction.client, thread);
+        if (prompt?.edit) {
+            await prompt.edit({
+                content: renderTimedMessage(
+                    'Choose your advantage for the next game:',
+                    match.timeoutDeadlineAt,
+                    `${LOSER_CHOICE_TIMEOUT_MINUTES} minutes`
+                ),
+                components: advantageComponents
+            }).catch(error => {
+                logRatedWarn(interaction.client, match, 'game.advantage_prompt.deadline_refresh_failed', getMatchLogDetails(match, {
+                    game: confirmedGameNumber,
+                    error: error.message
+                }));
+            });
+        }
+    }, {
+        source: 'loss_confirm',
+        required: true,
+        game: confirmedGameNumber
+    });
+
     if (prompt) {
-        storeDelayedGameResult(match, confirmedGameNumber, getPendingResultWinnerMention(match));
-        match.loserAdvantagePromptShown = true;
-        await replaceWinnerWaitingPrompt(match, {
-            content: '⏳ Waiting for your opponent to choose the next-game advantage...',
-            components: []
-        }, 'winner waiting advantage message');
         logRatedInfo(interaction.client, match, 'game.advantage_prompt.posted', getMatchLogDetails(match, {
             loser: interaction.user.id,
-            loserTeam: loserTeamIndex
+            loserTeam: loserTeamIndex,
+            fallback: 'thread_advantage_control'
         }));
-        return;
+    } else {
+        logRatedWarn(interaction.client, match, 'game.advantage_prompt.private_failed', getMatchLogDetails(match, {
+            game: confirmedGameNumber,
+            loser: interaction.user.id,
+            fallback: 'thread_advantage_control'
+        }));
     }
-
-    await updateMatchControlMessage(match, interaction.client);
-    logRatedWarn(interaction.client, match, 'game.advantage_prompt.retry_required', getMatchLogDetails(match, {
-        game: confirmedGameNumber,
-        loser: interaction.user.id
-    }));
 }
 
 async function handleLoserAdvantage(interaction, match, choice) {
@@ -3939,9 +4799,7 @@ async function handleLoserAdvantage(interaction, match, choice) {
     clearPendingResult(match);
     match.loserAdvantagePromptShown = false;
     match.stage = 'awaiting_start';
-    scheduleSelectionTimeout(match, choice === 'home' ? 'home' : 'away', interaction.client);
-    scheduleSelectionTimeout(match, choice === 'home' ? 'away' : 'home', interaction.client);
-    ensureMatchTimeoutScheduled(match, 'start', interaction.client);
+    clearMatchTimers(match);
 
     const loserPayload = choice === 'home'
         ? {
@@ -3964,8 +4822,11 @@ async function handleLoserAdvantage(interaction, match, choice) {
 
     const loserPrompt = await deliverPrivateInteractionPayload(interaction, loserPayload, 'loser private setup');
     if (!loserPrompt) {
-        await recoverNextSetupViaStartGate(match, interaction.client, 'loser_private_setup_delivery_failed');
-        return;
+        logRatedWarn(interaction.client, match, 'setup.private_loser_delivery_failed', getMatchLogDetails(match, {
+            game: confirmedGameNumber,
+            loser: loserRepId,
+            fallback: 'thread_selection_control'
+        }));
     }
 
     const winnerPrompt = await deliverPrivateInteractionPayload(
@@ -3974,25 +4835,50 @@ async function handleLoserAdvantage(interaction, match, choice) {
         'winner private setup'
     );
     if (!winnerPrompt) {
-        await deliverPrivateInteractionPayload(interaction, {
-            content: 'Private setup controls could not be delivered to both players. Please use **Start Match** in the thread to reopen setup.',
-            components: []
-        }, 'loser private setup cancel notice').catch(() => {});
-        await recoverNextSetupViaStartGate(match, interaction.client, 'winner_private_setup_delivery_failed');
-        return;
+        logRatedWarn(interaction.client, match, 'setup.private_winner_delivery_failed', getMatchLogDetails(match, {
+            game: confirmedGameNumber,
+            winner: winnerRepId,
+            fallback: 'thread_selection_control'
+        }));
     }
+
+    const loserSelectionPlayer = choice === 'home' ? 'home' : 'away';
+    const winnerSelectionPlayer = choice === 'home' ? 'away' : 'home';
 
     match.loserTeamIndex = null;
     match.loserRepMention = null;
-    await clearCurrentControlMessage(match, interaction.client, null);
+    queueMatchOutput(match, interaction.client, 'cleanup_current_control_after_advantage_choice', async () => {
+        clearCurrentControlMessageBestEffort(match, interaction.client, null, 'advantage_choice');
+    }, {
+        source: 'advantage_choice',
+        game: confirmedGameNumber
+    });
+    queueMatchOutput(match, interaction.client, 'post_visible_setup_selection_controls_after_advantage', async () => {
+        await postVisibleSetupSelectionControls(
+            match,
+            interaction.client,
+            [loserSelectionPlayer, winnerSelectionPlayer],
+            {
+                source: 'advantage_choice',
+                choice,
+                game: confirmedGameNumber
+            }
+        );
+    }, {
+        source: 'advantage_choice',
+        required: true,
+        choice,
+        game: confirmedGameNumber
+    });
     logRatedInfo(interaction.client, match, 'game.advantage.chosen', getMatchLogDetails(match, {
         game: confirmedGameNumber,
         loser: interaction.user.id,
         choice
     }));
     logRatedInfo(interaction.client, match, 'setup.private_controls.posted', getMatchLogDetails(match, {
-        loserPrompt: loserPrompt.id,
-        winnerPrompt: winnerPrompt.id
+        loserPrompt: loserPrompt?.id,
+        winnerPrompt: winnerPrompt?.id,
+        fallback: 'thread_selection_control'
     }));
 }
 
@@ -4033,12 +4919,18 @@ async function resolveLoserConfirmationIfTimedOut(matchId, phase, client) {
             match.loserAdvantagePromptShown = false;
             match.startClickedUserIds = [];
             match.stage = 'awaiting_winner';
-            await clearCurrentControlMessage(match, client, timeoutResultMessage);
             logRatedWarn(client, match, 'game.loss_confirm_timeout', getMatchLogDetails(match, {
                 game: timedOutGameNumber
             }));
-            await postGameImageIfMissing(match, client);
-            await updateMatchControlMessage(match, client);
+            queueMatchOutput(match, client, 'advance_no_setup_after_loss_confirm_timeout', async () => {
+                const thread = await client.channels.fetch(match.threadId).catch(() => null);
+                await clearCurrentControlMessage(match, client, timeoutResultMessage, thread);
+                await postGameImageIfMissing(match, client, thread);
+                await postWinnerControl(match, client, thread);
+            }, {
+                source: 'loss_confirm_timeout_no_setup',
+                game: timedOutGameNumber
+            });
             return;
         }
 
@@ -4057,24 +4949,32 @@ async function resolveLoserConfirmationIfTimedOut(matchId, phase, client) {
         clearPendingResult(match);
         match.loserAdvantagePromptShown = false;
         match.startClickedUserIds = [];
-        match.stage = 'awaiting_start';
-        const thread = await client.channels.fetch(match.threadId).catch(() => null);
-        await clearCurrentControlMessage(match, client, null, thread);
-        await postDelayedGameResultIfMissing(match, client, thread);
-        await postGameImageIfMissing(match, client, thread);
+        match.stage = 'awaiting_winner';
         logRatedWarn(client, match, 'game.advantage_timeout', getMatchLogDetails(match, {
             game: timedOutGameNumber,
             choice,
             stadium: match.selectedStadium?.description,
             captain: match.selectedCaptain?.description
         }));
-        const block = getOrCreateGameBlock(match);
-        if (thread?.send && !block.selectionsMessageId) {
-            const confMsg = await thread.send(buildThreadTextPayload(renderCombinedSelectionsMessage(match), 'line', { components: [] })).catch(() => null);
-            if (confMsg) block.selectionsMessageId = confMsg.id;
-        }
-        match.stage = 'awaiting_winner';
-        await postWinnerControl(match, client);
+        queueMatchOutput(match, client, 'advance_to_winner_control_after_advantage_timeout', async () => {
+            const thread = await client.channels.fetch(match.threadId).catch(() => null);
+            clearCurrentControlMessageBestEffort(match, client, thread, 'advantage_timeout');
+            await postDelayedGameResultIfMissing(match, client, thread);
+            await postGameImageIfMissing(match, client, thread);
+            const block = getOrCreateGameBlock(match);
+            if (thread?.send && !block.selectionsMessageId) {
+                const confMsg = await thread.send(buildThreadTextPayload(renderCombinedSelectionsMessage(match), 'line', { components: [] })).catch(() => null);
+                if (confMsg) {
+                    block.selectionsMessageId = confMsg.id;
+                    logRatedInfo(client, match, 'match.output.selection_message_sent', getMatchLogDetails(match, { message: confMsg.id }));
+                }
+            }
+            await postWinnerControl(match, client, thread);
+        }, {
+            source: 'advantage_timeout',
+            required: true,
+            game: timedOutGameNumber
+        });
     });
 }
 
@@ -4143,6 +5043,12 @@ async function handleSetupSelection(interaction, match, kind) {
     logRatedInfo(interaction.client, match, 'setup.selection.chosen', getMatchLogDetails(match, {
         user: interaction.user.id,
         kind,
+        value: selectedOption.description,
+        source: 'manual'
+    }));
+    logRatedInfo(interaction.client, match, 'setup.selection.state_saved', getMatchLogDetails(match, {
+        user: interaction.user.id,
+        kind,
         value: selectedOption.description
     }));
 
@@ -4152,16 +5058,41 @@ async function handleSetupSelection(interaction, match, kind) {
         match[config.deadlineKey] = null;
     }
 
-    const thread = await interaction.client.channels.fetch(match.threadId).catch(() => null);
     const block = getOrCreateGameBlock(match);
-    await deleteThreadMessage(thread, block[config.promptIdKey]);
+    const selectedPromptId = block[config.promptIdKey];
     block[config.promptIdKey] = null;
 
     if (match[config.otherSelectedKey]) {
-        await advanceMatchToWinnerControlAfterSelections(match, interaction.client, thread);
+        match.stage = 'awaiting_winner';
+        queueMatchOutput(match, interaction.client, 'advance_to_winner_control_after_manual_selection', async () => {
+            const thread = await interaction.client.channels.fetch(match.threadId).catch(() => null);
+            if (selectedPromptId) {
+                await deleteThreadMessage(thread, selectedPromptId);
+            }
+            await advanceMatchToWinnerControlAfterSelections(match, interaction.client, thread);
+        }, {
+            source: 'manual_selection',
+            required: true,
+            kind,
+            game: getNextGameNumber(match)
+        });
+    } else if (selectedPromptId) {
+        queueMatchOutput(match, interaction.client, 'cleanup_setup_selection_prompt', async () => {
+            const thread = await interaction.client.channels.fetch(match.threadId).catch(() => null);
+            await deleteThreadMessage(thread, selectedPromptId);
+        }, {
+            source: 'manual_selection',
+            kind
+        });
     }
 
-    await interaction.deleteReply().catch(() => {});
+    interaction.deleteReply().catch(error => {
+        logRatedWarn(interaction.client, match, 'setup.selection_private_cleanup_failed', getMatchLogDetails(match, {
+            user: interaction.user.id,
+            kind,
+            error: error.message
+        }));
+    });
 }
 
 async function handleStadiumSelection(interaction, match) {
@@ -4176,25 +5107,6 @@ async function showPrivateStartSetupControls(interaction, match, config) {
     await ensureDeferredReply(interaction);
     const options = await getOptionsForGameType(match.gameType);
     const block = getOrCreateGameBlock(match);
-    const thread = await interaction.client.channels.fetch(match.threadId).catch(() => null);
-    scheduleSelectionTimeout(match, config.player, interaction.client);
-
-    const privatePrompt = await deliverPrivateInteractionPayload(interaction, {
-        content: config.renderPrompt(match),
-        components: config.buildRows(match, options)
-    }, `${config.player} start setup`);
-    if (!privatePrompt) {
-        clearSelectionTimer(match, config.player);
-        logRatedWarn(interaction.client, match, 'setup.start_retry_required', getMatchLogDetails(match, {
-            user: interaction.user.id,
-            player: config.player
-        }));
-        return;
-    }
-    logRatedInfo(interaction.client, match, 'setup.start.clicked', getMatchLogDetails(match, {
-        user: interaction.user.id,
-        player: config.player
-    }));
 
     if (!Array.isArray(match.startClickedUserIds)) {
         match.startClickedUserIds = [];
@@ -4203,12 +5115,48 @@ async function showPrivateStartSetupControls(interaction, match, config) {
         match.startClickedUserIds.push(config.repId);
     }
 
-    if (match.startClickedUserIds.includes(config.otherRepId) && thread && !block.gameImageMessageId) {
-        await clearStartButtonComponents(thread, block);
-        await postGameImageIfMissing(match, interaction.client, thread);
-        logRatedInfo(interaction.client, match, 'setup.start_gate.complete', getMatchLogDetails(match, {
+    queueMatchOutput(match, interaction.client, 'post_visible_setup_selection_control_after_start', async () => {
+        await postVisibleSetupSelectionControls(match, interaction.client, [config.player], {
+            source: 'start_click',
+            player: config.player,
+            user: interaction.user.id,
             game: getNextGameNumber(match)
+        });
+    }, {
+        source: 'start_click',
+        required: true,
+        player: config.player,
+        game: getNextGameNumber(match)
+    });
+
+    const privatePrompt = await deliverPrivateInteractionPayload(interaction, {
+        content: config.renderPrompt(match),
+        components: config.buildRows(match, options)
+    }, `${config.player} start setup`);
+    if (!privatePrompt) {
+        logRatedWarn(interaction.client, match, 'setup.start_retry_required', getMatchLogDetails(match, {
+            user: interaction.user.id,
+            player: config.player,
+            fallback: 'thread_selection_control'
         }));
+    }
+    logRatedInfo(interaction.client, match, 'setup.start.clicked', getMatchLogDetails(match, {
+        user: interaction.user.id,
+        player: config.player
+    }));
+
+    if (match.startClickedUserIds.includes(config.otherRepId) && !block.gameImageMessageId) {
+        queueMatchOutput(match, interaction.client, 'post_start_gate_game_image', async () => {
+            const thread = await interaction.client.channels.fetch(match.threadId).catch(() => null);
+            await clearStartButtonComponents(thread, block);
+            await postGameImageIfMissing(match, interaction.client, thread);
+            logRatedInfo(interaction.client, match, 'setup.start_gate.complete', getMatchLogDetails(match, {
+                game: getNextGameNumber(match)
+            }));
+        }, {
+            source: 'start_gate',
+            game: getNextGameNumber(match)
+        });
     }
 }
 
@@ -4344,6 +5292,8 @@ async function tick(client) {
         }
     }
 
+    await reconcileActiveMatchControls(client);
+
     const matches = [...state.activeMatchesById.values()];
     for (const match of matches) {
         if (!match.timeoutPhase || now < match.timeoutDeadlineAt) {
@@ -4364,6 +5314,9 @@ async function tick(client) {
     });
     await recoverPendingCompetitiveWhrRunner(client, 'whr.runner_not_configured').catch(error => {
         logRatedError(client, { all: true }, 'whr.runner_recovery_failed', error);
+    });
+    await runPendingCompetitiveDbOps(client).catch(error => {
+        logRatedError(client, { all: true }, 'competitive_db.pending_recovery_failed', error);
     });
     await finalizeOverdueCompletedThreads(client, now);
     await reconcileAllPanels(client);
@@ -4388,6 +5341,13 @@ async function ensureCompetitiveRatedQueue(client) {
     startRatedRuntimeLogCleanupLoop(client);
     for (const panelConfig of CONFIG.PANEL_CHANNELS) {
         logRatedInfo(client, panelConfig, 'queue.started', { channel: panelConfig.channelId });
+    }
+    await prewarmOptionsForPanelGameTypes(client);
+    try {
+        await recoverRuntimeState(client);
+    } catch (err) {
+        console.error(`[RatedQueue] Runtime state recovery failed: ${err.message}`);
+        logRatedError(client, { all: true }, 'runtime_state.recovery_failed', err);
     }
     for (const meta of state.panelMetaByChannelId.values()) {
         meta.channelLockApplied = false;
@@ -4424,6 +5384,12 @@ async function ensureCompetitiveRatedQueue(client) {
         console.error(`[RatedQueue] WHR/TST runner recovery failed: ${err.message}`);
         logRatedError(client, { all: true }, 'whr.runner_recovery_initial_failed', err);
     }
+    try {
+        await runPendingCompetitiveDbOps(client);
+    } catch (err) {
+        console.error(`[RatedQueue] Pending Competitive DB op recovery failed: ${err.message}`);
+        logRatedError(client, { all: true }, 'competitive_db.pending_recovery_initial_failed', err);
+    }
 }
 
 async function resetCompetitiveRatedQueue(client) {
@@ -4444,10 +5410,13 @@ async function resetCompetitiveRatedQueue(client) {
     state.activeMatchesById.clear();
     state.activeMatchesByThreadId.clear();
     state.activeMatchesByUserId.clear();
+    scheduleRuntimeStatePersist('queue_reset');
     state.reportableMatchesById.clear();
     state.panelMetaByChannelId.clear();
     state.cachedOptionsByGameType.clear();
     state.operationQueues.clear();
+    state.outputQueuesByMatchId.clear();
+    state.outputQueueMetaByMatchId.clear();
     state.pendingMatchmakingChannels.clear();
     for (const timer of state.matchmakingTimersByChannelId.values()) {
         clearTimeout(timer);
@@ -4906,6 +5875,7 @@ async function handleMatchInteraction(interaction) {
     }
 
     const lockKey = `match:${match.id}`;
+    const interactionReceivedAt = Date.now();
 
     return await runMatchTransition({
         interaction,
@@ -4928,11 +5898,24 @@ async function handleMatchInteraction(interaction) {
             }
             return false;
         },
+        onReceived: async () => {
+            logRatedInfo(interaction.client, match, 'match.transition.interaction_received', getMatchLogDetails(match, {
+                action: matchAction,
+                user: interaction.user.id
+            }));
+        },
         onAckFailed: async () => {
             logRatedWarn(interaction.client, match, 'match.transition.ack_failed', getMatchLogDetails(match, {
                 action: matchAction,
                 user: interaction.user.id,
                 error: interaction.__ratedAckError?.message
+            }));
+        },
+        onAcked: async () => {
+            logRatedInfo(interaction.client, match, 'match.transition.ack_done', getMatchLogDetails(match, {
+                action: matchAction,
+                user: interaction.user.id,
+                ackMs: Date.now() - interactionReceivedAt
             }));
         },
         onQueued: async () => {
@@ -4952,6 +5935,7 @@ async function handleMatchInteraction(interaction) {
                 action: matchAction,
                 user: interaction.user.id
             }));
+            scheduleRuntimeStatePersist(`interaction:${matchAction}`);
         },
         transition: async () => {
             if (interaction.customId.includes(':match:start:')) {
@@ -5040,6 +6024,12 @@ function __resetState() {
         clearInterval(state.reconcileTimer);
         state.reconcileTimer = null;
     }
+    if (runtimeStatePersistTimer) {
+        clearTimeout(runtimeStatePersistTimer);
+        runtimeStatePersistTimer = null;
+    }
+    runtimeStatePersistPromise = Promise.resolve();
+    runtimeStateRecovered = false;
 
     for (const search of state.activeSearchesById.values()) {
         clearSearchTimers(search);
@@ -5060,6 +6050,7 @@ function __resetState() {
     state.activeMatchesByThreadId.clear();
     state.activeMatchesByUserId.clear();
     state.reportableMatchesById.clear();
+    state.pendingCompetitiveDbOpsByKey.clear();
     state.pendingRematchesByMatchId.clear();
     state.rematchInitiatorsByUserId.clear();
     state.rematchTimersByMatchId.clear();
@@ -5074,6 +6065,8 @@ function __resetState() {
         clearTimeout(timer);
     }
     state.panelStatusRefreshTimersByChannelId.clear();
+    state.outputQueuesByMatchId.clear();
+    state.outputQueueMetaByMatchId.clear();
     state.runtimeLogQueuesByThreadId.clear();
 }
 
@@ -5087,10 +6080,13 @@ function __getStateSnapshot() {
         rematchTimerCount: state.rematchTimersByMatchId.size,
         completedThreadCloseTimerCount: state.completedThreadCloseTimersByMatchId.size,
         pendingCompletedThreadFinalizationCount: state.pendingCompletedThreadFinalizationsByMatchId.size,
+        pendingCompetitiveDbOpCount: state.pendingCompetitiveDbOpsByKey.size,
         panelCount: state.panelMetaByChannelId.size,
         pendingInteractionLockCount: state.operationQueues.size,
         pendingMatchmakingChannelCount: state.pendingMatchmakingChannels.size,
         pendingMatchmakingTimerCount: state.matchmakingTimersByChannelId.size,
+        pendingOutputQueueCount: state.outputQueuesByMatchId.size,
+        pendingOutputJobCount: [...state.outputQueueMetaByMatchId.values()].reduce((count, meta) => count + (meta.pending ?? 0), 0),
         runtimeLogBufferCount: state.runtimeLogBuffersByThreadId.size,
         runtimeLogQueueCount: state.runtimeLogQueuesByThreadId.size,
         runtimeLogCleanupTimerActive: Boolean(state.runtimeLogCleanupTimer)
@@ -5104,6 +6100,7 @@ function __seedStateForTests({
     activeMatches = [],
     reportableMatches = [],
     pendingCompletedThreadFinalizations = [],
+    pendingCompetitiveDbOps = [],
     cachedOptionsByGameType = {}
 } = {}) {
     for (const userId of activeSearchUserIds) {
@@ -5137,6 +6134,10 @@ function __seedStateForTests({
         state.pendingCompletedThreadFinalizationsByMatchId.set(pending.id, pending);
     }
 
+    for (const op of pendingCompetitiveDbOps) {
+        state.pendingCompetitiveDbOpsByKey.set(op.key, op);
+    }
+
     for (const [gameType, options] of Object.entries(cachedOptionsByGameType)) {
         state.cachedOptionsByGameType.set(gameType, options);
     }
@@ -5145,6 +6146,7 @@ function __seedStateForTests({
 module.exports = {
     __createCompetitiveRatedMatchForTests: createCompetitiveRatedMatch,
     __flushRuntimeLogsForTests: flushRuntimeLogsForTests,
+    __flushOutputQueuesForTests: flushMatchOutputQueuesForTests,
     __getStateSnapshot,
     __resetState,
     __runMatchmakingForTests: tryCreateMatches,

@@ -31,7 +31,8 @@ const mockRatedMatchDao = {
 };
 
 jest.mock('../../src/db/sqlClient', () => ({
-    executeQuery: (...args) => mockExecuteQuery(...args)
+    executeQuery: (...args) => mockExecuteQuery(...args),
+    isTransientDbError: err => Boolean(err?.transientDbError)
 }));
 
 jest.mock('../../src/services/competitiveRating', () => ({
