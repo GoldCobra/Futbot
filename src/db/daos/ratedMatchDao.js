@@ -348,7 +348,7 @@ class RatedMatchDao {
     }
 
     async recordGame({
-        matchId,
+        ratedMatchId,
         gameNumber,
         winnerTeamNumber,
         homeTeamNumber,
@@ -362,10 +362,10 @@ class RatedMatchDao {
         const [resolvedReportedByParticipantId, resolvedConfirmedByParticipantId] = await Promise.all([
             reportedByParticipantId != null
                 ? reportedByParticipantId
-                : this._getParticipantId(matchId, reportedByDiscordId),
+                : this._getParticipantId(ratedMatchId, reportedByDiscordId),
             confirmedByParticipantId != null
                 ? confirmedByParticipantId
-                : this._getParticipantId(matchId, confirmedByDiscordId)
+                : this._getParticipantId(ratedMatchId, confirmedByDiscordId)
         ]);
 
         const result = await executeQuery(
@@ -420,7 +420,7 @@ class RatedMatchDao {
                 THROW;
              END CATCH`,
             {
-                matchId,
+                matchId: ratedMatchId,
                 gameNumber,
                 winnerTeamNumber,
                 homeTeamNumber,

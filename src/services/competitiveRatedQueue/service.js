@@ -221,19 +221,9 @@ function queueMatchOutput(match, client, label, worker, details = {}) {
     meta.nextRetryAt = null;
     meta.lastError = null;
 
-    logRatedInfo(client, match, 'match.output_queued', getMatchLogDetails(match, {
-        label,
-        pending: meta.pending,
-        ...details
-    }));
-
     const previous = state.outputQueuesByMatchId.get(matchId) ?? Promise.resolve();
     const queued = previous.catch(() => {}).then(async () => {
         const startedAt = Date.now();
-        logRatedInfo(client, match, 'match.output.started', getMatchLogDetails(match, {
-            label,
-            queuedMs: startedAt - queuedAt
-        }));
 
         try {
             return await worker();
@@ -246,11 +236,6 @@ function queueMatchOutput(match, client, label, worker, details = {}) {
             return null;
         } finally {
             const durationMs = Date.now() - startedAt;
-            const log = durationMs > MATCH_OUTPUT_WARN_MS ? logRatedWarn : logRatedInfo;
-            log(client, match, durationMs > MATCH_OUTPUT_WARN_MS ? 'match.output.slow' : 'match.output.finished', getMatchLogDetails(match, {
-                label,
-                durationMs
-            }));
             meta.pending = Math.max(0, meta.pending - 1);
         }
     });
@@ -307,11 +292,6 @@ async function flushRuntimeStatePersist(reason = 'state_change') {
         .catch(() => {})
         .then(async () => {
             await saveCompetitiveRatedRuntimeState(buildRuntimeStateSnapshotForPersist());
-            logRatedInfo(state.client, { all: true }, 'runtime_state.persisted', {
-                reason,
-                activeMatches: state.activeMatchesById.size,
-                pendingCompetitiveDbOps: state.pendingCompetitiveDbOpsByKey.size
-            });
             return true;
         })
         .catch(error => {
@@ -1736,14 +1716,6 @@ function scheduleMatchTimeout(match, phase, client) {
         });
 
     match.timeoutTimer = scheduleSearchTimeout(callback, delayMs);
-    logRatedInfo(client, match, 'match.timeout.scheduled', getMatchLogDetails(match, {
-        phase,
-        minutes: getMatchTimeoutMinutes(phase)
-    }));
-    logRatedInfo(client, match, 'match.output.timer_started', getMatchLogDetails(match, {
-        phase,
-        deadlineAt
-    }));
     return true;
 }
 
@@ -4296,6 +4268,7 @@ async function recordConfirmedGameResult(match, client, confirmedByDiscordId = n
 
     try {
         await ratedMatchDao.recordGame(buildRecordGameDbPayload(match, confirmedByDiscordId));
+        match.competitiveDbFailed = false;
         return true;
     } catch (err) {
         if (isTransientDbError(err)) {
@@ -4381,6 +4354,7 @@ async function finishMatchWithCompetitiveDbPending(match, winnerMention, client,
 }
 
 async function completeMatch(match, winnerMention, client) {
+    if (match.stage === 'complete') return;
     match.stage = 'complete';
     const thread = await client.channels.fetch(match.threadId).catch(() => null);
     const completedThreadName = buildTerminalThreadName(match, COMPLETED_THREAD_PREFIX);

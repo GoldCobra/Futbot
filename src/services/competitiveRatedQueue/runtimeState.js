@@ -36,7 +36,8 @@ function serializeMatch(match) {
 }
 
 function hydrateMatch(raw) {
-    if (!raw?.id || !raw?.threadId || !Array.isArray(raw?.teams)) {
+    if (!raw?.id || !raw?.threadId || !Array.isArray(raw?.teams) ||
+        !raw.teams.every(t => Array.isArray(t?.memberIds))) {
         return null;
     }
 
@@ -101,9 +102,16 @@ async function loadCompetitiveRatedRuntimeState() {
         throw error;
     }
 
-    const payload = JSON.parse(rawText);
+    let payload;
+    try {
+        payload = JSON.parse(rawText);
+    } catch {
+        console.error('[RatedQueue] Runtime state file is malformed — starting fresh.');
+        return { activeMatches: [], pendingCompetitiveDbOps: [] };
+    }
     if (payload?.version !== RUNTIME_STATE_VERSION) {
-        throw new Error(`Unsupported competitive runtime state version ${payload?.version}`);
+        console.error(`[RatedQueue] Runtime state version mismatch (found ${payload?.version}, expected ${RUNTIME_STATE_VERSION}) — starting fresh.`);
+        return { activeMatches: [], pendingCompetitiveDbOps: [] };
     }
 
     return {
