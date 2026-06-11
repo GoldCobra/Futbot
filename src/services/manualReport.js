@@ -69,12 +69,12 @@ function buildManualMatchCode({ legacyMatchId = null, legacyMultiMatchId = null 
 }
 
 function buildReportReply({ legacyMatchId, ratedMatchId, gameType, mode, matchNumber }) {
-    const legacyMatchIdLine = legacyMatchId ? `\nMatch Id: ${legacyMatchId}` : '';
     const competitiveMatchLine = gameType && mode && matchNumber
         ? `\nRecorded as: ${gameType} ${mode} #${matchNumber}`
         : '';
     const ratedMatchIdLine = ratedMatchId ? `\nCompetitive Match Id: ${ratedMatchId}` : '';
-    return `Thanks for playing!\n\nResult recorded. Competitive ELO updated. Legacy ELO unchanged.${competitiveMatchLine}${legacyMatchIdLine}${ratedMatchIdLine}`;
+    const rollbackLine = matchNumber ? `\nRollback: match number ${matchNumber}` : '';
+    return `Thanks for playing!\n\nResult recorded. Competitive ELO updated.${competitiveMatchLine}${ratedMatchIdLine}${rollbackLine}`;
 }
 
 async function getActiveCompetitiveSeasonOrThrow() {
