@@ -2846,9 +2846,7 @@ async function sendThreadSetupSelectionPrompt(match, thread, player, options) {
     }
 
     const block = getOrCreateGameBlock(match);
-    const payload = buildThreadTextPayload(config.renderPrompt(match), 'line', {
-        components: config.buildRows(match, options)
-    });
+    const payload = buildThreadTextPayload(config.renderPrompt(match), 'line');
     const message = await editOrSendRequiredThreadMessage(thread, block[config.promptIdKey], payload);
     block[config.promptIdKey] = message.id;
     return { message, config };
@@ -2872,8 +2870,7 @@ async function armVisibleSelectionPromptTimer(match, client, thread, player, mes
 
     scheduleSelectionTimeout(match, player, client);
     await message.edit?.(quoteThreadPayload({
-        content: config.renderPrompt(match),
-        components: config.buildRows(match, options)
+        content: config.renderPrompt(match)
     })).catch(error => {
         logRatedWarn(client, match, 'setup.selection_control.deadline_refresh_failed', getMatchLogDetails(match, {
             player,
@@ -4993,7 +4990,7 @@ async function handleSetupSelection(interaction, match, kind) {
     const config = getSetupPickConfig(kind);
     const repId = match.teams[match[config.teamIndexKey] - 1].repUserId;
     if (interaction.user.id !== repId) {
-        await safeReply(interaction, {
+        await safeFollowUp(interaction, {
             content: config.permissionMessage(match.mode),
             ephemeral: true
         });
