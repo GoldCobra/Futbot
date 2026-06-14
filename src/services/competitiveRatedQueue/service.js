@@ -92,6 +92,7 @@ const {
     clearPendingRematch,
     clearPendingRematches,
     clearRematchTimer,
+    isQueueSearchEnabled,
     state,
     withInteractionLock,
     withOperationQueue
@@ -5412,6 +5413,14 @@ async function handleJoinButton(interaction) {
         return true;
     }
 
+    if (!isQueueSearchEnabled()) {
+        await safeReply(interaction, {
+            content: 'Rated queue search is currently disabled. Please try again later.',
+            ephemeral: true
+        });
+        return true;
+    }
+
     if (!await ensureImmediateReply(interaction, {
         content: `Joining the ${getModeCompactLabel(mode)} pool...`,
         components: []
@@ -5748,6 +5757,14 @@ async function handleRematchInteraction(interaction) {
     }
 
     return await withInteractionLock(`rematch:${matchId}`, async () => {
+        if (!isQueueSearchEnabled()) {
+            await safeReply(interaction, {
+                content: 'Rated queue search is currently disabled. Please try again later.',
+                ephemeral: true
+            });
+            return true;
+        }
+
         const snapshot = await getReportableMatchSnapshot(matchId, interaction.client);
         if (!snapshot || !isReportableMatch(snapshot)) {
             await safeReply(interaction, {

@@ -40,7 +40,7 @@ futbot: [
         'directories': [
             {
                 'name': 'mslstaff',
-                'include': ['compSeason', 'rollbackratedmatch']
+                'include': ['compSeason', 'rollbackratedmatch', 'ratedQueueDisable', 'ratedQueueEnable']
             }
         ]
     }

@@ -24,7 +24,8 @@ const state = {
     runtimeLogQueuesByThreadId: new Map(),
     runtimeLogBuffersByThreadId: new Map(),
     runtimeLogFlushTimersByThreadId: new Map(),
-    runtimeLogCleanupTimer: null
+    runtimeLogCleanupTimer: null,
+    queueSearchEnabled: true
 };
 
 async function withOperationQueue(scopeKey, callback) {
@@ -91,6 +92,14 @@ function clearPendingRematches() {
     state.rematchInitiatorsByUserId.clear();
 }
 
+function isQueueSearchEnabled() {
+    return state.queueSearchEnabled === true;
+}
+
+function setQueueSearchEnabled(value) {
+    state.queueSearchEnabled = value === true;
+}
+
 module.exports = {
     clearCompletedThreadCloseTimer,
     clearCompletedThreadCloseTimers,
@@ -98,6 +107,8 @@ module.exports = {
     clearPendingRematch,
     clearPendingRematches,
     clearRematchTimer,
+    isQueueSearchEnabled,
+    setQueueSearchEnabled,
     state,
     withInteractionLock,
     withOperationQueue
