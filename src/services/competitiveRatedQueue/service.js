@@ -830,17 +830,31 @@ function normalizePlayerName(name, discordId) {
     return value.slice(0, 100);
 }
 
+// Normalize any Discord identity (mention <@id>/<@!id>/<@&id>, &id, x-id, raw) to a bare snowflake.
+// Mirrors dbo.fn_NormalizeDiscordId so direct Player inserts can never store a wrapped id.
+function normalizeDiscordId(raw) {
+    const original = String(raw ?? '').trim();
+    if (!original) return original;
+    const stripped = original
+        .replace(/^<@[!&]?/, '')
+        .replace(/>$/, '')
+        .replace(/^&+/, '')
+        .replace(/^x-/, '')
+        .trim();
+    return /^[0-9]{15,20}$/.test(stripped) ? stripped : original;
+}
+
 async function getPlayerIdByDiscordId(discordId) {
     const result = await executeQuery(`
         SELECT TOP 1 ID AS Id
         FROM dbo.Player
         WHERE DiscordID = @discordId
-    `, { discordId: String(discordId) });
+    `, { discordId: normalizeDiscordId(discordId) });
     return result.recordset[0]?.Id ?? null;
 }
 
 async function ensureCompetitivePlayer(discordId, displayName = null) {
-    const normalizedDiscordId = String(discordId);
+    const normalizedDiscordId = normalizeDiscordId(discordId);
     const existingId = await getPlayerIdByDiscordId(normalizedDiscordId);
     if (existingId) {
         return existingId;
@@ -6168,6 +6182,7 @@ module.exports = {
     isCompetitiveRatedInteraction,
     isManagedPanelChannel,
     isUserInLiveQueue,
+    normalizeDiscordId,
     renderFinalMatchResultMessage,
     renderGameResultMessage,
     resetCompetitiveRatedQueue

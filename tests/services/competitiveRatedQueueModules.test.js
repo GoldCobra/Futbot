@@ -51,6 +51,7 @@ describe('competitiveRatedQueue internal modules', () => {
             'isCompetitiveRatedInteraction',
             'isManagedPanelChannel',
             'isUserInLiveQueue',
+            'normalizeDiscordId',
             'renderFinalMatchResultMessage',
             'renderGameResultMessage',
             'resetCompetitiveRatedQueue'
