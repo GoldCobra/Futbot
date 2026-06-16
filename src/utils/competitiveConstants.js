@@ -5,10 +5,10 @@ const COMPETITIVE_DB_SCHEMA = process.env.COMPETITIVE_DB_SCHEMA ?? 'rocci121_tob
 
 // K-factor thresholds aligned with rank tier boundaries
 const K_PLACEMENT = 100;
-const K_BRONZE_SILVER_GOLD = 50;    // < 1250 ELO
-const K_PLATINUM_DIAMOND = 40;       // 1250–1549
-const K_MASTER = 32;                 // 1550–1749
-const K_TITAN = 24;                  // 1750+
+const K_BRONZE_SILVER_GOLD = 64;    // < 1250 ELO
+const K_PLATINUM_DIAMOND = 52;       // 1250–1549
+const K_MASTER = 40;                 // 1550–1749
+const K_TITAN = 32;                  // 1750+
 
 function getKFactor(elo, isPlacement) {
     if (isPlacement) return K_PLACEMENT;
