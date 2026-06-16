@@ -4920,6 +4920,27 @@ async function resolveLoserConfirmationIfTimedOut(matchId, phase, client) {
             return;
         }
 
+        // If the just-confirmed game already decided the match (someone reached firstTo),
+        // complete it here instead of advancing to another game. This mirrors the no-setup
+        // branch above and the normal handleLoserConfirm path; without it, a loser timing out
+        // on the deciding game's confirmation wrongly serves an extra game (e.g. Bo3 going to
+        // Game 3 at 2-0).
+        const isMatchComplete = match.score.team1 >= match.firstTo || match.score.team2 >= match.firstTo;
+        if (!advantagePromptAlreadyShown && isMatchComplete) {
+            const completedGameNumber = getPendingResultGameNumber(match);
+            const winnerMention = getPendingResultWinnerMention(match);
+            await clearWinnerWaitingPrompt(match);
+            if (!await recordConfirmedGameResult(match, client, null)) return;
+            clearPendingResult(match);
+            match.loserAdvantagePromptShown = true;
+            await completeMatch(match, winnerMention, client);
+            logRatedWarn(client, match, 'game.loss_confirm_timeout', getMatchLogDetails(match, {
+                game: completedGameNumber,
+                result: 'completed'
+            }));
+            return;
+        }
+
         const options = await getOptionsForGameType(match.gameType);
         const choice = Math.random() >= 0.5 ? 'home' : 'captain';
         const nextSides = applyLoserChoice(match.homeTeamIndex, match.loserTeamIndex, choice);
