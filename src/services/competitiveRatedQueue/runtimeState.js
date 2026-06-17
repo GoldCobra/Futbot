@@ -26,6 +26,7 @@ function serializeMatch(match) {
         timeoutTimer: null,
         homeSelectionTimer: null,
         awaySelectionTimer: null,
+        initialGameSetupInFlight: false,
         notificationInteractions: [],
         privateDeliveryInteractionsByUserId: [],
         privatePromptHandles: {},

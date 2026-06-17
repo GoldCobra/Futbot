@@ -3896,6 +3896,24 @@ async function recoverCompletedThreadFinalizations(client, now = Date.now()) {
 }
 
 async function postInitialGameSetup(match, client) {
+    // Guard against concurrent runs: match creation posts the initial setup
+    // directly while the periodic reconcile watchdog can also fire before the
+    // welcome/start message IDs are recorded — that race posted the welcome+rules
+    // twice. The flag is set synchronously, so the second overlapping call bails
+    // before any thread.send. In-memory only; sequential recovery still works via
+    // the existing !rulesImageMessageId guard.
+    if (match.initialGameSetupInFlight) {
+        return;
+    }
+    match.initialGameSetupInFlight = true;
+    try {
+        return await postInitialGameSetupInner(match, client);
+    } finally {
+        match.initialGameSetupInFlight = false;
+    }
+}
+
+async function postInitialGameSetupInner(match, client) {
     const thread = await client.channels.fetch(match.threadId).catch(() => null);
     if (!thread?.send) {
         logRatedWarn(client, match, 'setup.initial.skipped', getMatchLogDetails(match, { reason: 'thread_missing' }));
@@ -6171,6 +6189,7 @@ module.exports = {
     __flushRuntimeLogsForTests: flushRuntimeLogsForTests,
     __flushOutputQueuesForTests: flushMatchOutputQueuesForTests,
     __getStateSnapshot,
+    __postInitialGameSetupForTests: postInitialGameSetup,
     __resetState,
     __runMatchmakingForTests: tryCreateMatches,
     __runRuntimeLogCleanupForTests: runRatedRuntimeLogCleanup,

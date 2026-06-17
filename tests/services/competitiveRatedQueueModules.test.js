@@ -19,6 +19,7 @@ describe('competitiveRatedQueue internal modules', () => {
             '__flushOutputQueuesForTests',
             '__flushRuntimeLogsForTests',
             '__getStateSnapshot',
+            '__postInitialGameSetupForTests',
             '__resetState',
             '__runMatchmakingForTests',
             '__runRuntimeLogCleanupForTests',
