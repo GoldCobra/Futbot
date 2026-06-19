@@ -99,7 +99,6 @@ const {
 const {
     buildGameImageMessage,
     buildImageMessage,
-    buildSeparatorImageMessage,
     getGameImagePath
 } = require('./messages');
 const {
@@ -119,6 +118,7 @@ const {
     getPendingResultWinnerMention: getPendingResultWinnerMentionFromState,
     getPendingResultWinnerTeam,
     getPrivateDeliveryInteraction,
+    isMatchDecided,
     matchActionTokenMatches,
     rememberPrivateDeliveryInteraction,
     requiresSetup,
@@ -765,7 +765,6 @@ function renderMatchControlContent(match) {
 function createGameBlock(gameNumber) {
     return {
         gameNumber,
-        gameImageSeparatorMessageId: null,
         gameImageMessageId: null,
         startMessageId: null,
         homeSelectionPromptId: null,
@@ -1948,25 +1947,12 @@ async function postGameImageIfMissing(match, client, thread = null) {
     const gameImagePayload = buildGameImageMessage(nextGameNumber);
     if (!gameImagePayload) return null;
 
-    const separatorPayload = nextGameNumber > 1 ? buildSeparatorImageMessage() : null;
-    const separatorMessage = separatorPayload
-        ? await thread.send(separatorPayload).catch(() => null)
-        : null;
-    if (separatorPayload && !separatorMessage) {
-        logRatedWarn(client, match, 'game.separator.failed', getMatchLogDetails(match, {
-            game: nextGameNumber
-        }));
-        return null;
-    }
-
     const msg = await thread.send(gameImagePayload).catch(() => null);
     if (msg) {
-        if (separatorMessage) block.gameImageSeparatorMessageId = separatorMessage.id;
         block.gameImageMessageId = msg.id;
         logRatedInfo(client, match, 'game.image.posted', getMatchLogDetails(match, {
             game: nextGameNumber,
-            message: msg.id,
-            separator: separatorMessage?.id
+            message: msg.id
         }));
         logRatedInfo(client, match, 'match.output.image_sent', getMatchLogDetails(match, {
             game: nextGameNumber,
@@ -2523,17 +2509,6 @@ async function postTerminalThreadNotice(thread, match, client, content, componen
     }
 
     const payload = buildThreadTextPayload(content, 'line', { components });
-    return await thread.send(payload).catch(err => {
-        logRatedWarn(client, match, event, getMatchLogDetails(match, { error: err.message }));
-        return null;
-    });
-}
-
-async function postTerminalThreadImageNotice(thread, match, client, payload, event = 'thread.notice_image_post_failed') {
-    if (!thread?.send || !payload) {
-        return null;
-    }
-
     return await thread.send(payload).catch(err => {
         logRatedWarn(client, match, event, getMatchLogDetails(match, { error: err.message }));
         return null;
@@ -3138,15 +3113,6 @@ async function completeMatch(match, winnerMention, client) {
         thread,
         []
     );
-    const competitiveSummarySeparatorMessage = hasCompetitiveSummary
-        ? await postTerminalThreadImageNotice(
-            thread,
-            match,
-            client,
-            buildSeparatorImageMessage(),
-            'match.competitive_summary_separator_failed'
-        )
-        : null;
     const competitiveSummaryMessage = hasCompetitiveSummary
         ? await postTerminalThreadNotice(
             thread,
@@ -3169,7 +3135,6 @@ async function completeMatch(match, winnerMention, client) {
     storeReportableMatch(match, completedThreadName, completionMessage?.id ?? null);
     logRatedInfo(client, match, 'match.final_result.posted', getMatchLogDetails(match, {
         message: finalResultMessage?.id,
-        competitiveSeparatorMessage: competitiveSummarySeparatorMessage?.id,
         competitiveMessage: competitiveSummaryMessage?.id,
         noticeMessage: completionNoticeMessage?.id,
         reportable: isReportableMatch(match)
@@ -3217,7 +3182,7 @@ async function handleWinnerSelection(interaction, match) {
         score: `${match.score.team1}-${match.score.team2}`
     }));
 
-    const isMatchComplete = match.score.team1 >= match.firstTo || match.score.team2 >= match.firstTo;
+    const isMatchComplete = isMatchDecided(match);
     const loserTeamIndex = teamIndex === 1 ? 2 : 1;
     setPendingResult(match, {
         gameNumber: completedGameNumber,
@@ -3292,7 +3257,7 @@ async function handleLoserConfirm(interaction, match) {
     if (!requiresSetup(match.gameType)) {
         await ensureDeferredReply(interaction);
         const confirmedGameNumber = pendingGameNumber;
-        const isMatchComplete = match.score.team1 >= match.firstTo || match.score.team2 >= match.firstTo;
+        const isMatchComplete = isMatchDecided(match);
         if (isMatchComplete) {
             match.loserAdvantagePromptShown = true;
             const winnerMention = getPendingResultWinnerMention(match);
@@ -3349,7 +3314,7 @@ async function handleLoserConfirm(interaction, match) {
     await ensureDeferredReply(interaction);
     const loserTeamIndex = getPendingResultLoserTeamIndex(match);
     const confirmedGameNumber = pendingGameNumber;
-    const isMatchComplete = match.score.team1 >= match.firstTo || match.score.team2 >= match.firstTo;
+    const isMatchComplete = isMatchDecided(match);
     if (isMatchComplete) {
         match.loserAdvantagePromptShown = true;
         const winnerMention = getPendingResultWinnerMention(match);
@@ -3560,7 +3525,7 @@ async function resolveLoserConfirmationIfTimedOut(matchId, phase, client) {
         if (!requiresSetup(match.gameType)) {
             const loserMention = match.teams[match.loserTeamIndex - 1].repMention;
             const timedOutGameNumber = getPendingResultGameNumber(match);
-            const isMatchComplete = match.score.team1 >= match.firstTo || match.score.team2 >= match.firstTo;
+            const isMatchComplete = isMatchDecided(match);
             if (isMatchComplete) {
                 const winnerMention = getPendingResultWinnerMention(match);
                 if (!await recordConfirmedGameResult(match, client, null)) return;
@@ -3603,7 +3568,7 @@ async function resolveLoserConfirmationIfTimedOut(matchId, phase, client) {
         // branch above and the normal handleLoserConfirm path; without it, a loser timing out
         // on the deciding game's confirmation wrongly serves an extra game (e.g. Bo3 going to
         // Game 3 at 2-0).
-        const isMatchComplete = match.score.team1 >= match.firstTo || match.score.team2 >= match.firstTo;
+        const isMatchComplete = isMatchDecided(match);
         if (!advantagePromptAlreadyShown && isMatchComplete) {
             const completedGameNumber = getPendingResultGameNumber(match);
             const winnerMention = getPendingResultWinnerMention(match);

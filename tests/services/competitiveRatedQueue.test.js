@@ -696,28 +696,6 @@ function threadPayloadHasFile(payload, imageName) {
     return (payload.files ?? []).some(file => file.name === imageName);
 }
 
-function expectFileImmediatelyBefore(thread, previousImageName, imageName) {
-    const imageIndex = findThreadPayloadIndex(thread, payload => threadPayloadHasFile(payload, imageName));
-    expect(imageIndex).toBeGreaterThan(0);
-    expect(threadPayloadHasFile(thread.send.mock.calls[imageIndex - 1][0], previousImageName)).toBe(true);
-}
-
-function expectFileNotImmediatelyBefore(thread, previousImageName, imageName) {
-    const imageIndex = findThreadPayloadIndex(thread, payload => threadPayloadHasFile(payload, imageName));
-    expect(imageIndex).toBeGreaterThanOrEqual(0);
-    if (imageIndex > 0) {
-        expect(threadPayloadHasFile(thread.send.mock.calls[imageIndex - 1][0], previousImageName)).toBe(false);
-    }
-}
-
-function expectFileNotImmediatelyAfter(thread, previousImageName, imageName) {
-    const imageIndex = findThreadPayloadIndex(thread, payload => threadPayloadHasFile(payload, previousImageName));
-    expect(imageIndex).toBeGreaterThanOrEqual(0);
-    if (imageIndex < thread.send.mock.calls.length - 1) {
-        expect(threadPayloadHasFile(thread.send.mock.calls[imageIndex + 1][0], imageName)).toBe(false);
-    }
-}
-
 function expectThreadRenameBeforeClose(thread) {
     expect(thread.setLocked).toHaveBeenCalled();
     expect(thread.setArchived).toHaveBeenCalled();
@@ -1943,7 +1921,6 @@ describe('competitiveRatedQueue', () => {
             await flushOutputQueues();
             expect(threadHasPublicSelectionButtons(thread)).toBe(true);
             expect(threadHasImagePayload(thread, 'g1.png')).toBe(true);
-            expectFileNotImmediatelyBefore(thread, 'sep.png', 'g1.png');
             expectPublicThreadTextIsQuoted(thread);
             expect(setupMessage.delete).toHaveBeenCalled();
             expect(setupMessage.edit).toHaveBeenCalledWith(expect.objectContaining({
@@ -2051,7 +2028,6 @@ describe('competitiveRatedQueue', () => {
             expect(awayStart.editReply.mock.calls.at(-1)[0].content).toContain('CAPTAIN');
             await flushOutputQueues();
             expect(threadHasImagePayload(thread, 'g1.png')).toBe(true);
-            expectFileNotImmediatelyBefore(thread, 'sep.png', 'g1.png');
             expect(threadHasPublicSelectionButtons(thread)).toBe(true);
         } finally {
             randomSpy.mockRestore();
@@ -2229,8 +2205,6 @@ describe('competitiveRatedQueue', () => {
 
             expect(threadHasImagePayload(thread, 'rules-msbl.png')).toBe(true);
             expect(threadHasImagePayload(thread, 'g1.png')).toBe(true);
-            expectFileNotImmediatelyBefore(thread, 'sep.png', 'g1.png');
-            expectFileNotImmediatelyAfter(thread, 'g1.png', 'sep.png');
             expect(findThreadPayload(thread, payload =>
                 getButtonComponents(payload).some(component => component.label === 'Start Match')
             )).toBeUndefined();
@@ -2308,8 +2282,6 @@ describe('competitiveRatedQueue', () => {
             expect(confirmedPayload.content).toContain('Result:');
             expect(confirmedPayload.content).not.toContain('confirmed the loss.');
             expect(threadHasImagePayload(thread, 'g2.png')).toBe(true);
-            expectFileImmediatelyBefore(thread, 'sep.png', 'g2.png');
-            expectFileNotImmediatelyAfter(thread, 'g2.png', 'sep.png');
             expect(findThreadPayload(thread, payload =>
                 getButtonComponents(payload).some(component => component.label === 'GAME WIN')
             )).toBeDefined();
@@ -2645,7 +2617,6 @@ describe('competitiveRatedQueue', () => {
         expect(resultIndex).toBeGreaterThanOrEqual(0);
         expect(gameImageIndex).toBeGreaterThan(resultIndex);
         expect(selectionsIndex).toBeGreaterThan(gameImageIndex);
-        expectFileImmediatelyBefore(thread, 'sep.png', 'g2.png');
     });
 
     it('keeps SMS Game Win confirm-gated and delays the result until next setup picks', async () => {
@@ -2711,7 +2682,6 @@ describe('competitiveRatedQueue', () => {
         expect(delayedResultIndex).toBeGreaterThanOrEqual(0);
         expect(delayedGameImageIndex).toBeGreaterThan(delayedResultIndex);
         expect(delayedSelectionsIndex).toBeGreaterThan(delayedGameImageIndex);
-        expectFileImmediatelyBefore(thread, 'sep.png', 'g2.png');
     });
 
     it('auto-selects a random stadium for HOME when the 2-minute selection timer fires', async () => {
@@ -2853,7 +2823,6 @@ describe('competitiveRatedQueue', () => {
         expect(resultIndex).toBeGreaterThanOrEqual(0);
         expect(gameImageIndex).toBeGreaterThan(resultIndex);
         expect(selectionsIndex).toBeGreaterThan(gameImageIndex);
-        expectFileImmediatelyBefore(thread, 'sep.png', 'g2.png');
         expect(competitiveRatedQueue.__getStateSnapshot().activeMatchCount).toBe(1);
         expect(match.selectedStadium).not.toBeNull();
         expect(match.selectedCaptain).not.toBeNull();
@@ -2918,7 +2887,6 @@ describe('competitiveRatedQueue', () => {
         expect(selectionsIndex).toBeGreaterThan(gameImageIndex);
         expect(gameImageIndex).toBeGreaterThanOrEqual(0);
         expect(gameWinIndices.at(-1)).toBeGreaterThan(selectionsIndex);
-        expectFileImmediatelyBefore(thread, 'sep.png', 'g2.png');
         expect(threadHasPublicSelectionButtons(thread)).toBe(false);
     });
 
@@ -3006,7 +2974,6 @@ describe('competitiveRatedQueue', () => {
         expect(delayedResultIndex).toBeGreaterThan(confirmLossIndex);
         expect(delayedGameImageIndex).toBeGreaterThan(delayedResultIndex);
         expect(selectionsIndex).toBeGreaterThan(delayedGameImageIndex);
-        expectFileImmediatelyBefore(thread, 'sep.png', 'g2.png');
     });
 
     it('silently ignores duplicate Game Win clicks for the same game', async () => {
@@ -3499,7 +3466,7 @@ describe('competitiveRatedQueue', () => {
         }
     });
 
-    it('posts the game three image with a separator when the series reaches game three', async () => {
+    it('posts the game three image when the series reaches game three', async () => {
         const { client, thread } = createMatchClientMock();
         const match = createMatchFixture({
             firstTo: 3,
@@ -3559,8 +3526,6 @@ describe('competitiveRatedQueue', () => {
         expect(resultIndex).toBeGreaterThanOrEqual(0);
         expect(gameImageIndex).toBeGreaterThan(resultIndex);
         expect(selectionsIndex).toBeGreaterThan(gameImageIndex);
-        expectFileImmediatelyBefore(thread, 'sep.png', 'g3.png');
-        expectFileNotImmediatelyAfter(thread, 'g3.png', 'sep.png');
         expect(threadHasPublicSelectionButtons(thread)).toBe(false);
         expect(competitiveRatedQueue.__getStateSnapshot().activeMatchCount).toBe(1);
     });
@@ -4191,8 +4156,8 @@ describe('competitiveRatedQueue', () => {
         const ratingPayloadIndex = findThreadPayloadIndex(thread, payload =>
             payload.content?.includes('<@home-user> +24 <:arrow:1501606527188865114>')
         );
-        const separatorPayloadIndex = findThreadPayloadIndex(thread, payload =>
-            threadPayloadHasFile(payload, 'sep.png')
+        const winnerResultIndex = findThreadPayloadIndex(thread, payload =>
+            payload.content?.includes('WINS THE MATCH!')
         );
         const reportCustomId = getButtonCustomIdByLabel(reportPayload, 'Report Issue');
         const finalButtonLabels = getButtonComponents(reportPayload).map(component => component.label);
@@ -4200,8 +4165,8 @@ describe('competitiveRatedQueue', () => {
         expect(reportCustomId).toBe('rated:competitive:match:report_issue:match-1');
         expect(winnerPayload.content).toContain('WINS THE MATCH');
         expect(winnerPayload.content).toContain('Result:');
-        expect(separatorPayloadIndex).toBeGreaterThanOrEqual(0);
-        expect(ratingPayloadIndex).toBeGreaterThan(separatorPayloadIndex);
+        expect(ratingPayloadIndex).toBeGreaterThanOrEqual(0);
+        expect(ratingPayloadIndex).toBeGreaterThan(winnerResultIndex);
         expect(ratingPayload.content).toContain('<@home-user> +24 <:arrow:1501606527188865114> <:cr_unranked:1504559021670137906> **1024**');
         expect(ratingPayload.content).toContain('<@away-user> -24 <:arrow:1501606527188865114> <:cr_unranked:1504559021670137906> **976**');
         expect(ratingPayload.content).not.toContain('Competitive Rating');

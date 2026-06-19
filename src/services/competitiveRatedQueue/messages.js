@@ -4,8 +4,7 @@ const { AttachmentBuilder } = require('discord.js');
 
 const {
     PANEL_IMAGE_PATHS_BY_GAME_TYPE,
-    RATED_MATCH_IMAGE_DIR,
-    SEPARATOR_IMAGE_PATH
+    RATED_MATCH_IMAGE_DIR
 } = require('./constants');
 
 function getPanelImagePath(panelConfig) {
@@ -39,15 +38,10 @@ function buildGameImageMessage(gameNumber) {
     return buildImageMessage(getGameImagePath(gameNumber));
 }
 
-function buildSeparatorImageMessage() {
-    return buildImageMessage(SEPARATOR_IMAGE_PATH);
-}
-
 module.exports = {
     buildGameImageMessage,
     buildImageMessage,
     buildPanelImageMessage,
-    buildSeparatorImageMessage,
     getGameImagePath,
     getPanelImagePath
 };

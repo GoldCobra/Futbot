@@ -8,6 +8,11 @@ function getNextGameNumber(match) {
     return match.score.team1 + match.score.team2 + (match.stage === 'complete' ? 0 : 1);
 }
 
+// A match is decided once either team reaches the First-To target.
+function isMatchDecided(match) {
+    return match.score.team1 >= match.firstTo || match.score.team2 >= match.firstTo;
+}
+
 function getPendingResultWinnerTeam(match) {
     const loserTeamIndex = match?.pendingResult?.loserTeamIndex ?? match?.loserTeamIndex;
     if (!loserTeamIndex) {
@@ -108,6 +113,7 @@ module.exports = {
     getPendingResultWinnerMention,
     getPendingResultWinnerTeam,
     getPrivateDeliveryInteraction,
+    isMatchDecided,
     matchActionTokenMatches,
     rememberPrivateDeliveryInteraction,
     requiresSetup,
