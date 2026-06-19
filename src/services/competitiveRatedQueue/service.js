@@ -1,12 +1,9 @@
-const crypto = require('node:crypto');
-const path = require('node:path');
 const {
     ActionRowBuilder,
     ButtonBuilder,
     ButtonStyle,
     ChannelType,
-    MessageFlags,
-    PermissionsBitField
+    MessageFlags
 } = require('discord.js');
 
 const { executeQuery, isTransientDbError } = require('../../db/sqlClient');
@@ -45,8 +42,6 @@ const {
     LOSER_CHOICE_TIMEOUT_MINUTES,
     MATCH_TIMEOUT_PHASES,
     MSC_CAPTAIN_BUTTON_ORDER,
-    PANEL_BYPASS_ROLES,
-    PLAYER_COUNT_EMOJI,
     REMATCH_CONFIRM_TIMEOUT_MS,
     RULES_IMAGE_PATHS_BY_GAME_TYPE,
     SCORE_EMOJIS,
@@ -60,7 +55,6 @@ const {
     extendSearchCustomId,
     loserAdvantageCustomId,
     loserConfirmCustomId,
-    panelJoinCustomId,
     parseActionTokenFromCustomId,
     parseChannelIdFromCustomId,
     parseIdFromCustomId,
@@ -86,7 +80,6 @@ const {
     truncateDiscordName
 } = require('./formatting');
 const {
-    clearCompletedThreadCloseTimer,
     clearCompletedThreadCloseTimers,
     clearPendingCompletedThreadFinalizations,
     clearPendingRematch,
@@ -106,10 +99,8 @@ const {
 const {
     buildGameImageMessage,
     buildImageMessage,
-    buildPanelImageMessage,
     buildSeparatorImageMessage,
-    getGameImagePath,
-    getPanelImagePath
+    getGameImagePath
 } = require('./messages');
 const {
     applyLoserChoice,
@@ -150,8 +141,7 @@ const {
 } = require('./privatePrompts');
 const {
     isRuntimeStateEnabled,
-    loadCompetitiveRatedRuntimeState,
-    saveCompetitiveRatedRuntimeState
+    loadCompetitiveRatedRuntimeState
 } = require('./runtimeState');
 const {
     clearCurrentControlMessage,
@@ -168,161 +158,52 @@ const {
     isReportableMatch,
     storeReportableMatch
 } = require('./terminalFlow');
+const {
+    buildPanelMessage,
+    buildStatusMessageContent,
+    enforcePanelMessagePolicy,
+    getPanelConfigByChannelId,
+    getPanelConfigByGameType,
+    isManagedPanelChannel,
+    reconcilePanelChannel,
+    schedulePanelStatusRefresh
+} = require('./panel');
+const {
+    createId,
+    flushMatchOutputQueuesForTests,
+    getMatchLogDetails,
+    getSearchLogDetails,
+    hasPendingMatchOutput,
+    queueMatchOutput,
+    resetRuntimePersist,
+    scheduleRuntimeStatePersist
+} = require('./core');
+const {
+    buildCompleteCompetitiveDbPayload,
+    buildRecordGameDbPayload,
+    enqueueCompetitiveDbOp,
+    hasPendingCompetitiveDbOpsForMatch,
+    postCompetitiveDbPendingNotice,
+    renderCompetitiveRatingSummaryMessage,
+    runPendingCompetitiveDbOps
+} = require('./dbOps');
+const {
+    buildCancelledThreadSnapshotFromDb,
+    finalizeCompletedThreadFromSnapshot,
+    finalizeOverdueCompletedThreads,
+    finalizeThreadLifecycle,
+    isRematchWindowOpen,
+    recoverCompletedThreadFinalizations,
+    restoreCompletedThreadFinalization,
+    scheduleCompletedThreadClose,
+    setCompletedThreadFinalizationDeadline
+} = require('./threadLifecycle');
 
 function getModeCompactLabel(mode) {
     return mode === '2v2' ? '2vs2' : '1vs1';
 }
 
-function getPanelConfigByChannelId(channelId) {
-    return CONFIG.PANEL_CHANNELS.find(panel => panel.channelId === channelId) ?? null;
-}
-
-function getPanelConfigByGameType(gameType) {
-    return CONFIG.PANEL_CHANNELS.find(panel => panel.gameType === gameType) ?? null;
-}
-
-function isManagedPanelChannel(channelId) {
-    return Boolean(getPanelConfigByChannelId(channelId));
-}
-
-const MATCH_OUTPUT_WARN_MS = 5000;
-const RUNTIME_STATE_SAVE_DELAY_MS = 250;
-let runtimeStatePersistTimer = null;
-let runtimeStatePersistPromise = Promise.resolve();
 let runtimeStateRecovered = false;
-
-function getMatchOutputMeta(matchId) {
-    const key = String(matchId);
-    const meta = state.outputQueueMetaByMatchId.get(key) ?? {
-        pending: 0,
-        lastLabel: null,
-        queuedAt: null,
-        required: false,
-        attempt: 0,
-        nextRetryAt: null,
-        lastError: null
-    };
-    state.outputQueueMetaByMatchId.set(key, meta);
-    return meta;
-}
-
-function queueMatchOutput(match, client, label, worker, details = {}) {
-    if (!match?.id || typeof worker !== 'function') {
-        return Promise.resolve(null);
-    }
-
-    const matchId = String(match.id);
-    const queuedAt = Date.now();
-    const meta = getMatchOutputMeta(matchId);
-    meta.pending += 1;
-    meta.lastLabel = label;
-    meta.queuedAt = queuedAt;
-    meta.required = Boolean(details.required);
-    meta.attempt += 1;
-    meta.nextRetryAt = null;
-    meta.lastError = null;
-
-    const previous = state.outputQueuesByMatchId.get(matchId) ?? Promise.resolve();
-    const queued = previous.catch(() => {}).then(async () => {
-        const startedAt = Date.now();
-
-        try {
-            return await worker();
-        } catch (error) {
-            meta.lastError = error.message;
-            logRatedError(client, match, 'match.output.failed', error, getMatchLogDetails(match, {
-                label,
-                required: Boolean(details.required)
-            }));
-            return null;
-        } finally {
-            const durationMs = Date.now() - startedAt;
-            meta.pending = Math.max(0, meta.pending - 1);
-        }
-    });
-
-    const cleanup = queued.finally(() => {
-        if (state.outputQueuesByMatchId.get(matchId) === cleanup) {
-            state.outputQueuesByMatchId.delete(matchId);
-        }
-        if (meta.pending === 0 && state.outputQueuesByMatchId.get(matchId) !== cleanup) {
-            state.outputQueueMetaByMatchId.delete(matchId);
-        }
-        scheduleRuntimeStatePersist(`output:${label}`);
-    });
-
-    state.outputQueuesByMatchId.set(matchId, cleanup);
-    return cleanup;
-}
-
-async function flushMatchOutputQueuesForTests() {
-    await Promise.all([...state.outputQueuesByMatchId.values()].map(queue => queue.catch(() => {})));
-}
-
-function getSearchLogDetails(search) {
-    return {
-        search: search?.id,
-        user: search?.userId,
-        channel: search?.channelId
-    };
-}
-
-function getMatchLogDetails(match, extra = {}) {
-    return {
-        match: match?.id,
-        thread: match?.threadId,
-        score: match?.score ? `${match.score.team1}-${match.score.team2}` : null,
-        stage: match?.stage,
-        ...extra
-    };
-}
-
-function buildRuntimeStateSnapshotForPersist() {
-    return {
-        activeMatches: [...state.activeMatchesById.values()],
-        pendingCompetitiveDbOps: [...state.pendingCompetitiveDbOpsByKey.values()]
-    };
-}
-
-async function flushRuntimeStatePersist(reason = 'state_change') {
-    if (!isRuntimeStateEnabled()) {
-        return false;
-    }
-
-    runtimeStatePersistPromise = runtimeStatePersistPromise
-        .catch(() => {})
-        .then(async () => {
-            await saveCompetitiveRatedRuntimeState(buildRuntimeStateSnapshotForPersist());
-            return true;
-        })
-        .catch(error => {
-            logRatedError(state.client, { all: true }, 'runtime_state.persist_failed', error, {
-                reason
-            });
-            return false;
-        });
-
-    return await runtimeStatePersistPromise;
-}
-
-function scheduleRuntimeStatePersist(reason = 'state_change') {
-    if (!isRuntimeStateEnabled()) {
-        return;
-    }
-
-    if (runtimeStatePersistTimer) {
-        clearTimeout(runtimeStatePersistTimer);
-    }
-    runtimeStatePersistTimer = setTimeout(() => {
-        runtimeStatePersistTimer = null;
-        flushRuntimeStatePersist(reason).catch(error => {
-            logRatedError(state.client, { all: true }, 'runtime_state.persist_timer_failed', error, {
-                reason
-            });
-        });
-    }, RUNTIME_STATE_SAVE_DELAY_MS);
-    runtimeStatePersistTimer.unref?.();
-}
 
 function restoreRuntimeMatchIndexes(match) {
     state.activeMatchesById.set(match.id, match);
@@ -372,174 +253,6 @@ async function recoverRuntimeState(client) {
     }
 }
 
-function getCompetitiveDbOpKey(type, payload) {
-    if (type === 'record_game') {
-        return `${type}:${payload.ratedMatchId}:${payload.gameNumber}`;
-    }
-    if (type === 'complete_competitive') {
-        return `${type}:${payload.ratedMatchId}`;
-    }
-    return `${type}:${payload.matchCode ?? payload.ratedMatchId ?? createId()}`;
-}
-
-function enqueueCompetitiveDbOp(type, payload, match, client, reason) {
-    const key = getCompetitiveDbOpKey(type, payload);
-    const existing = state.pendingCompetitiveDbOpsByKey.get(key);
-    const op = existing ?? {
-        key,
-        type,
-        payload,
-        matchId: match?.id ?? payload.matchCode ?? null,
-        threadId: match?.threadId ?? payload.threadId ?? null,
-        createdAt: Date.now(),
-        attempts: 0,
-        lastError: null,
-        nextRetryAt: Date.now()
-    };
-    op.payload = payload;
-    op.reason = reason;
-    op.updatedAt = Date.now();
-    state.pendingCompetitiveDbOpsByKey.set(key, op);
-    if (match) {
-        match.competitiveDbPending = true;
-    }
-    logRatedWarn(client, match ?? { all: true }, 'competitive_db.op_queued', getMatchLogDetails(match, {
-        key,
-        type,
-        reason
-    }));
-    scheduleRuntimeStatePersist('competitive_db_op_queued');
-    return op;
-}
-
-function hasPendingCompetitiveDbOpsForMatch(match) {
-    if (!match?.ratedMatchId) return false;
-    return [...state.pendingCompetitiveDbOpsByKey.values()]
-        .some(op => Number(op.payload?.ratedMatchId) === Number(match.ratedMatchId));
-}
-
-function hasPendingRecordGameOpsForRatedMatch(ratedMatchId) {
-    return [...state.pendingCompetitiveDbOpsByKey.values()]
-        .some(op => op.type === 'record_game' && Number(op.payload?.ratedMatchId) === Number(ratedMatchId));
-}
-
-function buildRecordGameDbPayload(match, confirmedByDiscordId = null) {
-    return {
-        ratedMatchId: match.ratedMatchId,
-        matchCode: match.id,
-        threadId: match.threadId,
-        gameNumber: match.pendingResult.gameNumber,
-        winnerTeamNumber: match.pendingResult.winnerTeamIndex,
-        homeTeamNumber: match.pendingResult.homeTeamNumber ?? match.homeTeamIndex,
-        stadiumCode: match.pendingResult.stadiumCode ?? null,
-        captainCode: match.pendingResult.captainCode ?? null,
-        reportedByParticipantId: match.participantIdByDiscordId?.get(String(match.pendingResult.reporterDiscordId)),
-        confirmedByParticipantId: match.participantIdByDiscordId?.get(String(confirmedByDiscordId)),
-        reportedByDiscordId: match.pendingResult.reporterDiscordId ?? null,
-        confirmedByDiscordId
-    };
-}
-
-function buildCompleteCompetitiveDbPayload(match, winnerTeamNumber) {
-    return {
-        ratedMatchId: match.ratedMatchId,
-        matchCode: match.id,
-        threadId: match.threadId,
-        seasonId: match.seasonId,
-        gameType: CONSTANTS.SQL_GAME_TYPE_TO_NUMBER[match.gameType],
-        mode: match.mode,
-        winnerTeamNumber,
-        team1Score: match.score.team1,
-        team2Score: match.score.team2,
-        homeTeamNumber: match.homeTeamIndex,
-        awayTeamNumber: match.awayTeamIndex,
-        guildId: CONSTANTS.GUILD_ID
-    };
-}
-
-async function postCompetitiveDbPendingNotice(match, client, thread = null) {
-    thread ??= await client.channels.fetch(match.threadId).catch(() => null);
-    if (!thread?.send) return null;
-
-    const payload = buildThreadTextPayload(
-        `${BL_TIME_EMOJI} **Competitive DB sync pending.** The match can continue; Competitive ELO will be synced automatically when the database is reachable again.`,
-        'line',
-        { components: [] }
-    );
-    try {
-        const message = await editOrSendRequiredThreadMessage(
-            thread,
-            match.competitiveDbPendingNoticeMessageId,
-            payload
-        );
-        match.competitiveDbPendingNoticeMessageId = message.id;
-        return message;
-    } catch (error) {
-        logRatedError(client, match, 'competitive_db.pending_notice_failed', error, getMatchLogDetails(match));
-        return null;
-    }
-}
-
-async function runPendingCompetitiveDbOps(client) {
-    const now = Date.now();
-    const ops = [...state.pendingCompetitiveDbOpsByKey.values()]
-        .filter(op => !op.nextRetryAt || op.nextRetryAt <= now)
-        .sort((a, b) => a.createdAt - b.createdAt);
-
-    for (const op of ops) {
-        try {
-            if (op.type === 'record_game') {
-                await ratedMatchDao.recordGame(op.payload);
-            } else if (op.type === 'complete_competitive') {
-                if (hasPendingRecordGameOpsForRatedMatch(op.payload.ratedMatchId)) {
-                    continue;
-                }
-                const result = await recordCompetitiveResult({
-                    ...op.payload,
-                    client,
-                    guildId: op.payload.guildId ?? CONSTANTS.GUILD_ID
-                });
-                const thread = await client.channels.fetch(op.threadId).catch(() => null);
-                if (thread?.send && Array.isArray(result?.changes) && result.changes.length > 0) {
-                    await thread.send(buildThreadTextPayload(
-                        `${BL_CHECK_EMOJI} **Competitive DB sync completed.**\n${renderCompetitiveRatingSummaryMessage(result)}`,
-                        'line',
-                        { components: [] }
-                    )).catch(error => {
-                        logRatedWarn(client, { id: op.matchId, threadId: op.threadId }, 'competitive_db.sync_notice_failed', {
-                            match: op.matchId,
-                            thread: op.threadId,
-                            error: error.message
-                        });
-                    });
-                }
-            }
-            state.pendingCompetitiveDbOpsByKey.delete(op.key);
-            scheduleRuntimeStatePersist('competitive_db_op_completed');
-            logRatedInfo(client, { id: op.matchId, threadId: op.threadId }, 'competitive_db.op_completed', {
-                match: op.matchId,
-                thread: op.threadId,
-                key: op.key,
-                type: op.type
-            });
-        } catch (error) {
-            op.attempts += 1;
-            op.lastError = error.message;
-            op.nextRetryAt = Date.now() + Math.min(60000, 5000 * Math.max(op.attempts, 1));
-            scheduleRuntimeStatePersist('competitive_db_op_retry_scheduled');
-            logRatedWarn(client, { id: op.matchId, threadId: op.threadId }, 'competitive_db.op_retry_scheduled', {
-                match: op.matchId,
-                thread: op.threadId,
-                key: op.key,
-                type: op.type,
-                attempts: op.attempts,
-                nextRetryAt: op.nextRetryAt,
-                error: error.message
-            });
-        }
-    }
-}
-
 function hasExpectedMatchStageAndToken(match, interaction, expectedStage, gameNumber = getNextGameNumber(match)) {
     return match.stage === expectedStage
         && matchActionTokenMatches(match, interaction.customId, gameNumber);
@@ -556,70 +269,6 @@ async function ignoreMatchInteraction(interaction, match, event, reason, extra =
 
 const SEASON_UNAVAILABLE_MESSAGE = 'Season ended. New Season will start soon.';
 const QUEUE_JOIN_SEASON_UNAVAILABLE_MESSAGE = 'Season has not started yet. Rated matches open soon.';
-const LFG_ROLE_ID_BY_GAME_TYPE = {
-    MSBL: '944150830972538923',
-    MSC: '680810288605298744',
-    SMS: '781487757176209428'
-};
-
-function getLfgRoleIdForPanel(channelId) {
-    const panelConfig = getPanelConfigByChannelId(channelId);
-    return panelConfig ? LFG_ROLE_ID_BY_GAME_TYPE[panelConfig.gameType] ?? null : null;
-}
-
-function buildPanelMessage(channelId = CONFIG.PANEL_CHANNELS[0].channelId) {
-    const row = new ActionRowBuilder().addComponents(
-        new ButtonBuilder()
-            .setCustomId(panelJoinCustomId(channelId, '1v1'))
-            .setLabel('Search 1vs1')
-            .setStyle(ButtonStyle.Primary),
-        new ButtonBuilder()
-            .setCustomId(panelJoinCustomId(channelId, '2v2'))
-            .setLabel('Search 2vs2')
-            .setStyle(ButtonStyle.Primary)
-    );
-
-    return {
-        components: [row]
-    };
-}
-
-function buildStatusMessageContent(counts, channelId = null) {
-    const lines = [];
-    const hasSingles = (counts['1v1'] ?? 0) > 0;
-    const hasDoubles = (counts['2v2'] ?? 0) > 0;
-
-    if (hasSingles || hasDoubles) {
-        const roleId = getLfgRoleIdForPanel(channelId);
-        if (roleId) {
-            lines.push(`<@&${roleId}>`);
-        }
-    }
-
-    if (hasSingles) {
-        lines.push(`Players in 1vs1 Pool: **${PLAYER_COUNT_EMOJI} ${counts['1v1']}**`);
-    }
-
-    if (hasDoubles) {
-        lines.push(`Players in 2vs2 Pool: **👥 ${counts['2v2']}**`);
-    }
-
-    return lines.join('\n');
-}
-
-function buildStatusMessagePayload(panelConfig, counts) {
-    const roleId = LFG_ROLE_ID_BY_GAME_TYPE[panelConfig?.gameType];
-    const payload = {
-        content: buildStatusMessageContent(counts, panelConfig?.channelId),
-        components: [],
-        allowedMentions: { parse: [] }
-    };
-    if (roleId) {
-        payload.allowedMentions.roles = [roleId];
-    }
-    return payload;
-}
-
 function buildExtendButtons(search) {
     return [
         new ActionRowBuilder().addComponents(
@@ -758,56 +407,6 @@ function buildSearchSeasonEndedPayload(search) {
         content: `${BL_X_EMOJI} ${SEASON_UNAVAILABLE_MESSAGE}`,
         components: []
     };
-}
-
-function createPanelMeta(channelId) {
-    return {
-        channelId,
-        imageMessageId: null,
-        panelMessageId: null,
-        statusMessageId: null,
-        channelLockApplied: false,
-        availabilityKey: 'active'
-    };
-}
-
-function getOrCreatePanelMeta(channelId) {
-    if (!state.panelMetaByChannelId.has(channelId)) {
-        state.panelMetaByChannelId.set(channelId, createPanelMeta(channelId));
-    }
-    return state.panelMetaByChannelId.get(channelId);
-}
-
-function hasBypassRole(member) {
-    if (!member?.roles?.cache) {
-        return false;
-    }
-
-    if (member.permissions?.has?.(PermissionsBitField.Flags.Administrator)) {
-        return true;
-    }
-
-    return member.roles.cache.some(role => PANEL_BYPASS_ROLES.has(role.id));
-}
-
-function buildSearchCounts(channelId) {
-    const counts = {
-        '1v1': 0,
-        '2v2': 0
-    };
-
-    for (const search of state.activeSearchesById.values()) {
-        if (search.channelId !== channelId) {
-            continue;
-        }
-        counts[search.mode] += 1;
-    }
-
-    return counts;
-}
-
-function createId() {
-    return crypto.randomBytes(6).toString('hex');
 }
 
 function describeTeam(team) {
@@ -1064,37 +663,6 @@ function formatScoreResult(match) {
     const left = SCORE_EMOJIS[match.score.team1] ?? String(match.score.team1);
     const right = SCORE_EMOJIS[match.score.team2] ?? String(match.score.team2);
     return `${left} **-** ${right}`;
-}
-
-function getDisplayedDelta(delta) {
-    const rounded = Math.round(delta);
-    if (!Number.isFinite(rounded)) {
-        return '+0';
-    }
-
-    return rounded >= 0 ? `+${rounded}` : `${rounded}`;
-}
-
-function renderCompetitiveRatingLine(change) {
-    const rank = change.rankAfter ?? 0;
-    const rankEmoji = COMP_RANK_EMOJIS[rank] ?? COMP_RANK_EMOJIS[0];
-    const eloAfter = Math.round(change.eloAfter);
-    return `<@${change.discordId}> ${getDisplayedDelta(change.eloDelta)} ${ARROW_EMOJI} ${rankEmoji} **${eloAfter}**`;
-}
-
-function renderCompetitiveRatingSummaryMessage(competitiveResult = null) {
-    if (!Array.isArray(competitiveResult?.changes) || competitiveResult.changes.length === 0) {
-        return null;
-    }
-
-    return competitiveResult.changes
-        .slice()
-        .sort((left, right) => {
-            if (left.outcome !== right.outcome) return left.outcome === 'win' ? -1 : 1;
-            return left.teamNumber - right.teamNumber;
-        })
-        .map(renderCompetitiveRatingLine)
-        .join('\n');
 }
 
 function renderGameResultMessage(winnerMention, gameNumber, match) {
@@ -1670,23 +1238,6 @@ function scheduleSearchTimers(search, client) {
     }
 }
 
-function schedulePanelStatusRefresh(channelId, client) {
-    if (!channelId || state.panelStatusRefreshTimersByChannelId.has(channelId)) {
-        return;
-    }
-
-    const timer = scheduleSearchTimeout(() => {
-        state.panelStatusRefreshTimersByChannelId.delete(channelId);
-        refreshPanelStatus(channelId, client).catch(error => {
-            const panelConfig = getPanelConfigByChannelId(channelId);
-            logRatedError(client, panelConfig ?? { channel: channelId }, 'panel.status.refresh_failed', error, {
-                channel: channelId
-            });
-        });
-    }, 500);
-    state.panelStatusRefreshTimersByChannelId.set(channelId, timer);
-}
-
 function clearMatchTimers(match) {
     if (!match) {
         return;
@@ -1847,207 +1398,6 @@ async function closeSearch(search, reason, client) {
     log(client, search, `queue.${reason}`, getSearchLogDetails(search));
 }
 
-async function reconcilePanelChannel(client, panelConfig) {
-    const channel = await fetchChannel(client, panelConfig.channelId);
-    if (!channel || channel.type !== ChannelType.GuildText) {
-        console.warn(`[RatedQueue] Panel channel ${panelConfig.channelId} not found or not a text channel. Bot may not be in the correct guild.`);
-        logRatedWarn(client, panelConfig, 'panel.channel_missing', { channel: panelConfig.channelId });
-        return;
-    }
-    const panelMeta = getOrCreatePanelMeta(channel.id);
-
-    if (!panelMeta.channelLockApplied) {
-        await applyChannelLock(channel, panelConfig.gameType);
-        panelMeta.channelLockApplied = true;
-    }
-
-    const counts = buildSearchCounts(channel.id);
-    const hasAnySearches = counts['1v1'] > 0 || counts['2v2'] > 0;
-    const panelIsBootstrapped = panelMeta.imageMessageId && panelMeta.panelMessageId;
-    const needsFullReconcile = !panelIsBootstrapped || hasAnySearches || panelMeta.statusMessageId != null;
-    const existingMessages = needsFullReconcile ? await fetchRecentMessages(channel, 100) : [];
-    const deletedMessageIds = new Set();
-
-    const panelImagePayload = buildPanelImageMessage(panelConfig);
-    let panelImageMessage = findPanelImageMessage(existingMessages, client.user?.id, panelConfig);
-    if (panelImagePayload) {
-        if (panelImageMessage) {
-            panelMeta.imageMessageId = panelImageMessage.id;
-        } else if (!panelMeta.imageMessageId) {
-            try {
-                const createdPanelImageMessage = await channel.send(panelImagePayload);
-                panelMeta.imageMessageId = createdPanelImageMessage.id;
-                panelImageMessage = createdPanelImageMessage;
-                console.log('[RatedQueue] Panel image sent.');
-                logRatedInfo(client, panelConfig, 'panel.image.created', {
-                    channel: channel.id,
-                    message: createdPanelImageMessage.id
-                });
-            } catch (err) {
-                console.error(`[RatedQueue] Failed to send panel image: ${err.message}. Check bot permissions (SendMessages) in channel ${channel.id}.`);
-                logRatedError(client, panelConfig, 'panel.image.create_failed', err, { channel: channel.id });
-                return;
-            }
-        }
-    }
-
-    const panelPayload = buildPanelMessage(channel.id);
-    let panelMessage = findPanelMessage(existingMessages, client.user?.id, channel.id);
-    const shouldRecreatePanelMessage = Boolean(
-        panelMessage
-            && panelImageMessage
-            && panelMessage.createdTimestamp < panelImageMessage.createdTimestamp
-    ) || panelMessageNeedsRecreate(panelMessage);
-    if (shouldRecreatePanelMessage) {
-        await panelMessage.delete().catch(() => {});
-        deletedMessageIds.add(panelMessage.id);
-        panelMessage = null;
-        panelMeta.panelMessageId = null;
-    }
-
-    if (panelMessage) {
-        panelMeta.panelMessageId = panelMessage.id;
-    } else if (!panelMeta.panelMessageId) {
-        try {
-            const createdPanelMessage = await channel.send(panelPayload);
-            panelMeta.panelMessageId = createdPanelMessage.id;
-            console.log('[RatedQueue] Panel buttons sent.');
-            logRatedInfo(client, panelConfig, 'panel.controls.created', {
-                channel: channel.id,
-                message: createdPanelMessage.id
-            });
-        } catch (err) {
-            console.error(`[RatedQueue] Failed to send panel buttons: ${err.message}. Check bot permissions (SendMessages) in channel ${channel.id}.`);
-            logRatedError(client, panelConfig, 'panel.controls.create_failed', err, { channel: channel.id });
-            return;
-        }
-    }
-    panelMeta.availabilityKey = 'static';
-
-    const statusMessage = findStatusMessage(existingMessages, client.user?.id);
-    if (hasAnySearches) {
-        const statusPayload = buildStatusMessagePayload(panelConfig, counts);
-        if (statusMessage) {
-            panelMeta.statusMessageId = statusMessage.id;
-            await statusMessage.edit(statusPayload).catch(err =>
-                {
-                    console.warn(`[RatedQueue] Failed to edit status message in ${channel.id}: ${err.message}`);
-                    logRatedWarn(client, panelConfig, 'panel.status.edit_failed', { channel: channel.id, error: err.message });
-                }
-            );
-        } else {
-            const createdStatusMessage = await channel.send(statusPayload);
-            panelMeta.statusMessageId = createdStatusMessage.id;
-            logRatedInfo(client, panelConfig, 'panel.status.created', {
-                channel: channel.id,
-                message: createdStatusMessage.id
-            });
-        }
-    } else if (statusMessage) {
-        panelMeta.statusMessageId = null;
-        await statusMessage.delete().catch(err =>
-            {
-                console.warn(`[RatedQueue] Failed to delete status message in ${channel.id}: ${err.message}`);
-                logRatedWarn(client, panelConfig, 'panel.status.delete_failed', { channel: channel.id, error: err.message });
-            }
-        );
-    }
-
-    await prunePanelChannelMessages(existingMessages, panelMeta, deletedMessageIds);
-}
-
-async function fetchPanelMessageById(channel, messageId) {
-    if (!messageId || typeof channel.messages?.fetch !== 'function') {
-        return null;
-    }
-
-    return await channel.messages.fetch(messageId).catch(() => null);
-}
-
-async function refreshPanelStatus(channelId, client) {
-    const panelConfig = getPanelConfigByChannelId(channelId);
-    if (!panelConfig) {
-        return;
-    }
-
-    const channel = await fetchChannel(client, panelConfig.channelId);
-    if (!channel || channel.type !== ChannelType.GuildText) {
-        logRatedWarn(client, panelConfig, 'panel.status.channel_missing', { channel: panelConfig.channelId });
-        return;
-    }
-
-    const panelMeta = getOrCreatePanelMeta(channel.id);
-    const counts = buildSearchCounts(channel.id);
-    const hasAnySearches = counts['1v1'] > 0 || counts['2v2'] > 0;
-    let statusMessage = await fetchPanelMessageById(channel, panelMeta.statusMessageId);
-    let existingStatusMessages = [];
-
-    if (!statusMessage) {
-        const recentMessages = await fetchRecentMessages(channel, 100);
-        existingStatusMessages = findStatusMessages(recentMessages, client.user?.id);
-        statusMessage = existingStatusMessages[0] ?? null;
-        panelMeta.statusMessageId = statusMessage?.id ?? null;
-    }
-
-    if (hasAnySearches) {
-        const statusPayload = buildStatusMessagePayload(panelConfig, counts);
-
-        if (statusMessage) {
-            if (existingStatusMessages.length === 0) {
-                const recentMessages = await fetchRecentMessages(channel, 100);
-                existingStatusMessages = findStatusMessages(recentMessages, client.user?.id);
-            }
-            await statusMessage.edit(statusPayload).catch(err => {
-                console.warn(`[RatedQueue] Failed to edit status message in ${channel.id}: ${err.message}`);
-                logRatedWarn(client, panelConfig, 'panel.status.edit_failed', { channel: channel.id, error: err.message });
-            });
-            panelMeta.statusMessageId = statusMessage.id;
-            await deleteDuplicateStatusMessages(existingStatusMessages, statusMessage.id, panelConfig, channel, client);
-            return;
-        }
-
-        const createdStatusMessage = await channel.send(statusPayload);
-        panelMeta.statusMessageId = createdStatusMessage.id;
-        logRatedInfo(client, panelConfig, 'panel.status.created', {
-            channel: channel.id,
-            message: createdStatusMessage.id,
-            mode: 'fast_refresh'
-        });
-        return;
-    }
-
-    const deletedStatusMessageIds = new Set();
-    if (statusMessage && existingStatusMessages.length === 0) {
-        const recentMessages = await fetchRecentMessages(channel, 100);
-        existingStatusMessages = findStatusMessages(recentMessages, client.user?.id);
-    }
-    if (statusMessage) {
-        await statusMessage.delete().catch(err => {
-            console.warn(`[RatedQueue] Failed to delete status message in ${channel.id}: ${err.message}`);
-            logRatedWarn(client, panelConfig, 'panel.status.delete_failed', { channel: channel.id, error: err.message });
-        });
-        deletedStatusMessageIds.add(statusMessage.id);
-    }
-    await deleteDuplicateStatusMessages(existingStatusMessages, null, panelConfig, channel, client, deletedStatusMessageIds);
-    panelMeta.statusMessageId = null;
-}
-
-async function prunePanelChannelMessages(messages, panelMeta, skipMessageIds = new Set()) {
-    const keepMessageIds = new Set([
-        panelMeta.imageMessageId,
-        panelMeta.panelMessageId,
-        panelMeta.statusMessageId
-    ].filter(Boolean));
-
-    for (const message of messages) {
-        if (keepMessageIds.has(message.id) || skipMessageIds.has(message.id)) {
-            continue;
-        }
-
-        await message.delete().catch(() => {});
-    }
-}
-
 async function getCurrentQueueAvailability(client, context = {}) {
     if (typeof getSeasonQueueAvailability !== 'function') {
         return { canQueue: true, status: 'active', message: null };
@@ -2090,133 +1440,6 @@ function renderSeasonEndCancelMessage() {
     return quoteThreadLines(
         `${BL_X_EMOJI} Season ended. The match was cancelled because the season finalization grace period expired.`
     );
-}
-
-async function fetchRecentMessages(channel, limit) {
-    try {
-        if (typeof channel.messages?.fetch !== 'function') {
-            return [];
-        }
-        const collection = await channel.messages.fetch({ limit, cache: false });
-        return [...collection.values()];
-    } catch {
-        return [];
-    }
-}
-
-function findPanelMessage(messages, botUserId, channelId) {
-    const joinPrefix = `${CONFIG.PREFIX}:join:${channelId}:`;
-    return messages.find(message => {
-        if (message.author?.id !== botUserId) {
-            return false;
-        }
-
-        return (message.components ?? []).some(row =>
-            (row.components ?? []).some(component =>
-                (component.customId?.startsWith?.(joinPrefix) ?? false)
-                    || (component.data?.custom_id?.startsWith?.(joinPrefix) ?? false)
-            )
-        );
-    }) ?? null;
-}
-
-function componentIsDisabled(component) {
-    return component?.disabled === true || component?.data?.disabled === true;
-}
-
-function panelMessageNeedsRecreate(message) {
-    if (!message) {
-        return false;
-    }
-
-    if (typeof message.content === 'string' && message.content.trim().length > 0) {
-        return true;
-    }
-
-    return (message.components ?? []).some(row =>
-        (row.components ?? []).some(component => componentIsDisabled(component))
-    );
-}
-
-function findPanelImageMessage(messages, botUserId, panelConfig) {
-    const imagePath = getPanelImagePath(panelConfig);
-    const imageName = imagePath ? path.basename(imagePath) : null;
-    if (!imageName) {
-        return null;
-    }
-
-    return messages.find(message => {
-        if (message.author?.id !== botUserId) {
-            return false;
-        }
-
-        if (!message.attachments) {
-            return false;
-        }
-
-        if (typeof message.attachments.some === 'function') {
-            return message.attachments.some(attachment => attachment?.name === imageName);
-        }
-
-        return false;
-    }) ?? null;
-}
-
-function findStatusMessage(messages, botUserId) {
-    return messages.find(message =>
-        message.author?.id === botUserId
-            && typeof message.content === 'string'
-            && message.content.includes('Players in ')
-    ) ?? null;
-}
-
-function findStatusMessages(messages, botUserId) {
-    return messages.filter(message =>
-        message.author?.id === botUserId
-            && typeof message.content === 'string'
-            && message.content.includes('Players in ')
-    );
-}
-
-async function deleteDuplicateStatusMessages(statusMessages, keepMessageId, panelConfig, channel, client, skipMessageIds = new Set()) {
-    for (const message of statusMessages) {
-        if (message.id === keepMessageId || skipMessageIds.has(message.id)) {
-            continue;
-        }
-
-        await message.delete().catch(err => {
-            console.warn(`[RatedQueue] Failed to delete duplicate status message in ${channel.id}: ${err.message}`);
-            logRatedWarn(client, panelConfig, 'panel.status.duplicate_delete_failed', {
-                channel: channel.id,
-                message: message.id,
-                error: err.message
-            });
-        });
-    }
-}
-
-async function applyChannelLock(channel, gameType) {
-    try {
-        const botMemberId = channel.guild.members.me?.id ?? channel.client.user?.id;
-        if (botMemberId) {
-            await channel.permissionOverwrites.edit(botMemberId, {
-                ViewChannel: true,
-                SendMessages: true,
-                SendMessagesInThreads: true,
-                CreatePublicThreads: true,
-                ManageMessages: true,
-                ManageThreads: true,
-                ReadMessageHistory: true
-            }, { reason: `Allow the ${gameType} Competitive Rated queue to manage its panel.` });
-        }
-
-        await channel.permissionOverwrites.edit(channel.guild.roles.everyone, {
-            SendMessages: false
-        }, { reason: `Managed by the ${gameType} Competitive Rated queue.` });
-    } catch (error) {
-        console.error(`Failed to apply competitive panel channel lock: ${error.message}`);
-        logRatedError(channel.client, { gameType }, 'panel.lock_failed', error, { channel: channel.id });
-    }
 }
 
 function createSearchFromInteraction(interaction, panelConfig, mode, durationMinutes, options, ratingProfile) {
@@ -2854,20 +2077,26 @@ function scheduleSelectionTimeout(match, player, client) {
     );
 }
 
-async function sendThreadSetupSelectionPrompt(match, thread, player, options) {
+async function sendThreadSetupSelectionPrompt(match, thread, player, options, { withButtons = false } = {}) {
     const config = getSetupPromptConfig(player);
     if (!config || match?.stage !== 'awaiting_start' || match[config.selectedKey]) {
         return null;
     }
 
     const block = getOrCreateGameBlock(match);
-    const payload = buildThreadTextPayload(config.renderPrompt(match), 'line');
+    // When requested, the visible thread prompt carries the same rep-gated selection
+    // buttons as the private ephemeral. This guarantees the rep can always pick — even
+    // when the ephemeral could not be delivered — instead of relying on the auto-randomize
+    // fallback. handleSetupSelection already restricts these buttons to the correct rep.
+    const buttonRows = withButtons ? config.buildRows(match, options) : [];
+    const extra = buttonRows.length > 0 ? { components: buttonRows } : {};
+    const payload = buildThreadTextPayload(config.renderPrompt(match), 'line', extra);
     const message = await editOrSendRequiredThreadMessage(thread, block[config.promptIdKey], payload);
     block[config.promptIdKey] = message.id;
     return { message, config };
 }
 
-async function armVisibleSelectionPromptTimer(match, client, thread, player, message, options) {
+async function armVisibleSelectionPromptTimer(match, client, thread, player, message, options, { withButtons = false } = {}) {
     const config = getSetupPromptConfig(player);
     if (!config) {
         return false;
@@ -2884,8 +2113,11 @@ async function armVisibleSelectionPromptTimer(match, client, thread, player, mes
     }
 
     scheduleSelectionTimeout(match, player, client);
+    // Preserve the rep-gated buttons on the deadline-refresh edit when they were posted.
+    const refreshExtra = withButtons ? { components: config.buildRows(match, options) } : {};
     await message.edit?.(quoteThreadPayload({
-        content: config.renderPrompt(match)
+        content: config.renderPrompt(match),
+        ...refreshExtra
     })).catch(error => {
         logRatedWarn(client, match, 'setup.selection_control.deadline_refresh_failed', getMatchLogDetails(match, {
             player,
@@ -2902,6 +2134,7 @@ async function armVisibleSelectionPromptTimer(match, client, thread, player, mes
 }
 
 async function postVisibleSetupSelectionControls(match, client, players, details = {}) {
+    const withButtons = details.withButtons === true;
     const uniquePlayers = [...new Set(players)].filter(player => player === 'home' || player === 'away');
     if (!uniquePlayers.length || match?.stage !== 'awaiting_start') {
         return [];
@@ -2917,7 +2150,7 @@ async function postVisibleSetupSelectionControls(match, client, players, details
     const posted = [];
     for (const player of uniquePlayers) {
         try {
-            const result = await sendThreadSetupSelectionPrompt(match, thread, player, options);
+            const result = await sendThreadSetupSelectionPrompt(match, thread, player, options, { withButtons });
             if (result) {
                 posted.push({ player, ...result });
             }
@@ -2936,7 +2169,7 @@ async function postVisibleSetupSelectionControls(match, client, players, details
 
     ensureMatchTimeoutScheduled(match, 'start', client);
     for (const item of posted) {
-        await armVisibleSelectionPromptTimer(match, client, thread, item.player, item.message, options);
+        await armVisibleSelectionPromptTimer(match, client, thread, item.player, item.message, options, { withButtons });
     }
 
     return posted;
@@ -3015,557 +2248,6 @@ async function clearCurrentSetupComponents(match, thread) {
     block.homeSelectionPromptId = null;
     await deleteThreadMessage(thread, block.awaySelectionPromptId);
     block.awaySelectionPromptId = null;
-}
-
-function formatThreadActionError(error) {
-    return error?.message ?? String(error);
-}
-
-async function setThreadStateWithRetry(thread, methodName, value, reason, step, attempts = 2) {
-    if (typeof thread?.[methodName] !== 'function') {
-        return {
-            ok: false,
-            errors: [{ step, message: `${methodName} unavailable` }]
-        };
-    }
-
-    const errors = [];
-    for (let attempt = 1; attempt <= attempts; attempt += 1) {
-        try {
-            await thread[methodName](value, reason);
-            return { ok: true, errors };
-        } catch (error) {
-            errors.push({
-                step: `${step}_attempt_${attempt}`,
-                message: formatThreadActionError(error)
-            });
-        }
-    }
-
-    return { ok: false, errors };
-}
-
-async function closeMatchThread(thread, reason) {
-    if (!thread) {
-        return {
-            archivedOk: false,
-            lockedOk: false,
-            errors: [{ step: 'thread_missing', message: 'thread unavailable' }]
-        };
-    }
-
-    const lockResult = thread.locked === true
-        ? { ok: true, errors: [] }
-        : await setThreadStateWithRetry(
-            thread,
-            'setLocked',
-            true,
-            reason,
-            'lock'
-        );
-    const archiveResult = thread.archived === true
-        ? { ok: true, errors: [] }
-        : await setThreadStateWithRetry(
-            thread,
-            'setArchived',
-            true,
-            reason,
-            'archive'
-        );
-
-    return {
-        archivedOk: archiveResult.ok,
-        lockedOk: lockResult.ok,
-        errors: [...archiveResult.errors, ...lockResult.errors]
-    };
-}
-
-function isUnknownDiscordMessageError(error) {
-    return Number(error?.code) === 10008
-        || Number(error?.rawError?.code) === 10008
-        || String(error?.message ?? '').toLowerCase().includes('unknown message');
-}
-
-async function deleteParentThreadStarterMessage(matchSnapshot, thread, client, source) {
-    const parentChannelId = matchSnapshot.channelId
-        ?? matchSnapshot.panelChannelId
-        ?? thread?.parentId
-        ?? thread?.parent?.id
-        ?? null;
-    const threadId = matchSnapshot.threadId ?? thread?.id ?? null;
-    if (!parentChannelId || !threadId || typeof client?.channels?.fetch !== 'function') {
-        return { deleted: false, skipped: true };
-    }
-
-    const parentChannel = await client.channels.fetch(parentChannelId).catch(error => {
-        logRatedWarn(client, matchSnapshot, 'thread.parent_starter_fetch_channel_failed', getMatchLogDetails(matchSnapshot, {
-            source,
-            channel: parentChannelId,
-            error: formatThreadActionError(error)
-        }));
-        return null;
-    });
-    if (!parentChannel?.messages?.fetch) {
-        return { deleted: false, skipped: true };
-    }
-
-    let directFetchWasUnknown = false;
-    let starterMessage = await parentChannel.messages.fetch(threadId).catch(error => {
-        if (!isUnknownDiscordMessageError(error)) {
-            logRatedWarn(client, matchSnapshot, 'thread.parent_starter_fetch_failed', getMatchLogDetails(matchSnapshot, {
-                source,
-                channel: parentChannelId,
-                message: threadId,
-                error: formatThreadActionError(error)
-            }));
-        } else {
-            directFetchWasUnknown = true;
-        }
-        return null;
-    });
-    if (!starterMessage && directFetchWasUnknown) {
-        const recentMessages = await parentChannel.messages.fetch({ limit: 50 }).catch(error => {
-            logRatedWarn(client, matchSnapshot, 'thread.parent_starter_history_fetch_failed', getMatchLogDetails(matchSnapshot, {
-                source,
-                channel: parentChannelId,
-                message: threadId,
-                error: formatThreadActionError(error)
-            }));
-            return null;
-        });
-        const candidates = recentMessages?.values
-            ? Array.from(recentMessages.values())
-            : Array.isArray(recentMessages)
-            ? recentMessages
-            : [];
-        starterMessage = candidates.find(message =>
-            String(message?.id ?? '') === String(threadId)
-            || String(message?.thread?.id ?? '') === String(threadId)
-        ) ?? null;
-    }
-    if (!starterMessage) {
-        return { deleted: false, missing: true };
-    }
-
-    try {
-        await starterMessage.delete();
-        logRatedInfo(client, matchSnapshot, 'thread.parent_starter_deleted', getMatchLogDetails(matchSnapshot, {
-            source,
-            channel: parentChannelId,
-            message: threadId
-        }));
-        return { deleted: true };
-    } catch (error) {
-        if (!isUnknownDiscordMessageError(error)) {
-            logRatedWarn(client, matchSnapshot, 'thread.parent_starter_delete_failed', getMatchLogDetails(matchSnapshot, {
-                source,
-                channel: parentChannelId,
-                message: threadId,
-                error: formatThreadActionError(error)
-            }));
-            return { deleted: false, error };
-        }
-        return { deleted: false, missing: true };
-    }
-}
-
-async function trySetThreadTerminalName(thread, terminalName) {
-    if (!thread?.setName) {
-        return { ok: false, error: new Error('setName unavailable') };
-    }
-
-    try {
-        await thread.setName(terminalName);
-        return { ok: true };
-    } catch (error) {
-        return { ok: false, error };
-    }
-}
-
-async function reopenThreadForTerminalRename(thread, reason) {
-    if (!thread) {
-        return {
-            opened: false,
-            errors: [{ step: 'rename_reopen_thread_missing', message: 'thread unavailable' }]
-        };
-    }
-
-    const unarchiveResult = await setThreadStateWithRetry(
-        thread,
-        'setArchived',
-        false,
-        `${reason} (rename reopen unarchive)`,
-        'rename_reopen_unarchive'
-    );
-    const unlockResult = await setThreadStateWithRetry(
-        thread,
-        'setLocked',
-        false,
-        `${reason} (rename reopen unlock)`,
-        'rename_reopen_unlock'
-    );
-
-    return {
-        opened: unarchiveResult.ok || unlockResult.ok,
-        errors: [...unarchiveResult.errors, ...unlockResult.errors]
-    };
-}
-
-async function setTerminalThreadNameReliably(thread, match, prefix, client, reason) {
-    const terminalName = buildTerminalThreadName(match, prefix);
-    const errors = [];
-    if (!thread) {
-        return {
-            terminalName,
-            renamed: false,
-            errors: [{ step: 'rename_thread_missing', message: 'thread unavailable' }]
-        };
-    }
-
-    const initialRename = await trySetThreadTerminalName(thread, terminalName);
-    if (initialRename.ok) {
-        return { terminalName, renamed: true, errors };
-    }
-    errors.push({
-        step: 'rename_initial',
-        message: formatThreadActionError(initialRename.error)
-    });
-
-    const fetchedThread = thread?.id && client?.channels?.fetch
-        ? await client.channels.fetch(thread.id).catch(error => {
-            errors.push({
-                step: 'rename_refetch',
-                message: formatThreadActionError(error)
-            });
-            return null;
-        })
-        : null;
-    if (fetchedThread) {
-        const fetchedRename = await trySetThreadTerminalName(fetchedThread, terminalName);
-        if (fetchedRename.ok) {
-            return { terminalName, renamed: true, errors };
-        }
-        errors.push({
-            step: 'rename_refetch_attempt',
-            message: formatThreadActionError(fetchedRename.error)
-        });
-    }
-
-    const fallbackThread = fetchedThread ?? thread;
-    if (fallbackThread?.setArchived && fallbackThread?.setLocked) {
-        const reopenResult = await reopenThreadForTerminalRename(fallbackThread, reason);
-        errors.push(...reopenResult.errors);
-        if (reopenResult.opened) {
-            const fallbackRename = await trySetThreadTerminalName(fallbackThread, terminalName);
-            if (fallbackRename.ok) {
-                const restoreArchive = await setThreadStateWithRetry(
-                    fallbackThread,
-                    'setArchived',
-                    true,
-                    `${reason} (rename fallback restore archive)`,
-                    'rename_restore_archive'
-                );
-                const restoreLock = await setThreadStateWithRetry(
-                    fallbackThread,
-                    'setLocked',
-                    true,
-                    `${reason} (rename fallback restore lock)`,
-                    'rename_restore_lock'
-                );
-                errors.push(...restoreArchive.errors, ...restoreLock.errors);
-                return { terminalName, renamed: true, errors };
-            }
-            errors.push({
-                step: 'rename_fallback_attempt',
-                message: formatThreadActionError(fallbackRename.error)
-            });
-        }
-    }
-
-    logRatedWarn(client, match, 'thread.rename_failed', getMatchLogDetails(match, {
-        thread: thread.id,
-        targetName: terminalName,
-        errors: errors.map(error => `${error.step}:${error.message}`).join(';')
-    }));
-    return { terminalName, renamed: false, errors };
-}
-
-function buildCompletedThreadFinalizationSnapshot(match) {
-    return {
-        id: match.id,
-        ratedMatchId: match.ratedMatchId ?? null,
-        channelId: match.channelId,
-        threadId: match.threadId,
-        threadName: match.threadName,
-        gameType: match.gameType,
-        mode: match.mode,
-        score: match.score ? { ...match.score } : null,
-        stage: 'complete',
-        finalizeAfterAt: Date.now() + COMPLETED_THREAD_CLOSE_DELAY_MS
-    };
-}
-
-function getDateMs(value) {
-    const ms = value instanceof Date ? value.getTime() : new Date(value).getTime();
-    return Number.isFinite(ms) ? ms : Date.now();
-}
-
-function buildCompletedThreadFinalizationSnapshotFromDb(row) {
-    const completedAtMs = getDateMs(row.CompletedAtUtc);
-    return {
-        id: row.MatchCode,
-        ratedMatchId: row.Id,
-        channelId: row.PanelChannelId ? String(row.PanelChannelId) : null,
-        threadId: row.ThreadId,
-        threadName: null,
-        gameType: row.GameType,
-        mode: row.ModeCode,
-        matchNumber: row.MatchNumber,
-        seasonMatchNumber: row.SeasonMatchNumber,
-        score: {
-            team1: Number(row.Team1Score ?? 0),
-            team2: Number(row.Team2Score ?? 0)
-        },
-        stage: 'complete',
-        completedAtMs,
-        finalizeAfterAt: completedAtMs + COMPLETED_THREAD_CLOSE_DELAY_MS
-    };
-}
-
-function buildCancelledThreadSnapshotFromDb(row) {
-    return {
-        id: row.MatchCode,
-        ratedMatchId: row.Id,
-        channelId: row.PanelChannelId ? String(row.PanelChannelId) : null,
-        threadId: row.ThreadId,
-        threadName: null,
-        gameType: row.GameType,
-        mode: row.ModeCode,
-        matchNumber: row.MatchNumber,
-        seasonMatchNumber: row.SeasonMatchNumber,
-        score: null,
-        stage: 'cancelled'
-    };
-}
-
-function clearCompletedThreadFinalization(matchId) {
-    clearCompletedThreadCloseTimer(matchId);
-    state.pendingCompletedThreadFinalizationsByMatchId.delete(matchId);
-}
-
-function getThreadFinalizationErrorSummary(result) {
-    const closeErrors = result?.closeStatus?.errors ?? [];
-    const renameErrors = result?.renameStatus?.errors ?? [];
-    return [...closeErrors, ...renameErrors]
-        .map(error => `${error.step}:${error.message}`)
-        .join('; ') || 'Thread finalization failed';
-}
-
-async function finalizeThreadLifecycle(matchSnapshot, client, {
-    prefix,
-    closeReason,
-    renameReason,
-    result,
-    source = 'direct'
-}) {
-    const lockKey = `thread-finalize:${matchSnapshot.threadId}`;
-    return await withOperationQueue(lockKey, async () => {
-        const thread = await client.channels.fetch(matchSnapshot.threadId).catch(error => {
-            logRatedWarn(client, matchSnapshot, 'thread.finalize_fetch_failed', getMatchLogDetails(matchSnapshot, {
-                result,
-                source,
-                error: formatThreadActionError(error)
-            }));
-            return null;
-        });
-
-        const matchForThread = {
-            ...matchSnapshot,
-            threadName: matchSnapshot.threadName ?? thread?.name ?? 'Match'
-        };
-        const expectedTerminalName = buildTerminalThreadName(matchForThread, prefix);
-        const alreadyFinalized = Boolean(
-            thread
-                && thread.archived === true
-                && thread.locked === true
-                && thread.name === expectedTerminalName
-        );
-        const renameStatus = alreadyFinalized || thread?.name === expectedTerminalName
-            ? { terminalName: expectedTerminalName, renamed: true, errors: [] }
-            : await setTerminalThreadNameReliably(
-                thread,
-                matchForThread,
-                prefix,
-                client,
-                renameReason
-            );
-        const closeStatus = alreadyFinalized
-            ? { archivedOk: true, lockedOk: true, errors: [] }
-            : await closeMatchThread(thread, closeReason);
-        const success = closeStatus.archivedOk && closeStatus.lockedOk && renameStatus.renamed;
-
-        if (success) {
-            await deleteParentThreadStarterMessage(matchSnapshot, thread, client, source);
-            logRatedInfo(client, matchSnapshot, 'thread.closed', getMatchLogDetails(matchSnapshot, {
-                result,
-                source
-            }));
-        } else {
-            logRatedWarn(client, matchSnapshot, 'thread.finalize_failed', getMatchLogDetails(matchSnapshot, {
-                result,
-                source,
-                archivedOk: closeStatus.archivedOk,
-                lockedOk: closeStatus.lockedOk,
-                renamed: renameStatus.renamed,
-                closeErrors: closeStatus.errors.map(error => `${error.step}:${error.message}`).join(';'),
-                renameErrors: renameStatus.errors.map(error => `${error.step}:${error.message}`).join(';')
-            }));
-        }
-
-        return { success, closeStatus, renameStatus };
-    });
-}
-
-async function finalizeCompletedThreadIfDue(matchId, client, source = 'timer') {
-    const pending = state.pendingCompletedThreadFinalizationsByMatchId.get(matchId);
-    if (!pending) {
-        return false;
-    }
-    if (Date.now() < pending.finalizeAfterAt) {
-        return false;
-    }
-
-    const result = await finalizeThreadLifecycle(pending, client, {
-        prefix: COMPLETED_THREAD_PREFIX,
-        closeReason: `${pending.gameType} competitive completed match close delay`,
-        renameReason: `${pending.gameType} competitive completed match rename`,
-        result: 'completed',
-        source
-    });
-    if (result.success) {
-        try {
-            await ratedMatchDao.markThreadFinalizationSucceeded({ ratedMatchId: pending.ratedMatchId });
-            markReportableMatchThreadFinalized(matchId);
-            clearPendingRematch(matchId);
-            clearCompletedThreadFinalization(matchId);
-        } catch (error) {
-            logRatedError(client, pending, 'rated_match.thread_finalize_mark_success_failed', error, getMatchLogDetails(pending));
-            return false;
-        }
-    } else {
-        const errorSummary = getThreadFinalizationErrorSummary(result);
-        await ratedMatchDao.markThreadFinalizationFailed({
-            ratedMatchId: pending.ratedMatchId,
-            error: errorSummary
-        }).catch(error => {
-            logRatedError(client, pending, 'rated_match.thread_finalize_mark_failed_failed', error, getMatchLogDetails(pending, {
-                finalizeError: errorSummary
-            }));
-        });
-    }
-    return result.success;
-}
-
-function scheduleCompletedThreadFinalization(pendingFinalization, client, source = 'completion') {
-    clearCompletedThreadFinalization(pendingFinalization.id);
-    state.pendingCompletedThreadFinalizationsByMatchId.set(pendingFinalization.id, pendingFinalization);
-    const delayMs = Math.max(pendingFinalization.finalizeAfterAt - Date.now(), 0);
-    logRatedInfo(client, pendingFinalization, 'thread.close_scheduled', getMatchLogDetails(pendingFinalization, {
-        delayMs,
-        source
-    }));
-
-    const timer = setTimeout(async () => {
-        try {
-            await finalizeCompletedThreadIfDue(pendingFinalization.id, client, 'timer');
-        } finally {
-            state.completedThreadCloseTimersByMatchId.delete(pendingFinalization.id);
-        }
-    }, delayMs);
-
-    if (typeof timer.unref === 'function') {
-        timer.unref();
-    }
-
-    state.completedThreadCloseTimersByMatchId.set(pendingFinalization.id, timer);
-}
-
-function scheduleCompletedThreadClose(match, client) {
-    scheduleCompletedThreadFinalization(
-        buildCompletedThreadFinalizationSnapshot(match),
-        client,
-        'completion'
-    );
-}
-
-function markReportableMatchThreadFinalized(matchId) {
-    const snapshot = state.reportableMatchesById.get(matchId);
-    if (snapshot) {
-        snapshot.threadFinalizedAt = new Date().toISOString();
-    }
-}
-
-function getSnapshotCompletedAtMs(snapshot) {
-    if (Number.isFinite(snapshot?.completedAtMs)) {
-        return Number(snapshot.completedAtMs);
-    }
-    const ms = new Date(snapshot?.completedAtUtc ?? snapshot?.completedAt ?? Date.now()).getTime();
-    return Number.isFinite(ms) ? ms : Date.now();
-}
-
-function getCompletedThreadOriginalFinalizeAt(snapshot) {
-    return getSnapshotCompletedAtMs(snapshot) + COMPLETED_THREAD_CLOSE_DELAY_MS;
-}
-
-function isRematchWindowOpen(snapshot) {
-    if (!snapshot?.threadId || snapshot.threadFinalizedAt) {
-        return false;
-    }
-    return Date.now() <= getCompletedThreadOriginalFinalizeAt(snapshot);
-}
-
-function buildCompletedThreadFinalizationSnapshotFromReportable(snapshot, finalizeAfterAt = Date.now()) {
-    return {
-        id: snapshot.id,
-        ratedMatchId: snapshot.ratedMatchId ?? null,
-        channelId: snapshot.channelId ?? null,
-        threadId: snapshot.threadId,
-        threadName: snapshot.threadName,
-        gameType: snapshot.gameType,
-        mode: snapshot.mode,
-        score: snapshot.score ? { ...snapshot.score } : null,
-        stage: 'complete',
-        finalizeAfterAt
-    };
-}
-
-function setCompletedThreadFinalizationDeadline(snapshot, finalizeAfterAt) {
-    const existing = state.pendingCompletedThreadFinalizationsByMatchId.get(snapshot.id)
-        ?? buildCompletedThreadFinalizationSnapshotFromReportable(snapshot, finalizeAfterAt);
-    existing.finalizeAfterAt = finalizeAfterAt;
-    state.pendingCompletedThreadFinalizationsByMatchId.set(snapshot.id, existing);
-    clearCompletedThreadCloseTimer(snapshot.id);
-    return existing;
-}
-
-function restoreCompletedThreadFinalization(snapshot, client, source = 'rematch_restore') {
-    scheduleCompletedThreadFinalization(
-        buildCompletedThreadFinalizationSnapshotFromReportable(
-            snapshot,
-            Math.max(Date.now(), getCompletedThreadOriginalFinalizeAt(snapshot))
-        ),
-        client,
-        source
-    );
-}
-
-async function finalizeCompletedThreadFromSnapshot(snapshot, client, source = 'rematch') {
-    const pending = setCompletedThreadFinalizationDeadline(snapshot, Date.now());
-    const result = await finalizeCompletedThreadIfDue(pending.id, client, source);
-    if (result) {
-        markReportableMatchThreadFinalized(pending.id);
-    }
-    return result;
 }
 
 function getSnapshotParticipants(snapshot) {
@@ -3871,30 +2553,6 @@ async function cancelMatchIfTimedOut(matchId, phase, client) {
     });
 }
 
-async function finalizeOverdueCompletedThreads(client, now = Date.now()) {
-    const pendingFinalizations = [...state.pendingCompletedThreadFinalizationsByMatchId.values()]
-        .filter(pending => now >= pending.finalizeAfterAt);
-    for (const pending of pendingFinalizations) {
-        await finalizeCompletedThreadIfDue(pending.id, client, 'tick_overdue');
-    }
-}
-
-async function recoverCompletedThreadFinalizations(client, now = Date.now()) {
-    const rows = await ratedMatchDao.getPendingCompletedThreadFinalizations();
-    for (const row of rows) {
-        const pending = buildCompletedThreadFinalizationSnapshotFromDb(row);
-        const existing = state.pendingCompletedThreadFinalizationsByMatchId.get(pending.id);
-        const hasTimer = state.completedThreadCloseTimersByMatchId.has(pending.id);
-        if (now >= pending.finalizeAfterAt) {
-            clearCompletedThreadCloseTimer(pending.id);
-            state.pendingCompletedThreadFinalizationsByMatchId.set(pending.id, pending);
-            await finalizeCompletedThreadIfDue(pending.id, client, 'db_recovery_due');
-        } else if (!existing || !hasTimer) {
-            scheduleCompletedThreadFinalization(pending, client, 'db_recovery_pending');
-        }
-    }
-}
-
 async function postInitialGameSetup(match, client) {
     // Guard against concurrent runs: match creation posts the initial setup
     // directly while the periodic reconcile watchdog can also fire before the
@@ -4114,11 +2772,6 @@ async function updateMatchControlMessage(match, client, thread = null) {
     }
 }
 
-function hasPendingMatchOutput(match) {
-    const meta = state.outputQueueMetaByMatchId.get(String(match?.id));
-    return Boolean(meta?.pending);
-}
-
 function needsAwaitingWinnerSetupOutputRecovery(match) {
     if (
         match?.stage !== 'awaiting_winner'
@@ -4245,9 +2898,12 @@ async function reconcileActiveMatchControl(match, client) {
     }
 
     await queueControlWatchdogRecovery(match, client, 'watchdog_restore_setup_selection_controls', async () => {
+        // Recovery has no live ephemeral interaction to reuse, so always post the
+        // rep-gated buttons in the thread to guarantee the rep can still pick.
         await postVisibleSetupSelectionControls(match, client, missingPlayers, {
             source: 'watchdog',
-            players: missingPlayers.join(',')
+            players: missingPlayers.join(','),
+            withButtons: true
         });
     }, {
         phase: 'selection',
@@ -4848,6 +3504,9 @@ async function handleLoserAdvantage(interaction, match, choice) {
 
     const loserSelectionPlayer = choice === 'home' ? 'home' : 'away';
     const winnerSelectionPlayer = choice === 'home' ? 'away' : 'home';
+    // If either private setup prompt could not be delivered, fall back to posting the
+    // rep-gated selection buttons in the visible thread so both players can still pick.
+    const privateSetupComplete = Boolean(loserPrompt && winnerPrompt);
 
     match.loserTeamIndex = null;
     match.loserRepMention = null;
@@ -4865,7 +3524,8 @@ async function handleLoserAdvantage(interaction, match, choice) {
             {
                 source: 'advantage_choice',
                 choice,
-                game: confirmedGameNumber
+                game: confirmedGameNumber,
+                withButtons: !privateSetupComplete
             }
         );
     }, {
@@ -5145,7 +3805,8 @@ async function showPrivateStartSetupControls(interaction, match, config) {
             source: 'start_click',
             player: config.player,
             user: interaction.user.id,
-            game: getNextGameNumber(match)
+            game: getNextGameNumber(match),
+            withButtons: true
         });
     }, {
         source: 'start_click',
@@ -6047,29 +4708,12 @@ async function handleInteraction(interaction) {
     return false;
 }
 
-async function enforcePanelMessagePolicy(message) {
-    if (!message?.guild || message.author?.bot || !isManagedPanelChannel(message.channel?.id)) {
-        return false;
-    }
-
-    if (hasBypassRole(message?.member)) {
-        return false;
-    }
-
-    await message.delete().catch(() => {});
-    return true;
-}
-
 function __resetState() {
     if (state.reconcileTimer) {
         clearInterval(state.reconcileTimer);
         state.reconcileTimer = null;
     }
-    if (runtimeStatePersistTimer) {
-        clearTimeout(runtimeStatePersistTimer);
-        runtimeStatePersistTimer = null;
-    }
-    runtimeStatePersistPromise = Promise.resolve();
+    resetRuntimePersist();
     runtimeStateRecovered = false;
 
     for (const search of state.activeSearchesById.values()) {
