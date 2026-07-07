@@ -55,11 +55,13 @@ const {
     extendSearchCustomId,
     loserAdvantageCustomId,
     loserConfirmCustomId,
+    openPrivatePickCustomId,
     parseActionTokenFromCustomId,
     parseChannelIdFromCustomId,
     parseIdFromCustomId,
     parseLoserChoiceFromCustomId,
     parseModeFromCustomId,
+    parseOpenPickPlayerFromCustomId,
     parseOptionValueFromCustomId,
     reportIssueCustomId,
     rematchCustomId,
@@ -582,14 +584,39 @@ function renderAwaySelectionPrompt(match) {
     );
 }
 
+// Neutral in-thread prompt used only as the private re-request when the ephemeral could not
+// be delivered. It reveals only whose turn it is and the category — never the options.
+function renderHomeOpenPickPrompt(match) {
+    const homeTeam = match.teams[match.homeTeamIndex - 1];
+    return renderTimedMessage(
+        `${describeTeam(homeTeam)} — it's your turn to pick the **STADIUM**. Click **Choose Stadium** to open your private selection.`,
+        match.homeSelectionDeadlineAt,
+        `**${SELECTION_TIMEOUT_MINUTES} mins**`
+    );
+}
+
+function renderAwayOpenPickPrompt(match) {
+    const awayTeam = match.teams[match.awayTeamIndex - 1];
+    return renderTimedMessage(
+        `${describeTeam(awayTeam)} — it's your turn to pick the **CAPTAIN**. Click **Choose Captain** to open your private selection.`,
+        match.awaySelectionDeadlineAt,
+        `**${SELECTION_TIMEOUT_MINUTES} mins**`
+    );
+}
+
 function getSetupPromptConfig(player) {
     if (player === 'home') {
         return {
             player,
             selectedKey: 'selectedStadium',
-            promptIdKey: 'homeSelectionPromptId',
+            openButtonIdKey: 'homeOpenButtonMessageId',
+            deliveredKey: 'homeSelectionDelivered',
+            timerKey: 'homeSelectionTimer',
+            deadlineKey: 'homeSelectionDeadlineAt',
             buildRows: buildStadiumButtonRows,
-            renderPrompt: renderHomeSelectionPrompt
+            renderPrompt: renderHomeSelectionPrompt,
+            renderOpenPrompt: renderHomeOpenPickPrompt,
+            openButtonLabel: 'Choose Stadium'
         };
     }
 
@@ -597,9 +624,14 @@ function getSetupPromptConfig(player) {
         return {
             player,
             selectedKey: 'selectedCaptain',
-            promptIdKey: 'awaySelectionPromptId',
+            openButtonIdKey: 'awayOpenButtonMessageId',
+            deliveredKey: 'awaySelectionDelivered',
+            timerKey: 'awaySelectionTimer',
+            deadlineKey: 'awaySelectionDeadlineAt',
             buildRows: buildCaptainButtonRows,
-            renderPrompt: renderAwaySelectionPrompt
+            renderPrompt: renderAwaySelectionPrompt,
+            renderOpenPrompt: renderAwayOpenPickPrompt,
+            openButtonLabel: 'Choose Captain'
         };
     }
 
@@ -767,8 +799,16 @@ function createGameBlock(gameNumber) {
         gameNumber,
         gameImageMessageId: null,
         startMessageId: null,
-        homeSelectionPromptId: null,
-        awaySelectionPromptId: null,
+        // Neutral "it's your turn — click to open your private pick" buttons. These are the
+        // ONLY in-thread selection artifact and are posted solely when the private ephemeral
+        // could not be delivered. They never reveal the stadium/captain options.
+        homeOpenButtonMessageId: null,
+        awayOpenButtonMessageId: null,
+        // Whether the private ephemeral selection prompt is currently live for each side.
+        // true → rely on the ephemeral (no neutral button needed). false → owed (delivery
+        // failed or post-restart) → the neutral open button is the private re-request.
+        homeSelectionDelivered: false,
+        awaySelectionDelivered: false,
         selectionsMessageId: null,
         delayedResult: null,
         delayedResultMessageId: null
@@ -2033,18 +2073,6 @@ function clearSelectionTimers(match) {
     }
 }
 
-function clearSelectionTimer(match, player) {
-    const timerKey = player === 'home' ? 'homeSelectionTimer' : 'awaySelectionTimer';
-    const deadlineKey = player === 'home' ? 'homeSelectionDeadlineAt' : 'awaySelectionDeadlineAt';
-    if (match?.[timerKey]) {
-        clearTimeout(match[timerKey]);
-    }
-    if (match) {
-        match[timerKey] = null;
-        match[deadlineKey] = null;
-    }
-}
-
 function scheduleSelectionTimeout(match, player, client) {
     const delayMs = SELECTION_TIMEOUT_MINUTES * 60000;
     const timerKey = player === 'home' ? 'homeSelectionTimer' : 'awaySelectionTimer';
@@ -2063,101 +2091,93 @@ function scheduleSelectionTimeout(match, player, client) {
     );
 }
 
-async function sendThreadSetupSelectionPrompt(match, thread, player, options, { withButtons = false } = {}) {
+// Arms the auto-randomize selection deadline for a pending pick WITHOUT any thread message.
+// Pure state mutation (no thread I/O) so handlers and the watchdog can call it directly — the
+// selection deadline no longer depends on a visible message existing.
+function armSelectionTimeout(match, player, client) {
+    const config = getSetupPromptConfig(player);
+    if (!config || match?.stage !== 'awaiting_start' || match[config.selectedKey]) {
+        return false;
+    }
+    // The match-level 'start' phase timeout must be (re)scheduled FIRST: scheduleMatchTimeout()
+    // clears the selection timers, so arming the selection timer before it would be wiped.
+    ensureMatchTimeoutScheduled(match, 'start', client);
+    // Idempotent: keep a still-valid selection deadline rather than resetting it, so repeated
+    // calls (re-open, watchdog) can't push the auto-randomize deadline forever forward.
+    if (match[config.timerKey] && Number.isFinite(match[config.deadlineKey]) && match[config.deadlineKey] > Date.now()) {
+        return false;
+    }
+    scheduleSelectionTimeout(match, player, client);
+    return true;
+}
+
+function buildOpenPickButtonRow(match, player) {
+    const config = getSetupPromptConfig(player);
+    if (!config) {
+        return [];
+    }
+    return [
+        new ActionRowBuilder().addComponents(
+            new ButtonBuilder()
+                .setCustomId(openPrivatePickCustomId(match.id, player, getMatchActionToken(match, getNextGameNumber(match))))
+                .setLabel(config.openButtonLabel)
+                .setStyle(ButtonStyle.Primary)
+        )
+    ];
+}
+
+// Posts the neutral rep-gated "it's your turn — click to open your private pick" button for a
+// single side, idempotently (edits the stored message instead of sending a duplicate). It never
+// reveals the stadium/captain options. Used only when the private ephemeral could not be
+// delivered (e.g. a winner rep with a stale interaction token) or during watchdog recovery.
+async function postNeutralOpenButton(match, client, player, details = {}) {
     const config = getSetupPromptConfig(player);
     if (!config || match?.stage !== 'awaiting_start' || match[config.selectedKey]) {
         return null;
     }
 
-    const block = getOrCreateGameBlock(match);
-    // When requested, the visible thread prompt carries the same rep-gated selection
-    // buttons as the private ephemeral. This guarantees the rep can always pick — even
-    // when the ephemeral could not be delivered — instead of relying on the auto-randomize
-    // fallback. handleSetupSelection already restricts these buttons to the correct rep.
-    const buttonRows = withButtons ? config.buildRows(match, options) : [];
-    const extra = buttonRows.length > 0 ? { components: buttonRows } : {};
-    const payload = buildThreadTextPayload(config.renderPrompt(match), 'line', extra);
-    const message = await editOrSendRequiredThreadMessage(thread, block[config.promptIdKey], payload);
-    block[config.promptIdKey] = message.id;
-    return { message, config };
-}
-
-async function armVisibleSelectionPromptTimer(match, client, thread, player, message, options, { withButtons = false } = {}) {
-    const config = getSetupPromptConfig(player);
-    if (!config) {
-        return false;
-    }
-
-    if (match?.stage !== 'awaiting_start' || match[config.selectedKey]) {
-        clearSelectionTimer(match, player);
-        const block = getOrCreateGameBlock(match);
-        if (block[config.promptIdKey] === message?.id) {
-            await deleteThreadMessage(thread, message.id);
-            block[config.promptIdKey] = null;
-        }
-        return false;
-    }
-
-    scheduleSelectionTimeout(match, player, client);
-    // Preserve the rep-gated buttons on the deadline-refresh edit when they were posted.
-    const refreshExtra = withButtons ? { components: config.buildRows(match, options) } : {};
-    await message.edit?.(quoteThreadPayload({
-        content: config.renderPrompt(match),
-        ...refreshExtra
-    })).catch(error => {
-        logRatedWarn(client, match, 'setup.selection_control.deadline_refresh_failed', getMatchLogDetails(match, {
-            player,
-            message: message.id,
-            error: error.message
-        }));
-    });
-
-    logRatedInfo(client, match, 'setup.selection_control.posted', getMatchLogDetails(match, {
-        player,
-        message: message.id
-    }));
-    return true;
-}
-
-async function postVisibleSetupSelectionControls(match, client, players, details = {}) {
-    const withButtons = details.withButtons === true;
-    const uniquePlayers = [...new Set(players)].filter(player => player === 'home' || player === 'away');
-    if (!uniquePlayers.length || match?.stage !== 'awaiting_start') {
-        return [];
-    }
-
     const thread = await client.channels.fetch(match.threadId).catch(() => null);
     if (!thread?.send) {
-        logRatedWarn(client, match, 'setup.selection_control.thread_missing', getMatchLogDetails(match, details));
-        return [];
+        logRatedWarn(client, match, 'setup.open_button.thread_missing', getMatchLogDetails(match, { player, ...details }));
+        return null;
     }
 
-    const options = await getOptionsForGameType(match.gameType);
+    // Keep the auto-randomize deadline running so the neutral prompt's countdown is accurate
+    // and the pick can never stall forever waiting on a click.
+    armSelectionTimeout(match, player, client);
+
+    const block = getOrCreateGameBlock(match);
+    const payload = buildThreadTextPayload(config.renderOpenPrompt(match), 'line', {
+        components: buildOpenPickButtonRow(match, player)
+    });
+    try {
+        const message = await editOrSendRequiredThreadMessage(thread, block[config.openButtonIdKey], payload);
+        block[config.openButtonIdKey] = message.id;
+        block[config.deliveredKey] = false;
+        logRatedInfo(client, match, 'setup.open_button.posted', getMatchLogDetails(match, {
+            player,
+            message: message.id,
+            ...details
+        }));
+        return message;
+    } catch (error) {
+        logRatedError(client, match, 'setup.open_button.post_failed', error, getMatchLogDetails(match, {
+            player,
+            ...details
+        }));
+        return null;
+    }
+}
+
+async function postNeutralOpenButtons(match, client, players, details = {}) {
+    const uniquePlayers = [...new Set(players)].filter(player => player === 'home' || player === 'away');
     const posted = [];
     for (const player of uniquePlayers) {
-        try {
-            const result = await sendThreadSetupSelectionPrompt(match, thread, player, options, { withButtons });
-            if (result) {
-                posted.push({ player, ...result });
-            }
-        } catch (error) {
-            clearSelectionTimer(match, player);
-            logRatedError(client, match, 'setup.selection_control.post_failed', error, getMatchLogDetails(match, {
-                player,
-                ...details
-            }));
+        const message = await postNeutralOpenButton(match, client, player, details);
+        if (message) {
+            posted.push({ player, message });
         }
     }
-
-    if (!posted.length || match.stage !== 'awaiting_start') {
-        return posted;
-    }
-
-    ensureMatchTimeoutScheduled(match, 'start', client);
-    for (const item of posted) {
-        await armVisibleSelectionPromptTimer(match, client, thread, item.player, item.message, options, { withButtons });
-    }
-
     return posted;
 }
 
@@ -2189,8 +2209,9 @@ async function autoRandomizeSelection(matchId, player, client, expectedActionTok
             match.selectedStadium = options.stadiums[Math.floor(Math.random() * options.stadiums.length)];
             match.homeSelectionTimer = null;
             match.homeSelectionDeadlineAt = null;
-            await deleteThreadMessage(thread, block.homeSelectionPromptId);
-            block.homeSelectionPromptId = null;
+            await deleteThreadMessage(thread, block.homeOpenButtonMessageId);
+            block.homeOpenButtonMessageId = null;
+            block.homeSelectionDelivered = false;
             logRatedWarn(client, match, 'setup.selection.auto_randomized', getMatchLogDetails(match, {
                 kind: 'stadium',
                 value: match.selectedStadium?.description
@@ -2199,8 +2220,9 @@ async function autoRandomizeSelection(matchId, player, client, expectedActionTok
             match.selectedCaptain = options.captains[Math.floor(Math.random() * options.captains.length)];
             match.awaySelectionTimer = null;
             match.awaySelectionDeadlineAt = null;
-            await deleteThreadMessage(thread, block.awaySelectionPromptId);
-            block.awaySelectionPromptId = null;
+            await deleteThreadMessage(thread, block.awayOpenButtonMessageId);
+            block.awayOpenButtonMessageId = null;
+            block.awaySelectionDelivered = false;
             logRatedWarn(client, match, 'setup.selection.auto_randomized', getMatchLogDetails(match, {
                 kind: 'captain',
                 value: match.selectedCaptain?.description
@@ -2230,10 +2252,12 @@ async function clearCurrentSetupComponents(match, thread) {
 
     await deleteThreadMessage(thread, block.startMessageId);
     block.startMessageId = null;
-    await deleteThreadMessage(thread, block.homeSelectionPromptId);
-    block.homeSelectionPromptId = null;
-    await deleteThreadMessage(thread, block.awaySelectionPromptId);
-    block.awaySelectionPromptId = null;
+    await deleteThreadMessage(thread, block.homeOpenButtonMessageId);
+    block.homeOpenButtonMessageId = null;
+    block.homeSelectionDelivered = false;
+    await deleteThreadMessage(thread, block.awayOpenButtonMessageId);
+    block.awayOpenButtonMessageId = null;
+    block.awaySelectionDelivered = false;
 }
 
 function getSnapshotParticipants(snapshot) {
@@ -2859,30 +2883,66 @@ async function reconcileActiveMatchControl(match, client) {
         return;
     }
 
-    const missingPlayers = [];
-    const homeSelectionExists = await threadMessageExists(thread, block.homeSelectionPromptId);
-    const awaySelectionExists = await threadMessageExists(thread, block.awaySelectionPromptId);
-    if (!match.selectedStadium && (!homeSelectionExists || !match.homeSelectionTimer)) {
-        missingPlayers.push('home');
+    // Turn-aware recovery. A player is only "engaged" (owed a pick) once it is actually their
+    // turn: always in games 2+, but in game 1 only after that rep has clicked the Start gate.
+    const gameNumber = getNextGameNumber(match);
+    const homeRepId = match.teams[match.homeTeamIndex - 1]?.repUserId;
+    const awayRepId = match.teams[match.awayTeamIndex - 1]?.repUserId;
+    const startClicked = match.startClickedUserIds ?? [];
+    const isEngaged = repId => gameNumber >= 2 || startClicked.includes(repId);
+    const repIdFor = player => (player === 'home' ? homeRepId : awayRepId);
+
+    // Game 1: a rep who has not clicked Start is not yet owed a pick — the correct recovery for
+    // them is the shared Start control (idempotent), never a selection/open-pick prompt.
+    if (gameNumber === 1) {
+        const homeStillNeedsStart = !match.selectedStadium && !isEngaged(homeRepId);
+        const awayStillNeedsStart = !match.selectedCaptain && !isEngaged(awayRepId);
+        if ((homeStillNeedsStart || awayStillNeedsStart) && !(await threadMessageExists(thread, block.startMessageId))) {
+            await queueControlWatchdogRecovery(match, client, 'watchdog_restore_start_control', async () => {
+                await postInitialGameSetup(match, client);
+            }, {
+                phase: 'start',
+                missingMessage: block.startMessageId ?? null
+            });
+            return;
+        }
     }
-    if (!match.selectedCaptain && (!awaySelectionExists || !match.awaySelectionTimer)) {
-        missingPlayers.push('away');
+
+    // Re-arm the auto-randomize deadline for any engaged, still-pending side whose timer is not
+    // running (timers are null after a restart). Pure state — safe to run outside the output queue.
+    for (const player of ['home', 'away']) {
+        const config = getSetupPromptConfig(player);
+        if (isEngaged(repIdFor(player)) && !match[config.selectedKey] && !match[config.timerKey]) {
+            armSelectionTimeout(match, player, client);
+        }
     }
-    if (!missingPlayers.length) {
+
+    // Restore the neutral open button ONLY for an engaged side that is owed one (private delivery
+    // failed or was lost on restart) and whose button is missing. Never post the options publicly.
+    const owedPlayers = [];
+    for (const player of ['home', 'away']) {
+        const config = getSetupPromptConfig(player);
+        if (
+            !match[config.selectedKey]
+            && isEngaged(repIdFor(player))
+            && block[config.deliveredKey] !== true
+            && !(await threadMessageExists(thread, block[config.openButtonIdKey]))
+        ) {
+            owedPlayers.push(player);
+        }
+    }
+    if (!owedPlayers.length) {
         return;
     }
 
-    await queueControlWatchdogRecovery(match, client, 'watchdog_restore_setup_selection_controls', async () => {
-        // Recovery has no live ephemeral interaction to reuse, so always post the
-        // rep-gated buttons in the thread to guarantee the rep can still pick.
-        await postVisibleSetupSelectionControls(match, client, missingPlayers, {
+    await queueControlWatchdogRecovery(match, client, 'watchdog_restore_open_pick_buttons', async () => {
+        await postNeutralOpenButtons(match, client, owedPlayers, {
             source: 'watchdog',
-            players: missingPlayers.join(','),
-            withButtons: true
+            players: owedPlayers.join(',')
         });
     }, {
         phase: 'selection',
-        players: missingPlayers.join(',')
+        players: owedPlayers.join(',')
     });
 }
 
@@ -3426,52 +3486,50 @@ async function handleLoserAdvantage(interaction, match, choice) {
     match.stage = 'awaiting_start';
     clearMatchTimers(match);
 
-    const loserPayload = choice === 'home'
-        ? {
-            content: renderHomeSelectionPrompt(match),
-            components: buildStadiumButtonRows(match, options)
-        }
-        : {
-            content: renderAwaySelectionPrompt(match),
-            components: buildCaptainButtonRows(match, options)
-        };
-    const winnerPayload = choice === 'home'
-        ? {
-            content: renderAwaySelectionPrompt(match),
-            components: buildCaptainButtonRows(match, options)
-        }
-        : {
-            content: renderHomeSelectionPrompt(match),
-            components: buildStadiumButtonRows(match, options)
-        };
+    const loserSelectionPlayer = choice === 'home' ? 'home' : 'away';
+    const winnerSelectionPlayer = choice === 'home' ? 'away' : 'home';
+    const loserPlayerConfig = getSetupPromptConfig(loserSelectionPlayer);
+    const winnerPlayerConfig = getSetupPromptConfig(winnerSelectionPlayer);
 
+    const block = getOrCreateGameBlock(match);
+    const loserPayload = {
+        content: loserPlayerConfig.renderPrompt(match),
+        components: loserPlayerConfig.buildRows(match, options)
+    };
+    const winnerPayload = {
+        content: winnerPlayerConfig.renderPrompt(match),
+        components: winnerPlayerConfig.buildRows(match, options)
+    };
+    // Arm the auto-randomize deadlines for BOTH sides (after rendering the payloads) so neither
+    // pick can stall — even if a private prompt fails and only the neutral open button remains.
+    armSelectionTimeout(match, loserSelectionPlayer, interaction.client);
+    armSelectionTimeout(match, winnerSelectionPlayer, interaction.client);
+
+    // Loser rep always has a fresh live interaction (they just clicked advantage) → ephemeral.
     const loserPrompt = await deliverPrivateInteractionPayload(interaction, loserPayload, 'loser private setup');
+    block[loserPlayerConfig.deliveredKey] = Boolean(loserPrompt);
     if (!loserPrompt) {
         logRatedWarn(interaction.client, match, 'setup.private_loser_delivery_failed', getMatchLogDetails(match, {
             game: confirmedGameNumber,
             loser: loserRepId,
-            fallback: 'thread_selection_control'
+            fallback: 'neutral_open_button'
         }));
     }
 
+    // Winner rep only has a stored interaction (its token may be expired) → may need the button.
     const winnerPrompt = await deliverPrivateInteractionPayload(
         getPrivateDeliveryInteraction(match, winnerRepId),
         winnerPayload,
         'winner private setup'
     );
+    block[winnerPlayerConfig.deliveredKey] = Boolean(winnerPrompt);
     if (!winnerPrompt) {
         logRatedWarn(interaction.client, match, 'setup.private_winner_delivery_failed', getMatchLogDetails(match, {
             game: confirmedGameNumber,
             winner: winnerRepId,
-            fallback: 'thread_selection_control'
+            fallback: 'neutral_open_button'
         }));
     }
-
-    const loserSelectionPlayer = choice === 'home' ? 'home' : 'away';
-    const winnerSelectionPlayer = choice === 'home' ? 'away' : 'home';
-    // If either private setup prompt could not be delivered, fall back to posting the
-    // rep-gated selection buttons in the visible thread so both players can still pick.
-    const privateSetupComplete = Boolean(loserPrompt && winnerPrompt);
 
     match.loserTeamIndex = null;
     match.loserRepMention = null;
@@ -3481,24 +3539,26 @@ async function handleLoserAdvantage(interaction, match, choice) {
         source: 'advantage_choice',
         game: confirmedGameNumber
     });
-    queueMatchOutput(match, interaction.client, 'post_visible_setup_selection_controls_after_advantage', async () => {
-        await postVisibleSetupSelectionControls(
-            match,
-            interaction.client,
-            [loserSelectionPlayer, winnerSelectionPlayer],
-            {
+
+    // Strictly private: only post the neutral, rep-gated "open your pick" button for a side
+    // whose ephemeral could not be delivered. Never leak the options publicly.
+    const owedPlayers = [];
+    if (!loserPrompt) { owedPlayers.push(loserSelectionPlayer); }
+    if (!winnerPrompt) { owedPlayers.push(winnerSelectionPlayer); }
+    if (owedPlayers.length) {
+        queueMatchOutput(match, interaction.client, 'post_neutral_open_buttons_after_advantage', async () => {
+            await postNeutralOpenButtons(match, interaction.client, owedPlayers, {
                 source: 'advantage_choice',
                 choice,
-                game: confirmedGameNumber,
-                withButtons: !privateSetupComplete
-            }
-        );
-    }, {
-        source: 'advantage_choice',
-        required: true,
-        choice,
-        game: confirmedGameNumber
-    });
+                game: confirmedGameNumber
+            });
+        }, {
+            source: 'advantage_choice',
+            required: true,
+            choice,
+            game: confirmedGameNumber
+        });
+    }
     logRatedInfo(interaction.client, match, 'game.advantage.chosen', getMatchLogDetails(match, {
         game: confirmedGameNumber,
         loser: interaction.user.id,
@@ -3507,7 +3567,7 @@ async function handleLoserAdvantage(interaction, match, choice) {
     logRatedInfo(interaction.client, match, 'setup.private_controls.posted', getMatchLogDetails(match, {
         loserPrompt: loserPrompt?.id,
         winnerPrompt: winnerPrompt?.id,
-        fallback: 'thread_selection_control'
+        fallback: 'neutral_open_button'
     }));
 }
 
@@ -3631,13 +3691,15 @@ async function resolveLoserConfirmationIfTimedOut(matchId, phase, client) {
 function getSetupPickConfig(kind) {
     if (kind === 'stadium') {
         return {
+            player: 'home',
             selectedKey: 'selectedStadium',
             otherSelectedKey: 'selectedCaptain',
             optionsKey: 'stadiums',
             teamIndexKey: 'homeTeamIndex',
             timerKey: 'homeSelectionTimer',
             deadlineKey: 'homeSelectionDeadlineAt',
-            promptIdKey: 'homeSelectionPromptId',
+            openButtonIdKey: 'homeOpenButtonMessageId',
+            deliveredKey: 'homeSelectionDelivered',
             invalidMessage: 'Invalid stadium selection.',
             permissionMessage: mode => mode === '1v1'
                 ? 'Only the **HOME** player may choose the stadium.'
@@ -3646,13 +3708,15 @@ function getSetupPickConfig(kind) {
     }
 
     return {
+        player: 'away',
         selectedKey: 'selectedCaptain',
         otherSelectedKey: 'selectedStadium',
         optionsKey: 'captains',
         teamIndexKey: 'awayTeamIndex',
         timerKey: 'awaySelectionTimer',
         deadlineKey: 'awaySelectionDeadlineAt',
-        promptIdKey: 'awaySelectionPromptId',
+        openButtonIdKey: 'awayOpenButtonMessageId',
+        deliveredKey: 'awaySelectionDelivered',
         invalidMessage: 'Invalid captain selection.',
         permissionMessage: mode => mode === '1v1'
             ? 'Only the **AWAY** player may choose the captain.'
@@ -3709,15 +3773,18 @@ async function handleSetupSelection(interaction, match, kind) {
     }
 
     const block = getOrCreateGameBlock(match);
-    const selectedPromptId = block[config.promptIdKey];
-    block[config.promptIdKey] = null;
+    // The neutral "open your pick" button (if one was posted as a delivery fallback) is now
+    // resolved — drop its id and mark the side no longer owed so the watchdog won't restore it.
+    const selectedOpenButtonId = block[config.openButtonIdKey];
+    block[config.openButtonIdKey] = null;
+    block[config.deliveredKey] = false;
 
     if (match[config.otherSelectedKey]) {
         match.stage = 'awaiting_winner';
         queueMatchOutput(match, interaction.client, 'advance_to_winner_control_after_manual_selection', async () => {
             const thread = await interaction.client.channels.fetch(match.threadId).catch(() => null);
-            if (selectedPromptId) {
-                await deleteThreadMessage(thread, selectedPromptId);
+            if (selectedOpenButtonId) {
+                await deleteThreadMessage(thread, selectedOpenButtonId);
             }
             await advanceMatchToWinnerControlAfterSelections(match, interaction.client, thread);
         }, {
@@ -3726,10 +3793,10 @@ async function handleSetupSelection(interaction, match, kind) {
             kind,
             game: getNextGameNumber(match)
         });
-    } else if (selectedPromptId) {
+    } else if (selectedOpenButtonId) {
         queueMatchOutput(match, interaction.client, 'cleanup_setup_selection_prompt', async () => {
             const thread = await interaction.client.channels.fetch(match.threadId).catch(() => null);
-            await deleteThreadMessage(thread, selectedPromptId);
+            await deleteThreadMessage(thread, selectedOpenButtonId);
         }, {
             source: 'manual_selection',
             kind
@@ -3765,31 +3832,37 @@ async function showPrivateStartSetupControls(interaction, match, config) {
         match.startClickedUserIds.push(config.repId);
     }
 
-    queueMatchOutput(match, interaction.client, 'post_visible_setup_selection_control_after_start', async () => {
-        await postVisibleSetupSelectionControls(match, interaction.client, [config.player], {
-            source: 'start_click',
-            player: config.player,
-            user: interaction.user.id,
-            game: getNextGameNumber(match),
-            withButtons: true
-        });
-    }, {
-        source: 'start_click',
-        required: true,
-        player: config.player,
-        game: getNextGameNumber(match)
-    });
-
+    // The rep clicking Start has a live interaction → deliver their selection privately. No public
+    // selection prompt is posted; the neutral open button is used only if the ephemeral fails.
+    const deliveredKey = getSetupPromptConfig(config.player)?.deliveredKey;
     const privatePrompt = await deliverPrivateInteractionPayload(interaction, {
         content: config.renderPrompt(match),
         components: config.buildRows(match, options)
     }, `${config.player} start setup`);
+    // Arm the auto-randomize deadline after rendering so the pick can't stall on a missed click.
+    armSelectionTimeout(match, config.player, interaction.client);
+    if (deliveredKey) {
+        block[deliveredKey] = Boolean(privatePrompt);
+    }
     if (!privatePrompt) {
         logRatedWarn(interaction.client, match, 'setup.start_retry_required', getMatchLogDetails(match, {
             user: interaction.user.id,
             player: config.player,
-            fallback: 'thread_selection_control'
+            fallback: 'neutral_open_button'
         }));
+        queueMatchOutput(match, interaction.client, 'post_neutral_open_button_after_start', async () => {
+            await postNeutralOpenButton(match, interaction.client, config.player, {
+                source: 'start_click',
+                player: config.player,
+                user: interaction.user.id,
+                game: getNextGameNumber(match)
+            });
+        }, {
+            source: 'start_click',
+            required: true,
+            player: config.player,
+            game: getNextGameNumber(match)
+        });
     }
     logRatedInfo(interaction.client, match, 'setup.start.clicked', getMatchLogDetails(match, {
         user: interaction.user.id,
@@ -3837,6 +3910,45 @@ async function handleStartSetupButton(interaction, match) {
         content: getSetupPermissionMessage(match),
         ephemeral: true
     });
+}
+
+// Handles a click on the neutral rep-gated "Choose Stadium/Captain" button. It opens the actual
+// options as a fresh private ephemeral (the immediate ack reply is edited into the options), so
+// the choice is never shown to anyone but the correct rep.
+async function handleOpenPrivatePick(interaction, match) {
+    if (!hasExpectedMatchStageAndToken(match, interaction, 'awaiting_start')) {
+        await ignoreMatchInteraction(interaction, match, 'setup.openpick_ignored', 'stale_or_wrong_stage', {}, { deleteReply: true });
+        return;
+    }
+
+    const config = getSetupSelectionConfig(match, interaction.user.id);
+    const requestedPlayer = parseOpenPickPlayerFromCustomId(interaction.customId);
+    if (!config || config.player !== requestedPlayer) {
+        await safeReply(interaction, { content: getSetupPermissionMessage(match), ephemeral: true });
+        return;
+    }
+    if (match[config.selectedKey]) {
+        await ignoreMatchInteraction(interaction, match, 'setup.openpick_ignored', 'already_selected', {}, { deleteReply: true });
+        return;
+    }
+
+    const options = await getOptionsForGameType(match.gameType);
+    // Keep the deadline armed, then edit the acked ephemeral into the real (private) options.
+    armSelectionTimeout(match, config.player, interaction.client);
+    const prompt = await deliverPrivateInteractionPayload(interaction, {
+        content: config.renderPrompt(match),
+        components: config.buildRows(match, options)
+    }, `${config.player} open pick`);
+    const block = getOrCreateGameBlock(match);
+    const deliveredKey = getSetupPromptConfig(config.player)?.deliveredKey;
+    if (deliveredKey) {
+        block[deliveredKey] = Boolean(prompt);
+    }
+    logRatedInfo(interaction.client, match, 'setup.openpick.opened', getMatchLogDetails(match, {
+        user: interaction.user.id,
+        player: config.player,
+        delivered: Boolean(prompt)
+    }));
 }
 
 async function reconcileAllPanels(client) {
@@ -4607,6 +4719,10 @@ async function handleMatchInteraction(interaction) {
         transition: async () => {
             if (interaction.customId.includes(':match:start:')) {
                 await handleStartSetupButton(interaction, match);
+                return true;
+            }
+            if (interaction.customId.includes(':match:openpick:')) {
+                await handleOpenPrivatePick(interaction, match);
                 return true;
             }
             if (interaction.customId.includes(':match:stadium:')) {

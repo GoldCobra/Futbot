@@ -8,11 +8,14 @@ function getMatchActionAckPayload(matchAction) {
     if (matchAction === 'loser_confirm') {
         return { content: 'Confirming result...', components: [] };
     }
+    if (matchAction === 'openpick') {
+        return { content: 'Opening your pick...', components: [] };
+    }
     return null;
 }
 
 async function acknowledgeMatchAction(interaction, matchAction, ensureImmediateReply, ensureDeferredUpdate) {
-    if (['start', 'winner', 'loser_confirm'].includes(matchAction)) {
+    if (['start', 'winner', 'loser_confirm', 'openpick'].includes(matchAction)) {
         return await ensureImmediateReply(interaction, getMatchActionAckPayload(matchAction));
     }
 

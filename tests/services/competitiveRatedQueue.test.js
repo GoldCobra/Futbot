@@ -722,6 +722,14 @@ function threadHasPublicSelectionButtons(thread) {
     );
 }
 
+function threadHasOpenPickButton(thread, player = null) {
+    return [...thread.__sentMessages.values()].some(message =>
+        getButtonCustomIds(message.payload).some(customId =>
+            customId.includes(':match:openpick:') && (player == null || customId.split(':')[5] === player)
+        )
+    );
+}
+
 function threadHasImagePayload(thread, imageName) {
     return thread.send.mock.calls.some(([payload]) =>
         threadPayloadHasFile(payload, imageName)
@@ -1909,7 +1917,10 @@ describe('competitiveRatedQueue', () => {
             expect(homeStart.editReply.mock.calls.at(-1)[0].components[0].toJSON().components[0].custom_id)
                 .toContain(':match:stadium:');
             await flushOutputQueues();
-            expect(threadHasPublicSelectionButtons(thread)).toBe(true);
+            // Strictly private: the selection is delivered only as an ephemeral — no public
+            // stadium/captain buttons and no neutral open button (the ephemeral succeeded).
+            expect(threadHasPublicSelectionButtons(thread)).toBe(false);
+            expect(threadHasOpenPickButton(thread)).toBe(false);
 
             const awayStart = createButtonInteractionMock({ customId: startCustomId, userId: 'away-user', client });
             await competitiveRatedQueue.handleInteraction(awayStart);
@@ -1919,7 +1930,8 @@ describe('competitiveRatedQueue', () => {
             expect(awayStart.editReply.mock.calls.at(-1)[0].components[0].toJSON().components[0].custom_id)
                 .toContain(':match:captain:');
             await flushOutputQueues();
-            expect(threadHasPublicSelectionButtons(thread)).toBe(true);
+            expect(threadHasPublicSelectionButtons(thread)).toBe(false);
+            expect(threadHasOpenPickButton(thread)).toBe(false);
             expect(threadHasImagePayload(thread, 'g1.png')).toBe(true);
             expectPublicThreadTextIsQuoted(thread);
             expect(setupMessage.delete).toHaveBeenCalled();
@@ -1930,6 +1942,55 @@ describe('competitiveRatedQueue', () => {
             randomSpy.mockRestore();
             competitiveRatedQueue.__resetState();
             jest.useRealTimers();
+        }
+    });
+
+    it('does not post any selection or open-pick prompt for a rep who has not engaged the Start gate (watchdog)', async () => {
+        const randomSpy = jest.spyOn(Math, 'random').mockReturnValue(0.9);
+        try {
+            competitiveRatedQueue.__seedStateForTests({
+                cachedOptionsByGameType: { MSC: createMatchOptions() }
+            });
+            const { channel, client, thread } = createMatchClientMock();
+            const searches = [
+                createCompetitiveRatedSearch({ id: 'search-1', userId: 'home-user', username: 'Home', createdAt: 1 }),
+                createCompetitiveRatedSearch({ id: 'search-2', userId: 'away-user', username: 'Away', createdAt: 2 })
+            ];
+            await competitiveRatedQueue.__createCompetitiveRatedMatchForTests(
+                { channelId: channel.id, gameType: 'MSC' },
+                searches,
+                client,
+                { skipReconcile: true }
+            );
+
+            const setupPayload = findThreadPayload(thread, payload =>
+                payload.components?.[0]?.toJSON().components[0].custom_id.includes(':match:start:')
+            );
+            const startCustomId = getFirstButtonCustomId(setupPayload);
+
+            // Only HOME engages the Start gate (and gets their private ephemeral). AWAY has not.
+            await competitiveRatedQueue.handleInteraction(
+                createButtonInteractionMock({ customId: startCustomId, userId: 'home-user', client })
+            );
+            await flushOutputQueues();
+
+            // Two reconcile ticks must NOT post a captain prompt for the un-engaged AWAY rep, must
+            // not leak options publicly, and must not duplicate anything (root cause of the bug).
+            await competitiveRatedQueue.__tickForTests(client);
+            await flushOutputQueues();
+            await competitiveRatedQueue.__tickForTests(client);
+            await flushOutputQueues();
+
+            expect(threadHasPublicSelectionButtons(thread)).toBe(false);
+            expect(threadHasOpenPickButton(thread)).toBe(false);
+            // The shared Start control is still available so AWAY can engage when ready.
+            expect(findThreadPayload(thread, payload =>
+                getButtonComponents(payload).some(component => component.label === 'Start Match')
+            )).toBeDefined();
+            expect(competitiveRatedQueue.__getStateSnapshot().activeMatchCount).toBe(1);
+        } finally {
+            randomSpy.mockRestore();
+            competitiveRatedQueue.__resetState();
         }
     });
 
@@ -2028,7 +2089,9 @@ describe('competitiveRatedQueue', () => {
             expect(awayStart.editReply.mock.calls.at(-1)[0].content).toContain('CAPTAIN');
             await flushOutputQueues();
             expect(threadHasImagePayload(thread, 'g1.png')).toBe(true);
-            expect(threadHasPublicSelectionButtons(thread)).toBe(true);
+            // Strictly private: both reps got their ephemerals, so no public selection buttons.
+            expect(threadHasPublicSelectionButtons(thread)).toBe(false);
+            expect(threadHasOpenPickButton(thread)).toBe(false);
         } finally {
             randomSpy.mockRestore();
             competitiveRatedQueue.__resetState();
@@ -3606,7 +3669,10 @@ describe('competitiveRatedQueue', () => {
             );
             expect(cancelPayload).toBeUndefined();
             await flushOutputQueues();
-            expect(threadHasPublicSelectionButtons(thread)).toBe(true);
+            // The winner's ephemeral could not be delivered → they get the neutral, rep-gated
+            // open-pick button (never the options publicly); the loser stays fully private.
+            expect(threadHasPublicSelectionButtons(thread)).toBe(false);
+            expect(threadHasOpenPickButton(thread, 'away')).toBe(true);
             expect(findThreadPayload(thread, payload =>
                 getButtonComponents(payload).some(component => component.label === 'Start Match')
             )).toBeUndefined();
@@ -3630,26 +3696,38 @@ describe('competitiveRatedQueue', () => {
         const errorSpy = jest.spyOn(console, 'error').mockImplementation(() => {});
 
         try {
-            await competitiveRatedQueue.handleInteraction(createButtonInteractionMock({
+            const loserAdvantageInteraction = createButtonInteractionMock({
                 customId: chooseHomeCustomId,
                 userId: 'away-user',
                 client
-            }));
+            });
+            await competitiveRatedQueue.handleInteraction(loserAdvantageInteraction);
             await flushOutputQueues();
 
-            const stadiumMessage = findThreadMessage(thread, payload =>
-                getButtonCustomIds(payload).some(customId => customId.includes(':match:stadium:'))
-            );
-            const captainMessage = findThreadMessage(thread, payload =>
-                getButtonCustomIds(payload).some(customId => customId.includes(':match:captain:'))
-            );
-            expect(stadiumMessage).toBeDefined();
-            expect(captainMessage).toBeDefined();
-
-            const stadiumCustomId = getButtonCustomIds(stadiumMessage.payload)
+            // Loser (HOME/stadium) got their ephemeral directly; the winner (AWAY/captain) could
+            // not, so they receive the neutral rep-gated open-pick button — never public options.
+            const stadiumCustomId = getButtonCustomIds(loserAdvantageInteraction.editReply.mock.calls.at(-1)[0])
                 .find(customId => customId.includes(':match:stadium:'));
-            const captainCustomId = getButtonCustomIds(captainMessage.payload)
+            expect(stadiumCustomId).toBeDefined();
+            expect(threadHasPublicSelectionButtons(thread)).toBe(false);
+
+            const openPickMessage = findThreadMessage(thread, payload =>
+                getButtonCustomIds(payload).some(customId => customId.includes(':match:openpick:'))
+            );
+            expect(openPickMessage).toBeDefined();
+            const openPickCustomId = getButtonCustomIds(openPickMessage.payload)
+                .find(customId => customId.includes(':match:openpick:'));
+
+            // Winner clicks the neutral button → their captain options open privately (ephemeral).
+            const openPickInteraction = createButtonInteractionMock({
+                customId: openPickCustomId,
+                userId: 'home-user',
+                client
+            });
+            await competitiveRatedQueue.handleInteraction(openPickInteraction);
+            const captainCustomId = getButtonCustomIds(openPickInteraction.editReply.mock.calls.at(-1)[0])
                 .find(customId => customId.includes(':match:captain:'));
+            expect(captainCustomId).toBeDefined();
             randomSpy.mockClear();
 
             await competitiveRatedQueue.handleInteraction(createButtonInteractionMock({
@@ -3682,6 +3760,59 @@ describe('competitiveRatedQueue', () => {
             randomSpy.mockRestore();
             competitiveRatedQueue.__resetState();
             jest.useRealTimers();
+        }
+    });
+
+    it('rep-gates the neutral open-pick button so nobody but the owed rep can open the options', async () => {
+        const { client, thread } = createMatchClientMock();
+        const { winnerInteraction, chooseHomeCustomId } = await prepareLoserAdvantagePrompt(client);
+        // Force the winner's private delivery to fail so the neutral open-pick button is posted.
+        winnerInteraction.editReply.mockRejectedValueOnce(new Error('expired interaction token'));
+        winnerInteraction.followUp.mockRejectedValueOnce(new Error('Unknown interaction'));
+        const errorSpy = jest.spyOn(console, 'error').mockImplementation(() => {});
+
+        try {
+            await competitiveRatedQueue.handleInteraction(createButtonInteractionMock({
+                customId: chooseHomeCustomId,
+                userId: 'away-user',
+                client
+            }));
+            await flushOutputQueues();
+
+            const openPickMessage = findThreadMessage(thread, payload =>
+                getButtonCustomIds(payload).some(customId => customId.includes(':match:openpick:'))
+            );
+            expect(openPickMessage).toBeDefined();
+            const openPickCustomId = getButtonCustomIds(openPickMessage.payload)
+                .find(customId => customId.includes(':match:openpick:'));
+
+            // The wrong-side rep (loser, now HOME) and an outsider must NOT get the captain options.
+            const wrongRep = createButtonInteractionMock({ customId: openPickCustomId, userId: 'away-user', client });
+            await competitiveRatedQueue.handleInteraction(wrongRep);
+            const outsider = createButtonInteractionMock({ customId: openPickCustomId, userId: 'outsider-user', client });
+            await competitiveRatedQueue.handleInteraction(outsider);
+
+            for (const blocked of [wrongRep, outsider]) {
+                const payloads = [
+                    ...blocked.reply.mock.calls,
+                    ...blocked.editReply.mock.calls,
+                    ...blocked.followUp.mock.calls
+                ].map(([payload]) => payload);
+                expect(payloads.some(payload =>
+                    getButtonCustomIds(payload).some(customId => customId.includes(':match:captain:'))
+                )).toBe(false);
+            }
+
+            // The correct rep (winner, now AWAY) can open their captain options privately.
+            const correctRep = createButtonInteractionMock({ customId: openPickCustomId, userId: 'home-user', client });
+            await competitiveRatedQueue.handleInteraction(correctRep);
+            const captainCustomId = getButtonCustomIds(correctRep.editReply.mock.calls.at(-1)[0])
+                .find(customId => customId.includes(':match:captain:'));
+            expect(captainCustomId).toBeDefined();
+            expect(threadHasPublicSelectionButtons(thread)).toBe(false);
+        } finally {
+            errorSpy.mockRestore();
+            competitiveRatedQueue.__resetState();
         }
     });
 

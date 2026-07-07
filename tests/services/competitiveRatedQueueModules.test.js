@@ -73,6 +73,14 @@ describe('competitiveRatedQueue internal modules', () => {
         expect(extendId).toBe('rated:competitive:search:extend:search-1:15:warn-token');
         expect(customIds.parseIdFromCustomId(extendId)).toBe('search-1');
         expect(customIds.parseActionTokenFromCustomId(extendId)).toBe('warn-token');
+
+        const openPickId = customIds.openPrivatePickCustomId('match-1', 'away', '3.1');
+        expect(openPickId).toBe('rated:competitive:match:openpick:match-1:away:3.1');
+        expect(customIds.parseIdFromCustomId(openPickId)).toBe('match-1');
+        expect(customIds.parseOpenPickPlayerFromCustomId(openPickId)).toBe('away');
+        expect(customIds.parseActionTokenFromCustomId(openPickId)).toBe('3.1');
+        expect(customIds.actionTokenMatches(openPickId, '3.1')).toBe(true);
+        expect(customIds.actionTokenMatches(openPickId, '4.0')).toBe(false);
     });
 
     it('normalizes terminal thread names and quote formatting', () => {

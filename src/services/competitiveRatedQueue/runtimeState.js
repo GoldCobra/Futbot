@@ -56,7 +56,17 @@ function hydrateMatch(raw) {
         privatePromptHandles: {},
         participantIdByDiscordId: new Map(raw.participantIdByDiscordId ?? []),
         startClickedUserIds: Array.isArray(raw.startClickedUserIds) ? raw.startClickedUserIds : [],
-        gameBlocks: Array.isArray(raw.gameBlocks) ? raw.gameBlocks : [],
+        // No private ephemeral prompt survives a restart, so no selection can be considered
+        // "delivered" — force the flags false so the watchdog re-offers the neutral open button
+        // (never the options) for any still-pending, engaged side. Older persisted blocks that
+        // predate these fields default to null/false here too.
+        gameBlocks: (Array.isArray(raw.gameBlocks) ? raw.gameBlocks : []).map(block => ({
+            homeOpenButtonMessageId: null,
+            awayOpenButtonMessageId: null,
+            ...block,
+            homeSelectionDelivered: false,
+            awaySelectionDelivered: false
+        })),
         score: raw.score ?? { team1: 0, team2: 0 }
     };
 }

@@ -48,6 +48,10 @@ function startSetupCustomId(matchId, gameNumber = null) {
     return joinParts([CONFIG.PREFIX, 'match', 'start', matchId, gameNumber]);
 }
 
+function openPrivatePickCustomId(matchId, player, token = null) {
+    return joinParts([CONFIG.PREFIX, 'match', 'openpick', matchId, player, token]);
+}
+
 function parseChannelIdFromCustomId(customId) {
     return customId.split(':')[3];
 }
@@ -69,10 +73,14 @@ function parseLoserChoiceFromCustomId(customId) {
     return customId.split(':')[5];
 }
 
+function parseOpenPickPlayerFromCustomId(customId) {
+    return customId.split(':')[5];
+}
+
 function parseActionTokenFromCustomId(customId) {
     const parts = customId.split(':');
     if (parts[2] === 'match') {
-        if (['stadium', 'captain', 'loser_advantage'].includes(parts[3])) {
+        if (['stadium', 'captain', 'loser_advantage', 'openpick'].includes(parts[3])) {
             return parts[6] ?? null;
         }
         return parts[5] ?? null;
@@ -96,12 +104,14 @@ module.exports = {
     extendSearchCustomId,
     loserAdvantageCustomId,
     loserConfirmCustomId,
+    openPrivatePickCustomId,
     panelJoinCustomId,
     parseActionTokenFromCustomId,
     parseChannelIdFromCustomId,
     parseIdFromCustomId,
     parseLoserChoiceFromCustomId,
     parseModeFromCustomId,
+    parseOpenPickPlayerFromCustomId,
     parseOptionValueFromCustomId,
     reportIssueCustomId,
     rematchCustomId,
