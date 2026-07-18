@@ -1786,6 +1786,8 @@ describe('competitiveRatedQueue', () => {
             expect(cancelPayload.content).not.toContain('MATCH CANCELLED DUE TO INACTIVITY');
             expect(cancelPayload.content).toMatch(/^>>> /);
             expect(cancelNoticePayload?.content).toContain('**MATCH CANCELLED.**');
+            // A cancelled match must never show the "MATCH COMPLETE!" notice.
+            expect(findThreadPayload(thread, payload => payload.content?.includes('MATCH COMPLETE'))).toBeUndefined();
             expect(thread.setName).toHaveBeenCalledWith(expect.stringMatching(/^🚫 1v1 #1 \| (Home|Away) VS (Home|Away)$/));
             expect(thread.setLocked).toHaveBeenCalledWith(true, 'MSC competitive match inactivity timeout');
             expect(thread.setArchived).toHaveBeenCalledWith(true, 'MSC competitive match inactivity timeout');
@@ -1862,6 +1864,8 @@ describe('competitiveRatedQueue', () => {
             expect(cancelPayload.content).not.toContain('MATCH CANCELLED DUE TO INACTIVITY');
             expect(cancelPayload.content).toMatch(/^>>> /);
             expect(cancelNoticePayload?.content).toContain('**MATCH CANCELLED.**');
+            // A cancelled match must never show the "MATCH COMPLETE!" notice.
+            expect(findThreadPayload(thread, payload => payload.content?.includes('MATCH COMPLETE'))).toBeUndefined();
             expect(thread.setName).toHaveBeenCalledWith('🚫 1v1 #1 | Home VS Away');
             expect(thread.setLocked).toHaveBeenCalledWith(true, 'MSC competitive match inactivity timeout');
             expect(thread.setArchived).toHaveBeenCalledWith(true, 'MSC competitive match inactivity timeout');

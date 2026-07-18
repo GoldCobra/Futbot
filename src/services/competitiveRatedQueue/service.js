@@ -2658,6 +2658,11 @@ function queueAdvanceMatchToWinnerControlAfterSelections(match, client, thread =
 }
 
 async function postWinnerControl(match, client, thread = null) {
+    // Never render the game control for a terminal match (defense-in-depth against a racing
+    // worker firing after cancel/complete — see updateMatchControlMessage).
+    if (match.stage === 'cancelled' || match.stage === 'complete') {
+        return;
+    }
     thread ??= await client.channels.fetch(match.threadId).catch(() => null);
     if (!thread?.send) {
         return;
@@ -2720,6 +2725,14 @@ function getLoserControlTimeoutPhase(match) {
 }
 
 async function updateMatchControlMessage(match, client, thread = null) {
+    // A cancelled/complete match must never (re)render a control message. Its terminal notice
+    // ("MATCH CANCELLED." / the completion embed) is posted separately and the control message is
+    // already cleared — without this guard a reconcile/output-queue worker that was queued while
+    // the match was still live can run after cancellation and edit the control to the stale
+    // "MATCH COMPLETE!" fallback (renderMatchControlContent), which makes no sense on a cancel.
+    if (match.stage === 'cancelled' || match.stage === 'complete') {
+        return;
+    }
     if (match.stage === 'awaiting_start') {
         await postInitialGameSetup(match, client);
         return;
