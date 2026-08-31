@@ -18,7 +18,8 @@ const {
     getSeasonQueueAvailability,
     beginDueSeasonEnding,
     finalizeDueEndingSeason,
-    activateDueSeason
+    activateDueSeason,
+    clearAllCompetitiveRankRoles
 } = require('../competitiveRating');
 const { runPendingCompetitiveWhrRunner } = require('../competitiveWhrRunner');
 const { COMP_RANK_EMOJIS, COMP_RANK_NAMES, PLACEMENT_GAMES_REQUIRED } = require('../../utils/competitiveConstants');
@@ -3998,7 +3999,8 @@ async function handleAutomaticSeasonTransitions(client) {
         finalizedSeason: null,
         activatedSeason: null,
         removedSearches: 0,
-        cancelledMatches: 0
+        cancelledMatches: 0,
+        clearedRankRoles: null
     };
 
     if (typeof beginDueSeasonEnding === 'function') {
@@ -4034,6 +4036,22 @@ async function handleAutomaticSeasonTransitions(client) {
             logRatedInfo(client, { all: true }, 'season.activated', {
                 season: activatedSeason.Id
             });
+
+            // Best-effort: the season is already active in the DB, so a Discord failure here must
+            // not fail the transition. It is logged instead and retried on the next activation.
+            result.clearedRankRoles = await clearAllCompetitiveRankRoles(client, CONSTANTS.GUILD_ID)
+                .catch(error => {
+                    logRatedError(client, { all: true }, 'season.rank_roles_clear_failed', error);
+                    return null;
+                });
+            if (result.clearedRankRoles) {
+                logRatedWarn(client, { all: true }, 'season.rank_roles_cleared', {
+                    season: activatedSeason.Id,
+                    members: result.clearedRankRoles.members,
+                    roles: result.clearedRankRoles.rolesRemoved,
+                    failed: result.clearedRankRoles.failed
+                });
+            }
         }
     }
 

@@ -48,14 +48,18 @@ function clearRankThresholdCache() {
     };
 }
 
+function toCompetitiveRankRoleIds(thresholds) {
+    return thresholds
+        .map(row => row.DiscordRoleId)
+        .filter(roleId => roleId && !LEGACY_RANK_ROLE_IDS.has(String(roleId)));
+}
+
 async function assignCompRankRoles(client, guildId, discordId, highestRank) {
     if (!client || !guildId || !discordId) return;
 
     try {
         const thresholds = await getCachedRankThresholds();
-        const compRoleIds = thresholds
-            .map(row => row.DiscordRoleId)
-            .filter(roleId => roleId && !LEGACY_RANK_ROLE_IDS.has(String(roleId)));
+        const compRoleIds = toCompetitiveRankRoleIds(thresholds);
         const targetRoleId = thresholds.find(row => Number(row.RankNumber) === Number(highestRank))?.DiscordRoleId ?? null;
         const roleId = targetRoleId && !LEGACY_RANK_ROLE_IDS.has(String(targetRoleId))
             ? targetRoleId
@@ -76,6 +80,40 @@ async function assignCompRankRoles(client, guildId, discordId, highestRank) {
     } catch {
         // Rank roles are best-effort; rating writes must not depend on Discord role APIs.
     }
+}
+
+// Season start wipes the ladder: every competitive rank role (Unranked included) is stripped from
+// the whole guild, so the new season begins with nobody carrying a rank. The per-match flow then
+// re-adds Unranked on a player's first completed 1v1 and the real rank role once placement is done.
+async function clearAllCompetitiveRankRoles(client, guildId) {
+    const summary = { members: 0, rolesRemoved: 0, failed: 0 };
+    if (!client || !guildId) return summary;
+
+    const compRoleIds = toCompetitiveRankRoleIds(await getCachedRankThresholds());
+    if (!compRoleIds.length) return summary;
+    const compRoleIdSet = new Set(compRoleIds.map(String));
+
+    const guild = await client.guilds.fetch(guildId).catch(() => null);
+    if (!guild) return summary;
+    // No Discord endpoint lists members by role, so the full member list has to be cached first.
+    const members = await guild.members.fetch().catch(() => null);
+    if (!members) return summary;
+
+    for (const member of members.values()) {
+        const held = [...member.roles.cache.filter(role => compRoleIdSet.has(String(role.id))).values()];
+        if (!held.length) continue;
+
+        summary.members += 1;
+        try {
+            // One PATCH per member instead of one per role.
+            await member.roles.remove(held, 'Competitive season start: rank role reset');
+            summary.rolesRemoved += held.length;
+        } catch {
+            summary.failed += 1;
+        }
+    }
+
+    return summary;
 }
 
 async function updateOneVOneRankRoles(changes, seasonId, client, guildId) {
@@ -338,6 +376,7 @@ module.exports = {
     recordCompetitiveResult,
     rollbackCompetitiveMatch,
     assignCompRankRoles,
+    clearAllCompetitiveRankRoles,
     getLeaderboard,
     getPlayerRating,
     getPlayerRatingForSeason,
