@@ -37,6 +37,23 @@ const T = {
 
 const SEASON_END_GRACE_MINUTES = 60;
 
+// A season award says a player stands on the ladder, so it requires a finished placement -
+// the same bar TOP_10 has always applied. Without it three games are enough to take an award,
+// and for BIGGEST_UPSET the metric is not even meaningful yet: it is measured from EloBefore,
+// which is still swinging under the placement K-factor. Applied to the final rating row of the
+// season, exactly like TOP_10. A partition where nobody finished placement simply awards nothing.
+function placedPlayerFilter(playerColumn) {
+    return `EXISTS (
+                    SELECT 1
+                    FROM ${T.rating} placed
+                    WHERE placed.SeasonId = @seasonId
+                      AND placed.GameId = @gameId
+                      AND placed.ModeCode = @mode
+                      AND placed.PlayerId = ${playerColumn}
+                      AND placed.PlacementComplete = 1
+                  )`;
+}
+
 function bindInputs(request, inputs = {}) {
     for (const [key, value] of Object.entries(inputs)) {
         if (Array.isArray(value)) {
@@ -1698,6 +1715,7 @@ class CompetitiveRatingDao {
                 WHERE SeasonId = @seasonId
                   AND GameId = @gameId
                   AND ModeCode = @mode
+                  AND PlacementComplete = 1
                   AND ${whereClause}
              ),
              best AS (
@@ -1755,6 +1773,7 @@ class CompetitiveRatingDao {
                   AND rm.ModeCode = @mode
                   AND rm.Status = 'completed'
                   AND loser.AverageEloBefore > winner.AverageEloBefore
+                  AND ${placedPlayerFilter('crc.PlayerId')}
              ),
              best AS (
                 SELECT MAX(MetricValue) AS MetricValue FROM upsets
@@ -1798,6 +1817,7 @@ class CompetitiveRatingDao {
                   AND rm.GameId = @gameId
                   AND rm.ModeCode = @mode
                   AND rm.Status = 'completed'
+                  AND ${placedPlayerFilter('crc.PlayerId')}
                   AND ${condition}
                 GROUP BY crc.PlayerId
              ),
@@ -1844,6 +1864,8 @@ class CompetitiveRatingDao {
                   AND rm.ModeCode = @mode
                   AND rm.Status = 'completed'
                   AND rm.ModeCode = '2v2'
+                  AND ${placedPlayerFilter('p1.PlayerId')}
+                  AND ${placedPlayerFilter('p2.PlayerId')}
              ),
              candidates AS (
                 SELECT PlayerId1, PlayerId2, CAST(COUNT(*) / 2 AS DECIMAL(19,4)) AS MetricValue
