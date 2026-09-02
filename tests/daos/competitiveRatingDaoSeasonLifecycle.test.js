@@ -93,6 +93,40 @@ describe('CompetitiveRatingDao season activation', () => {
             query.includes('INSERT INTO') && query.includes('CompetitiveSeasonMatchSequence')
         ))).toBe(true);
     });
+
+    it('keeps placed players placed and only resets placement for unranked ones', async () => {
+        const dao = new CompetitiveRatingDao();
+
+        await dao.activateDueSeason();
+
+        const carryOver = mockTransaction.calls.find(call => (
+            call.query.includes('INSERT INTO')
+            && call.query.includes('PlacementComplete')
+            && call.query.includes('CROSS APPLY')
+        ));
+
+        expect(carryOver).toBeDefined();
+
+        // A player who finished placement last season stays placed, keeps a real rank
+        // and is credited the full 5 games; everyone else falls back to 0 and replays them.
+        expect(carryOver.query).toMatch(
+            /CASE WHEN oldRating\.PlacementComplete = 1 THEN carriedRank\.RankNumber ELSE 0 END/
+        );
+        expect(carryOver.query).toMatch(/CASE WHEN oldRating\.PlacementComplete = 1 THEN 1 ELSE 0 END/);
+        expect(carryOver.query).toMatch(
+            /CASE WHEN oldRating\.PlacementComplete = 1 THEN @placementGamesRequired ELSE 0 END/
+        );
+        expect(carryOver.inputs.placementGamesRequired).toBe(5);
+
+        // The carried rank is derived from the live thresholds against the carried ELO,
+        // so it always matches the rating instead of being pinned to Unranked.
+        expect(carryOver.query).toContain('CompetitiveRankThreshold');
+        expect(carryOver.query).toContain('threshold.MinElo <= carriedElo.Elo');
+
+        // How much ELO survives is still the season's own factor.
+        expect(carryOver.query).toContain('(oldRating.Elo - @defaultRating) * @softResetFactor');
+        expect(carryOver.inputs.softResetFactor).toBe(0.70);
+    });
 });
 
 describe('CompetitiveRatingDao season queue availability', () => {

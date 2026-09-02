@@ -439,6 +439,10 @@ class CompetitiveRatingDao {
             );
             const previousSeasonId = previousResult.recordset[0]?.Id ?? null;
             if (previousSeasonId) {
+                // Carry the ladder into the new season. Players who finished placement keep their
+                // rank and stay placed - only unplaced players redo the 5 placement matches.
+                // How much ELO carries over is set per season by SoftResetFactor:
+                // 1.00 keeps it all, 0.70 is the usual soft reset, 0.00 sends everyone to the default.
                 const defaultRating = await this.getDefaultRating(transaction);
                 await runRequest(
                     transaction,
@@ -446,12 +450,25 @@ class CompetitiveRatingDao {
                         SeasonId, PlayerId, GameId, ModeCode, Elo, RankNumber,
                         PlacementPlayed, PlacementComplete, PeakElo, PeakRankNumber
                      )
-                     SELECT @newSeasonId, PlayerId, GameId, ModeCode,
-                            @defaultRating + (Elo - @defaultRating) * @softResetFactor, 0,
-                            0, 0,
-                            @defaultRating + (Elo - @defaultRating) * @softResetFactor, 0
+                     SELECT @newSeasonId, oldRating.PlayerId, oldRating.GameId, oldRating.ModeCode,
+                            carriedElo.Elo,
+                            CASE WHEN oldRating.PlacementComplete = 1 THEN carriedRank.RankNumber ELSE 0 END,
+                            CASE WHEN oldRating.PlacementComplete = 1 THEN @placementGamesRequired ELSE 0 END,
+                            CASE WHEN oldRating.PlacementComplete = 1 THEN 1 ELSE 0 END,
+                            carriedElo.Elo,
+                            CASE WHEN oldRating.PlacementComplete = 1 THEN carriedRank.RankNumber ELSE 0 END
                      FROM ${T.rating} oldRating
-                     WHERE SeasonId = @oldSeasonId
+                     CROSS APPLY (
+                         SELECT @defaultRating + (oldRating.Elo - @defaultRating) * @softResetFactor AS Elo
+                     ) AS carriedElo
+                     CROSS APPLY (
+                         SELECT ISNULL(MAX(threshold.RankNumber), 1) AS RankNumber
+                         FROM ${T.threshold} threshold
+                         WHERE threshold.IsActive = 1
+                           AND threshold.RankNumber > 0
+                           AND threshold.MinElo <= carriedElo.Elo
+                     ) AS carriedRank
+                     WHERE oldRating.SeasonId = @oldSeasonId
                        AND NOT EXISTS (
                            SELECT 1
                            FROM ${T.rating} newRating
@@ -464,7 +481,8 @@ class CompetitiveRatingDao {
                         newSeasonId: nextSeason.Id,
                         oldSeasonId: previousSeasonId,
                         defaultRating,
-                        softResetFactor: nextSeason.SoftResetFactor
+                        softResetFactor: nextSeason.SoftResetFactor,
+                        placementGamesRequired: PLACEMENT_GAMES_REQUIRED
                     }
                 );
             }
