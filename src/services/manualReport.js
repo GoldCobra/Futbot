@@ -107,8 +107,19 @@ async function reportScoreSQLV2(gametype, p1, p2, p1Wins, p2Wins, channel, tourn
 
 async function reportScore2SQLV2(gametype, team1p1, team1p2, team2p1, team2p2, team1Wins, team2Wins, channel, serverid, delt1 = 0, delt2 = 0, delt5 = 0, delt6 = 0) {
     const command = getLegacyReportCommandForGame(gametype, true);
+    // dbo.ReportScore2 inserts the MultiMatch row but, unlike dbo.ReportScore, never returns its
+    // id. extractLegacyId() therefore came back null and every 2v2 report threw before it could
+    // create the Competitive match, leaving an orphaned legacy row behind and no rating. Capture
+    // the id here instead of depending on the procedure: remember the highest id before the call
+    // and take the newest row above it, in the same batch. @@IDENTITY is not an option because
+    // MultiMatch carries an AFTER INSERT trigger.
     const result = await executeQuery(
-        'exec reportScore2 @gametype, @p1, @p2, @p5, @p6, @score, null, @c, @serverid, @d1, @d2, @d5, @d6',
+        `DECLARE @previousMultiMatchId int = (SELECT ISNULL(MAX(ID), 0) FROM dbo.MultiMatch);
+         exec reportScore2 @gametype, @p1, @p2, @p5, @p6, @score, null, @c, @serverid, @d1, @d2, @d5, @d6;
+         SELECT TOP 1 ID AS Id
+         FROM dbo.MultiMatch
+         WHERE ID > @previousMultiMatchId AND GameType = @gametype
+         ORDER BY ID DESC;`,
         {
             gametype: getLegacyRatingGameType(command),
             p1: formatLegacyUser(team1p1),
@@ -124,7 +135,10 @@ async function reportScore2SQLV2(gametype, team1p1, team1p2, team2p1, team2p2, t
             d6: delt6
         }
     );
-    return result.recordset;
+    // Our SELECT is the last statement of the batch. The procedure emits no rows today, so this
+    // is also the first recordset, but take the last one explicitly rather than depend on that.
+    const recordsets = Array.isArray(result.recordsets) ? result.recordsets : [];
+    return recordsets.length > 1 ? recordsets[recordsets.length - 1] : result.recordset;
 }
 
 async function createCompletedManualRatedMatch({

@@ -200,6 +200,36 @@ describe('manual report service', () => {
         }));
     });
 
+    it('reads the new MultiMatch id itself instead of trusting dbo.ReportScore2 to return it', async () => {
+        // Production bug: dbo.ReportScore2 inserts the row but returns no result set, unlike
+        // dbo.ReportScore. extractLegacyId() got null and every 2v2 report aborted before the
+        // Competitive write - 8 orphaned legacy rows and 0 rated 2v2 matches in Burst 2026, while
+        // 1v1 completed 141 times. The suite missed it because the mock hands back an Id for any
+        // query mentioning reportScore2, which the real procedure never does.
+        await manualReport.recordManualReport2v2({
+            interaction: createInteraction(),
+            team1p1: { id: '111', username: 'One' },
+            team1p2: { id: '222', username: 'Two' },
+            team2p1: { id: '333', username: 'Three' },
+            team2p2: { id: '444', username: 'Four' },
+            team1Wins: 2,
+            team2Wins: 0,
+            gametype: 'MSBL',
+            guildid: 'guild-1'
+        });
+
+        const [query] = mockExecuteQuery.mock.calls.find(([sql]) => sql.includes('exec reportScore2'));
+
+        // The id comes from our own SELECT in the same batch, not from the procedure.
+        expect(query).toMatch(/SELECT ISNULL\(MAX\(ID\), 0\) FROM dbo\.MultiMatch/);
+        expect(query).toMatch(/SELECT TOP 1 ID AS Id/);
+        expect(query).toMatch(/WHERE ID > @previousMultiMatchId AND GameType = @gametype/);
+
+        // MultiMatch has an AFTER INSERT trigger, so @@IDENTITY would be unreliable here.
+        expect(query).not.toMatch(/@@IDENTITY/);
+        expect(query).not.toMatch(/SCOPE_IDENTITY/);
+    });
+
     it('builds short stable manual match codes that fit the current RatedMatch schema', () => {
         const singlesCode = manualReport._private.buildManualMatchCode({ legacyMatchId: 1234567890 });
         const doublesCode = manualReport._private.buildManualMatchCode({ legacyMultiMatchId: 2234567890 });
