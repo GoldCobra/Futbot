@@ -260,4 +260,57 @@ describe('competitiveRatedQueue internal modules', () => {
             await fs.rm(runtimeDir, { recursive: true, force: true });
         }
     });
+
+    it('round-trips cancel votes and defaults them for state written before the feature', async () => {
+        const previousRuntimeDir = process.env.FUTBOT_RUNTIME_DIR;
+        const previousRuntimeTestFlag = process.env.FUTBOT_RUNTIME_STATE_TEST;
+        const runtimeDir = await fs.mkdtemp(path.join(os.tmpdir(), 'futbot-runtime-'));
+        process.env.FUTBOT_RUNTIME_DIR = runtimeDir;
+        process.env.FUTBOT_RUNTIME_STATE_TEST = '1';
+
+        try {
+            await runtimeState.saveCompetitiveRatedRuntimeState({
+                activeMatches: [
+                    {
+                        id: 'match-voted',
+                        threadId: 'thread-1',
+                        teams: [{ memberIds: ['home-user'] }, { memberIds: ['away-user'] }],
+                        stage: 'awaiting_start',
+                        cancelVoteUserIds: ['home-user'],
+                        cancelVoteMessageId: 'thread-message-9',
+                        cancelVoteGameNumber: 1
+                    },
+                    {
+                        // Written before the cancel vote shipped - must hydrate, not crash.
+                        id: 'match-legacy',
+                        threadId: 'thread-2',
+                        teams: [{ memberIds: ['home-user'] }, { memberIds: ['away-user'] }],
+                        stage: 'awaiting_start'
+                    }
+                ]
+            });
+
+            const loaded = await runtimeState.loadCompetitiveRatedRuntimeState();
+            const voted = loaded.activeMatches.find(match => match.id === 'match-voted');
+            const legacy = loaded.activeMatches.find(match => match.id === 'match-legacy');
+
+            expect(voted.cancelVoteUserIds).toEqual(['home-user']);
+            expect(voted.cancelVoteMessageId).toBe('thread-message-9');
+            expect(voted.cancelVoteGameNumber).toBe(1);
+            expect(legacy.cancelVoteUserIds).toEqual([]);
+            expect(legacy.cancelVoteGameNumber).toBeNull();
+        } finally {
+            if (previousRuntimeDir === undefined) {
+                delete process.env.FUTBOT_RUNTIME_DIR;
+            } else {
+                process.env.FUTBOT_RUNTIME_DIR = previousRuntimeDir;
+            }
+            if (previousRuntimeTestFlag === undefined) {
+                delete process.env.FUTBOT_RUNTIME_STATE_TEST;
+            } else {
+                process.env.FUTBOT_RUNTIME_STATE_TEST = previousRuntimeTestFlag;
+            }
+            await fs.rm(runtimeDir, { recursive: true, force: true });
+        }
+    });
 });

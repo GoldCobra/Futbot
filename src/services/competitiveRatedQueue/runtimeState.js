@@ -56,6 +56,10 @@ function hydrateMatch(raw) {
         privatePromptHandles: {},
         participantIdByDiscordId: new Map(raw.participantIdByDiscordId ?? []),
         startClickedUserIds: Array.isArray(raw.startClickedUserIds) ? raw.startClickedUserIds : [],
+        // Cancel votes survive a restart on purpose: players who already agreed should not have
+        // to vote again. Defaulted here so runtime files written before this field hydrate cleanly.
+        cancelVoteUserIds: Array.isArray(raw.cancelVoteUserIds) ? raw.cancelVoteUserIds : [],
+        cancelVoteGameNumber: raw.cancelVoteGameNumber ?? null,
         // No private ephemeral prompt survives a restart, so no selection can be considered
         // "delivered" — force the flags false so the watchdog re-offers the neutral open button
         // (never the options) for any still-pending, engaged side. Older persisted blocks that

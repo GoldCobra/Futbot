@@ -44,6 +44,14 @@ function rematchCustomId(matchId) {
     return `${CONFIG.PREFIX}:match:rematch:${matchId}`;
 }
 
+// Match-level cancel vote. Deliberately NOT under ':search:cancel:' - that id cancels a queue
+// search and is matched first in handleInteraction. The trailing token lands in parts[5], which is
+// what parseActionTokenFromCustomId returns for any match action outside its special-case list, so
+// no parser change is needed here.
+function cancelMatchCustomId(matchId, gameNumber = null) {
+    return joinParts([CONFIG.PREFIX, 'match', 'cancel', matchId, gameNumber]);
+}
+
 function startSetupCustomId(matchId, gameNumber = null) {
     return joinParts([CONFIG.PREFIX, 'match', 'start', matchId, gameNumber]);
 }
@@ -99,6 +107,7 @@ function actionTokenMatches(customId, expectedToken) {
 
 module.exports = {
     actionTokenMatches,
+    cancelMatchCustomId,
     cancelSearchCustomId,
     captainButtonCustomId,
     extendSearchCustomId,

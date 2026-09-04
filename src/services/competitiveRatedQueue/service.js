@@ -51,6 +51,7 @@ const {
     STADIUM_DISPLAY_OVERRIDES
 } = require('./constants');
 const {
+    cancelMatchCustomId,
     cancelSearchCustomId,
     captainButtonCustomId,
     extendSearchCustomId,
@@ -270,6 +271,8 @@ async function ignoreMatchInteraction(interaction, match, event, reason, extra =
     await silentlyAcknowledgeInteraction(interaction, acknowledgeOptions);
 }
 
+const CANCEL_VOTE_PERMISSION_MESSAGE = 'Only the players in this match can cancel it.';
+const CANCEL_VOTE_COMPLETE_MESSAGE = 'Everyone agreed. Cancelling the match...';
 const SEASON_UNAVAILABLE_MESSAGE = 'Season ended. New Season will start soon.';
 const QUEUE_JOIN_SEASON_UNAVAILABLE_MESSAGE = 'Season has not started yet. Rated matches open soon.';
 function buildExtendButtons(search) {
@@ -835,7 +838,14 @@ function buildStartButton(matchId, gameNumber = 1) {
         new ButtonBuilder()
             .setCustomId(startSetupCustomId(matchId, gameNumber))
             .setLabel('Start Match')
-            .setStyle(ButtonStyle.Primary)
+            .setStyle(ButtonStyle.Primary),
+        // Appended AFTER Start deliberately: the test helpers read components[0] of this row to
+        // find the Start button. Secondary, not Danger, because the vote is reversible and must
+        // not read louder than the primary action.
+        new ButtonBuilder()
+            .setCustomId(cancelMatchCustomId(matchId, gameNumber))
+            .setLabel('Cancel Match')
+            .setStyle(ButtonStyle.Secondary)
     );
 }
 
@@ -1026,7 +1036,7 @@ function buildCaptainButtonRows(match, options) {
 }
 
 function buildMatchComponents(match, options) {
-    if (match.stage === 'complete') {
+    if (match.stage === 'complete' || match.stage === 'cancelled') {
         return [];
     }
 
@@ -1044,6 +1054,17 @@ function buildMatchComponents(match, options) {
                 .setLabel('Confirm Game Loss')
                 .setStyle(ButtonStyle.Danger)
         );
+        // MSBL skips the start gate entirely (requiresSetup covers MSC/SMS only), so the game
+        // control is its only place to bail out early. MSC and SMS keep the button on the start
+        // control instead - see buildStartButton.
+        if (!requiresSetup(match.gameType)) {
+            row.addComponents(
+                new ButtonBuilder()
+                    .setCustomId(cancelMatchCustomId(match.id, getMatchActionToken(match, gameNumber)))
+                    .setLabel('Cancel Match')
+                    .setStyle(ButtonStyle.Secondary)
+            );
+        }
         return [row];
     }
 
@@ -1862,6 +1883,10 @@ async function createCompetitiveRatedMatch(panelConfig, searches, client, {
         loserAdvantagePromptShown: false,
         rulesImageMessageId: null,
         startClickedUserIds: [],
+        // Plain arrays/ids so serializeMatch persists them with no extra mapping.
+        cancelVoteUserIds: [],
+        cancelVoteMessageId: null,
+        cancelVoteGameNumber: null,
         gameBlocks: [],
         controlMessageId: null,
         controlVersion: 0,
@@ -2453,33 +2478,53 @@ async function clearMatchNotifications(match) {
     }
 }
 
-async function cancelMatchForInactivity(match, phase, client) {
+// The one place a live match is torn down. The step order is load-bearing and is kept exactly as
+// it was when this lived in cancelMatchForInactivity: setting stage='cancelled' is what makes the
+// terminal guards in updateMatchControlMessage/postWinnerControl/reconcileActiveMatchControl no-op
+// for workers that were already queued. Pass cancelReason: null when the DB row is already
+// cancelled elsewhere (season end).
+async function cancelMatch(match, client, {
+    cancelReason = null,
+    reasonMessage,
+    closeReason,
+    renameReason,
+    source,
+    logEvent = 'match.cancelled',
+    logDetails = {}
+}) {
     clearMatchTimers(match);
-    const cancelMessage = renderInactivityCancelMessage(match, phase);
     const thread = await client.channels.fetch(match.threadId).catch(() => null);
-    logRatedWarn(client, match, 'match.cancelled', getMatchLogDetails(match, {
-        reason: 'inactivity',
-        phase
-    }));
+    logRatedWarn(client, match, logEvent, getMatchLogDetails(match, logDetails));
 
     match.stage = 'cancelled';
-    if (match.ratedMatchId) {
-        ratedMatchDao.cancelMatch({ matchCode: match.id, cancelReason: `inactivity_${phase}` })
+    if (cancelReason && match.ratedMatchId) {
+        ratedMatchDao.cancelMatch({ matchCode: match.id, cancelReason })
             .catch(err => logRatedError(client, match, 'rated_match.cancel_failed', err, getMatchLogDetails(match)));
     }
     if (thread?.send) {
         await clearCurrentSetupComponents(match, thread);
     }
-    await clearCurrentControlMessage(match, client, cancelMessage, thread);
+    await clearCurrentControlMessage(match, client, reasonMessage, thread);
     await postTerminalThreadNotice(thread, match, client, renderMatchCancelledNoticeMessage(), [], 'match.cancel_notice_failed');
     await clearMatchNotifications(match);
     removeMatchFromState(match);
     await finalizeThreadLifecycle(match, client, {
         prefix: CANCELLED_THREAD_PREFIX,
+        closeReason,
+        renameReason,
+        result: 'cancelled',
+        source
+    });
+}
+
+async function cancelMatchForInactivity(match, phase, client) {
+    await cancelMatch(match, client, {
+        cancelReason: `inactivity_${phase}`,
+        reasonMessage: renderInactivityCancelMessage(match, phase),
         closeReason: `${match.gameType} competitive match inactivity timeout`,
         renameReason: `${match.gameType} competitive match inactivity rename`,
-        result: 'cancelled',
-        source: 'cancel_inactivity'
+        source: 'cancel_inactivity',
+        logDetails: { reason: 'inactivity', phase }
     });
 }
 
@@ -2487,27 +2532,56 @@ function renderMatchCancelledNoticeMessage() {
     return quoteThreadLines(`${BL_X_EMOJI} **MATCH CANCELLED.**`);
 }
 
-async function cancelInMemoryMatchForSeasonEnd(match, client) {
-    clearMatchTimers(match);
-    const thread = await client.channels.fetch(match.threadId).catch(() => null);
-    logRatedWarn(client, match, 'match.season_end_cancelled', getMatchLogDetails(match, {
-        reason: 'season_end_cancelled'
-    }));
+function getMatchMemberIds(match) {
+    return (match?.teams ?? []).flatMap(team => team.memberIds ?? []);
+}
 
-    match.stage = 'cancelled';
-    if (thread?.send) {
-        await clearCurrentSetupComponents(match, thread);
+// The cancel vote is scoped to the game currently on screen: a vote left over from game 1 must not
+// combine with a vote from game 3 into a cancel nobody wants any more. Returns the now-orphaned
+// tally message id when the scope moved on, so the caller can clear it out of the thread.
+function resetCancelVotesOnGameChange(match, gameNumber) {
+    if (match.cancelVoteGameNumber === gameNumber) {
+        return null;
     }
-    await clearCurrentControlMessage(match, client, renderSeasonEndCancelMessage(), thread);
-    await postTerminalThreadNotice(thread, match, client, renderMatchCancelledNoticeMessage(), [], 'match.cancel_notice_failed');
-    await clearMatchNotifications(match);
-    removeMatchFromState(match);
-    await finalizeThreadLifecycle(match, client, {
-        prefix: CANCELLED_THREAD_PREFIX,
+
+    const staleMessageId = match.cancelVoteMessageId;
+    match.cancelVoteGameNumber = gameNumber;
+    match.cancelVoteUserIds = [];
+    match.cancelVoteMessageId = null;
+    return staleMessageId;
+}
+
+function renderCancelVoteStatusMessage(match) {
+    const memberIds = getMatchMemberIds(match);
+    const votedIds = match.cancelVoteUserIds ?? [];
+    const pendingMentions = memberIds
+        .filter(memberId => !votedIds.includes(memberId))
+        .map(memberId => `<@${memberId}>`);
+
+    return quoteThreadBlock(
+        `${BL_TIME_EMOJI} **CANCEL MATCH: ${votedIds.length}/${memberIds.length} AGREED.**\n` +
+        `Still waiting for ${pendingMentions.join(', ')}.\n` +
+        'The match only ends once everyone agrees. Press **Cancel Match** again to take your vote back.'
+    );
+}
+
+function renderPlayerVoteCancelMessage(match) {
+    return quoteThreadBlock(
+        `All ${getMatchMemberIds(match).length} players agreed to cancel.\n` +
+        "The match was ended early at the players' request."
+    );
+}
+
+async function cancelInMemoryMatchForSeasonEnd(match, client) {
+    // The season finalization transaction already flipped the DB row, so no cancelReason here.
+    await cancelMatch(match, client, {
+        cancelReason: null,
+        reasonMessage: renderSeasonEndCancelMessage(),
         closeReason: `${match.gameType} competitive match cancelled by season end`,
         renameReason: `${match.gameType} competitive match season-end rename`,
-        result: 'cancelled',
-        source: 'season_end'
+        source: 'season_end',
+        logEvent: 'match.season_end_cancelled',
+        logDetails: { reason: 'season_end_cancelled' }
     });
 }
 
@@ -3926,6 +4000,100 @@ async function handleStartSetupButton(interaction, match) {
     });
 }
 
+// Cancelling is unanimous by design - a single vote never ends a match. Membership is checked
+// against every team member rather than the reps, because in 2v2 the teammates have to be able to
+// agree as well; that is deliberately a wider gate than "Start Match", which stays rep-only.
+async function handleCancelMatchButton(interaction, match) {
+    if (match.stage === 'complete' || match.stage === 'cancelled') {
+        await ignoreMatchInteraction(interaction, match, 'match.cancel_vote_ignored', 'terminal_stage', {}, { deleteReply: true });
+        return;
+    }
+
+    // MSC and SMS carry the button on the start gate, MSBL on the game control - it has no gate.
+    const expectedStage = requiresSetup(match.gameType) ? 'awaiting_start' : 'awaiting_winner';
+    if (!hasExpectedMatchStageAndToken(match, interaction, expectedStage)) {
+        await ignoreMatchInteraction(interaction, match, 'match.cancel_vote_ignored', 'stale_or_wrong_stage', {}, { deleteReply: true });
+        return;
+    }
+
+    const memberIds = getMatchMemberIds(match);
+    if (!memberIds.includes(interaction.user.id)) {
+        await safeReply(interaction, { content: CANCEL_VOTE_PERMISSION_MESSAGE, ephemeral: true });
+        return;
+    }
+
+    const gameNumber = getNextGameNumber(match);
+    const staleVoteMessageId = resetCancelVotesOnGameChange(match, gameNumber);
+    const withdrawn = match.cancelVoteUserIds.includes(interaction.user.id);
+    match.cancelVoteUserIds = withdrawn
+        ? match.cancelVoteUserIds.filter(userId => userId !== interaction.user.id)
+        : [...match.cancelVoteUserIds, interaction.user.id];
+
+    const voteCount = match.cancelVoteUserIds.length;
+    logRatedInfo(interaction.client, match, 'match.cancel_vote', getMatchLogDetails(match, {
+        user: interaction.user.id,
+        withdrawn,
+        votes: voteCount,
+        required: memberIds.length,
+        game: gameNumber
+    }));
+
+    if (voteCount >= memberIds.length) {
+        // Cancel directly instead of going through cancelMatchIfTimedOut: this handler already
+        // holds match:<id> and withOperationQueue is not reentrant.
+        const thread = await interaction.client.channels.fetch(match.threadId).catch(() => null);
+        await deleteThreadMessage(thread, staleVoteMessageId);
+        await deleteThreadMessage(thread, match.cancelVoteMessageId);
+        match.cancelVoteMessageId = null;
+        await safeReply(interaction, { content: CANCEL_VOTE_COMPLETE_MESSAGE, ephemeral: true });
+        await cancelMatch(match, interaction.client, {
+            cancelReason: 'player_vote',
+            reasonMessage: renderPlayerVoteCancelMessage(match),
+            closeReason: `${match.gameType} competitive match cancelled by players`,
+            renameReason: `${match.gameType} competitive match player cancel rename`,
+            source: 'player_vote',
+            logDetails: { reason: 'player_vote', votes: voteCount, game: gameNumber }
+        });
+        return;
+    }
+
+    await safeReply(interaction, {
+        content: withdrawn
+            ? `Cancel vote withdrawn. ${voteCount}/${memberIds.length} still want to cancel.`
+            : `Cancel vote recorded: ${voteCount}/${memberIds.length}. The match ends once everyone agrees.`,
+        ephemeral: true
+    });
+
+    // Own thread message, never the start or control message: those are watchdog-managed and an
+    // edit here would fight the controlVersion tokens.
+    queueMatchOutput(match, interaction.client, 'render_cancel_vote_status', async () => {
+        if (match.stage === 'complete' || match.stage === 'cancelled') {
+            return;
+        }
+
+        const thread = await interaction.client.channels.fetch(match.threadId).catch(() => null);
+        if (!thread?.send) {
+            return;
+        }
+
+        await deleteThreadMessage(thread, staleVoteMessageId);
+        if (!match.cancelVoteUserIds.length) {
+            await deleteThreadMessage(thread, match.cancelVoteMessageId);
+            match.cancelVoteMessageId = null;
+            return;
+        }
+
+        const statusMessage = await editOrSendThreadMessage(thread, match.cancelVoteMessageId, {
+            content: renderCancelVoteStatusMessage(match)
+        });
+        match.cancelVoteMessageId = statusMessage?.id ?? null;
+    }, {
+        source: 'cancel_vote',
+        game: gameNumber,
+        votes: voteCount
+    });
+}
+
 // Handles a click on the neutral rep-gated "Choose Stadium/Captain" button. It opens the actual
 // options as a fresh private ephemeral (the immediate ack reply is edited into the options), so
 // the choice is never shown to anyone but the correct rep.
@@ -4750,6 +4918,10 @@ async function handleMatchInteraction(interaction) {
         transition: async () => {
             if (interaction.customId.includes(':match:start:')) {
                 await handleStartSetupButton(interaction, match);
+                return true;
+            }
+            if (interaction.customId.includes(':match:cancel:')) {
+                await handleCancelMatchButton(interaction, match);
                 return true;
             }
             if (interaction.customId.includes(':match:openpick:')) {

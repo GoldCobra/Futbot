@@ -776,6 +776,9 @@ function createMatchFixture(overrides = {}) {
         selectedCaptain: null,
         rulesImageMessageId: null,
         startClickedUserIds: [],
+        cancelVoteUserIds: [],
+        cancelVoteMessageId: null,
+        cancelVoteGameNumber: null,
         gameBlocks: [],
         controlMessageId: null,
         pendingResultGameNumber: null,
@@ -5235,5 +5238,237 @@ describe('competitiveRatedQueue', () => {
         expect(expiredCall[0].flags).toBe(MessageFlags.Ephemeral);
         expect(publicExpiredCall).toBeUndefined();
         expect(competitiveRatedQueue.__getStateSnapshot().activeSearchCount).toBe(0);
+    });
+
+    describe('Cancel Match vote', () => {
+        const CANCEL_CUSTOM_ID = 'rated:competitive:match:cancel:match-1:1';
+
+        function createDoublesTeams() {
+            const member = (id, username) => ({
+                id,
+                mention: `<@${id}>`,
+                username,
+                ratingProfile: { elo: 1000, doublesElo: 1000 }
+            });
+            return [
+                {
+                    repUserId: 'home-rep',
+                    repMention: '<@home-rep>',
+                    memberIds: ['home-rep', 'home-mate'],
+                    members: [member('home-rep', 'Home Rep'), member('home-mate', 'Home Mate')]
+                },
+                {
+                    repUserId: 'away-rep',
+                    repMention: '<@away-rep>',
+                    memberIds: ['away-rep', 'away-mate'],
+                    members: [member('away-rep', 'Away Rep'), member('away-mate', 'Away Mate')]
+                }
+            ];
+        }
+
+        async function clickCancel(client, userId, customId = CANCEL_CUSTOM_ID) {
+            const interaction = createButtonInteractionMock({ customId, userId, client });
+            await competitiveRatedQueue.handleInteraction(interaction);
+            await flushOutputQueues();
+            return interaction;
+        }
+
+        it('cancels a 1v1 only after both players have voted', async () => {
+            const { client, thread } = createMatchClientMock();
+            competitiveRatedQueue.__seedStateForTests({
+                activeMatches: [createMatchFixture({ stage: 'awaiting_start' })]
+            });
+
+            const firstVote = await clickCancel(client, 'home-user');
+
+            expect(firstVote.editReply.mock.calls.at(-1)[0].content).toContain('1/2');
+            expect(mockRatedMatchDao.cancelMatch).not.toHaveBeenCalled();
+            expect(competitiveRatedQueue.__getStateSnapshot().activeMatchCount).toBe(1);
+            expect(findThreadPayload(thread, payload => payload.content?.includes('CANCEL MATCH: 1/2 AGREED.')))
+                .toBeDefined();
+
+            await clickCancel(client, 'away-user');
+
+            expect(mockRatedMatchDao.cancelMatch)
+                .toHaveBeenCalledWith({ matchCode: 'match-1', cancelReason: 'player_vote' });
+            expect(findThreadPayload(thread, payload => payload.content?.includes('All 2 players agreed to cancel.')))
+                .toBeDefined();
+            expect(findThreadPayload(thread, payload => payload.content?.includes('**MATCH CANCELLED.**')))
+                .toBeDefined();
+            // A cancelled match must never show the "MATCH COMPLETE!" notice.
+            expect(findThreadPayload(thread, payload => payload.content?.includes('MATCH COMPLETE'))).toBeUndefined();
+            expect(thread.setName).toHaveBeenCalledWith('🚫 1v1 #1 | Home VS Away');
+            expect(thread.setLocked).toHaveBeenCalledWith(true, 'MSC competitive match cancelled by players');
+            expect(thread.setArchived).toHaveBeenCalledWith(true, 'MSC competitive match cancelled by players');
+            expectThreadRenameBeforeClose(thread);
+            expect(competitiveRatedQueue.__getStateSnapshot().activeMatchCount).toBe(0);
+        });
+
+        it('needs all four votes in a 2v2, teammates included', async () => {
+            const { client } = createMatchClientMock();
+            competitiveRatedQueue.__seedStateForTests({
+                activeMatches: [createMatchFixture({
+                    mode: '2v2',
+                    stage: 'awaiting_start',
+                    threadName: '2v2 #1 | Home VS Away',
+                    teams: createDoublesTeams(),
+                    participantIdByDiscordId: new Map([
+                        ['home-rep', 7000],
+                        ['home-mate', 7001],
+                        ['away-rep', 7002],
+                        ['away-mate', 7003]
+                    ])
+                })]
+            });
+
+            await clickCancel(client, 'home-rep');
+            await clickCancel(client, 'home-mate');
+            const thirdVote = await clickCancel(client, 'away-rep');
+
+            expect(thirdVote.editReply.mock.calls.at(-1)[0].content).toContain('3/4');
+            expect(mockRatedMatchDao.cancelMatch).not.toHaveBeenCalled();
+            expect(competitiveRatedQueue.__getStateSnapshot().activeMatchCount).toBe(1);
+
+            await clickCancel(client, 'away-mate');
+
+            expect(mockRatedMatchDao.cancelMatch)
+                .toHaveBeenCalledWith({ matchCode: 'match-1', cancelReason: 'player_vote' });
+            expect(competitiveRatedQueue.__getStateSnapshot().activeMatchCount).toBe(0);
+        });
+
+        it('lets a player take their vote back', async () => {
+            const { client, thread } = createMatchClientMock();
+            const match = createMatchFixture({ stage: 'awaiting_start' });
+            competitiveRatedQueue.__seedStateForTests({ activeMatches: [match] });
+
+            await clickCancel(client, 'home-user');
+            const withdrawal = await clickCancel(client, 'home-user');
+
+            expect(withdrawal.editReply.mock.calls.at(-1)[0].content).toContain('withdrawn');
+            expect(match.cancelVoteUserIds).toEqual([]);
+            expect(match.cancelVoteMessageId).toBeNull();
+
+            // The other player voting alone must not be enough after the withdrawal.
+            await clickCancel(client, 'away-user');
+
+            expect(mockRatedMatchDao.cancelMatch).not.toHaveBeenCalled();
+            expect(competitiveRatedQueue.__getStateSnapshot().activeMatchCount).toBe(1);
+            expect(findThreadPayload(thread, payload => payload.content?.includes('CANCEL MATCH: 1/2 AGREED.')))
+                .toBeDefined();
+        });
+
+        it('rejects a cancel vote from someone outside the match', async () => {
+            const { client } = createMatchClientMock();
+            const match = createMatchFixture({ stage: 'awaiting_start' });
+            competitiveRatedQueue.__seedStateForTests({ activeMatches: [match] });
+
+            const outsider = await clickCancel(client, 'random-user');
+
+            expect(outsider.editReply.mock.calls.at(-1)[0].content)
+                .toBe('Only the players in this match can cancel it.');
+            expect(match.cancelVoteUserIds).toEqual([]);
+            expect(competitiveRatedQueue.__getStateSnapshot().activeMatchCount).toBe(1);
+        });
+
+        it('drops a stale vote when the match has moved on to the next game', async () => {
+            const { client } = createMatchClientMock();
+            const match = createMatchFixture({
+                gameType: 'MSBL',
+                stage: 'awaiting_winner',
+                score: { team1: 1, team2: 0 },
+                cancelVoteUserIds: ['home-user'],
+                cancelVoteGameNumber: 1
+            });
+            competitiveRatedQueue.__seedStateForTests({ activeMatches: [match] });
+
+            const voteInGameTwo = await clickCancel(client, 'away-user', 'rated:competitive:match:cancel:match-1:2');
+
+            expect(voteInGameTwo.editReply.mock.calls.at(-1)[0].content).toContain('1/2');
+            expect(match.cancelVoteUserIds).toEqual(['away-user']);
+            expect(mockRatedMatchDao.cancelMatch).not.toHaveBeenCalled();
+            expect(competitiveRatedQueue.__getStateSnapshot().activeMatchCount).toBe(1);
+        });
+
+        it('ignores a cancel click on MSC once the match has left the start gate', async () => {
+            const { client } = createMatchClientMock();
+            const match = createMatchFixture({ stage: 'awaiting_winner' });
+            competitiveRatedQueue.__seedStateForTests({ activeMatches: [match] });
+
+            const lateClick = await clickCancel(client, 'home-user');
+
+            expect(lateClick.deleteReply).toHaveBeenCalled();
+            expect(match.cancelVoteUserIds).toEqual([]);
+            expect(competitiveRatedQueue.__getStateSnapshot().activeMatchCount).toBe(1);
+        });
+
+        it('puts the button next to Start Match for MSC', async () => {
+            const randomSpy = jest.spyOn(Math, 'random').mockReturnValue(0.9);
+            try {
+                competitiveRatedQueue.__seedStateForTests({
+                    cachedOptionsByGameType: { MSC: createMatchOptions() }
+                });
+                const { channel, client, thread } = createMatchClientMock();
+                const searches = [
+                    createCompetitiveRatedSearch({ id: 'search-1', userId: 'home-user', username: 'Home', createdAt: 1 }),
+                    createCompetitiveRatedSearch({ id: 'search-2', userId: 'away-user', username: 'Away', createdAt: 2 })
+                ];
+
+                await competitiveRatedQueue.__createCompetitiveRatedMatchForTests(
+                    { channelId: channel.id, gameType: 'MSC' },
+                    searches,
+                    client,
+                    { skipReconcile: true }
+                );
+
+                const setupPayload = findThreadPayload(thread, payload =>
+                    getButtonComponents(payload).some(component => component.label === 'Start Match')
+                );
+                expect(getButtonCustomIdByLabel(setupPayload, 'Cancel Match')).toContain(':match:cancel:');
+                // Start must stay first - the helpers all read components[0] of that row.
+                expect(getFirstButtonCustomId(setupPayload)).toContain(':match:start:');
+            } finally {
+                randomSpy.mockRestore();
+            }
+        });
+
+        it('puts the button on the MSBL game control, which has no start gate', async () => {
+            const { channel, client, thread } = createMatchClientMock();
+            const searches = [
+                createCompetitiveRatedSearch({ id: 'search-1', userId: 'home-user', username: 'Home', createdAt: 1, gameType: 'MSBL' }),
+                createCompetitiveRatedSearch({ id: 'search-2', userId: 'away-user', username: 'Away', createdAt: 2, gameType: 'MSBL' })
+            ];
+
+            await competitiveRatedQueue.__createCompetitiveRatedMatchForTests(
+                { channelId: channel.id, gameType: 'MSBL' },
+                searches,
+                client,
+                { skipReconcile: true }
+            );
+
+            const controlPayload = findThreadPayload(thread, payload =>
+                getButtonComponents(payload).some(component => component.label === 'GAME WIN')
+            );
+            expect(getButtonCustomIdByLabel(controlPayload, 'Cancel Match')).toContain(':match:cancel:');
+        });
+
+        it('keeps the button off the MSC game control', async () => {
+            const { client, thread } = createMatchClientMock();
+            competitiveRatedQueue.__seedStateForTests({
+                activeMatches: [createMatchFixture({ firstTo: 1, stage: 'awaiting_winner' })]
+            });
+
+            const winInteraction = createButtonInteractionMock({
+                customId: 'rated:competitive:match:winner:match-1',
+                userId: 'home-user',
+                client
+            });
+            await competitiveRatedQueue.handleInteraction(winInteraction);
+            await flushOutputQueues();
+
+            const confirmPayload = findThreadPayload(thread, payload =>
+                getButtonComponents(payload).some(component => component.label === 'Confirm Game Loss')
+            );
+            expect(getButtonCustomIdByLabel(confirmPayload, 'Cancel Match')).toBeUndefined();
+        });
     });
 });

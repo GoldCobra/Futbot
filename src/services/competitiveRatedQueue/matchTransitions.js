@@ -11,11 +11,16 @@ function getMatchActionAckPayload(matchAction) {
     if (matchAction === 'openpick') {
         return { content: 'Opening your pick...', components: [] };
     }
+    if (matchAction === 'cancel') {
+        return { content: 'Recording your cancel vote...', components: [] };
+    }
     return null;
 }
 
 async function acknowledgeMatchAction(interaction, matchAction, ensureImmediateReply, ensureDeferredUpdate) {
-    if (['start', 'winner', 'loser_confirm', 'openpick'].includes(matchAction)) {
+    // 'cancel' replies immediately so the voter gets a private tally back; everything else keeps
+    // the silent deferUpdate.
+    if (['start', 'winner', 'loser_confirm', 'openpick', 'cancel'].includes(matchAction)) {
         return await ensureImmediateReply(interaction, getMatchActionAckPayload(matchAction));
     }
 
