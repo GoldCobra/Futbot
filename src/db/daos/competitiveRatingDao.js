@@ -2086,7 +2086,31 @@ class CompetitiveRatingDao {
         return this._applySeasonRewardProgressForChanges(transaction, changes.recordset, thresholds, { writeFinalEarned });
     }
 
-    async _rebuildRatingPartition(transaction, { seasonId, gameId, mode, calculateDelta, writeFinalRewards = false }) {
+    // A rebuild rewrites MatchWins/MatchLosses for an entire partition, and the Player.Activity
+    // trigger reads a changed match counter as "this player just played". Without this, rolling
+    // back a single match would mark every player of that season+game+mode as active.
+    //
+    // The reset belongs in a finally, not after the work: sp_set_session_context is NOT undone by
+    // a rollback, and the connection goes straight back into the pool - a leaked flag would
+    // silently disable activity stamping for everything that runs on it afterwards. Same shape as
+    // the SoftResetElos proc, which clears the key in both its TRY and its CATCH.
+    async _withoutPlayerActivityStamp(transaction, work) {
+        await runRequest(transaction, `EXEC sys.sp_set_session_context @key = N'SkipPlayerActivity', @value = 1;`);
+        try {
+            return await work();
+        } finally {
+            await runRequest(transaction, `EXEC sys.sp_set_session_context @key = N'SkipPlayerActivity', @value = NULL;`);
+        }
+    }
+
+    async _rebuildRatingPartition(transaction, options) {
+        return await this._withoutPlayerActivityStamp(
+            transaction,
+            () => this._rebuildRatingPartitionCore(transaction, options)
+        );
+    }
+
+    async _rebuildRatingPartitionCore(transaction, { seasonId, gameId, mode, calculateDelta, writeFinalRewards = false }) {
         const defaultRating = await this.getDefaultRating(transaction);
         const thresholdsResult = await runRequest(
             transaction,
