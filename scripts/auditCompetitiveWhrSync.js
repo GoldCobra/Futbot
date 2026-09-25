@@ -39,6 +39,37 @@ async function main() {
         ORDER BY WhrRunnerStatus
     `);
 
+    // Legacy WHR freshness: every (player, day) with a counted 1v1 result needs exactly one history row.
+    const whrFreshness = await executeQuery(`
+        WITH resultDays AS (
+            SELECT GameType, Player1 AS Player, CAST(MatchDate AS date) AS MatchDay
+            FROM dbo.Match WHERE FutureMatch = 0 AND P1Wins + P1Losses > 0
+            UNION
+            SELECT GameType, Player2, CAST(MatchDate AS date)
+            FROM dbo.Match WHERE FutureMatch = 0 AND P1Wins + P1Losses > 0
+        ),
+        historyDays AS (
+            SELECT GameType, Player, CAST(MatchDate AS date) AS MatchDay FROM dbo.WhrRatingHistory
+        )
+        SELECT games.GameType,
+               (SELECT MAX(MatchDay) FROM resultDays r WHERE r.GameType = games.GameType) AS LastResultDay,
+               (SELECT MAX(MatchDay) FROM historyDays h WHERE h.GameType = games.GameType) AS LastWhrDay,
+               (SELECT COUNT(*) FROM resultDays r WHERE r.GameType = games.GameType
+                   AND NOT EXISTS (SELECT 1 FROM historyDays h WHERE h.GameType = r.GameType AND h.Player = r.Player AND h.MatchDay = r.MatchDay)) AS ResultDaysWithoutWhr,
+               (SELECT COUNT(*) FROM historyDays h WHERE h.GameType = games.GameType
+                   AND NOT EXISTS (SELECT 1 FROM resultDays r WHERE r.GameType = h.GameType AND r.Player = h.Player AND r.MatchDay = h.MatchDay)) AS WhrDaysWithoutResult
+        FROM (SELECT DISTINCT GameType FROM dbo.Match) games
+        ORDER BY games.GameType
+    `);
+
+    const legacyStatsPending = await executeQuery(`
+        SELECT ModeCode, COUNT(*) AS [Count]
+        FROM ${q('CompetitiveWhrSync')}
+        WHERE SyncStatus = 'synced'
+          AND LegacyStatsAppliedAtUtc IS NULL
+        GROUP BY ModeCode
+    `);
+
     const recentRows = await executeQuery(`
         SELECT TOP 20
             Id,
@@ -59,6 +90,8 @@ async function main() {
         summary: summary.recordset,
         syncStatuses: syncStatuses.recordset,
         runnerStatuses: runnerStatuses.recordset,
+        whrFreshness: whrFreshness.recordset,
+        legacyStatsPending: legacyStatsPending.recordset,
         recentRows: recentRows.recordset
     }, null, 2));
 }

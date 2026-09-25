@@ -23,6 +23,8 @@
     "db:rebuild:competitive-season-awards": "node scripts/rebuildCompetitiveSeasonAwards.js",
     "db:reset:competitive-live-test": "node scripts/resetCompetitiveLiveTestData.js",
     "whr:status": "node scripts/auditCompetitiveWhrSync.js",
+    "whr:recalc": "node scripts/recalculateLegacyWhr.js",
+    "whr:complete-results": "node scripts/completeLegacyResults.js",
     "test": "jest --runInBand"
   },
   "dependencies": {

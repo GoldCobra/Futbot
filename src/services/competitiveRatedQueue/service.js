@@ -4226,15 +4226,42 @@ async function handleAutomaticSeasonTransitions(client) {
     return result;
 }
 
-async function recoverPendingCompetitiveWhrRunner(client, event) {
+function summarizeWhrGame(game) {
+    const written = game.historyInserted + game.historyUpdated + game.historyDeleted + game.ratingsUpdated;
+    return `${game.gameType}:${game.reason}:matches=${game.matches}:players=${game.players}:written=${written}:sync=${game.syncRows}:${game.durationMs}ms`;
+}
+
+async function recoverPendingCompetitiveWhrRunner(client) {
     const result = await runPendingCompetitiveWhrRunner?.();
-    if (result?.updatedRows > 0) {
-        logRatedWarn(client, { all: true }, event, {
-            rows: result.updatedRows,
-            partitions: result.partitions?.map(partition => `${partition.gameId}:${partition.mode}:${partition.count}`).join(',')
+    const changedGames = (result?.games ?? []).filter(game => (
+        game.historyInserted + game.historyUpdated + game.historyDeleted + game.ratingsUpdated + game.syncRows > 0
+    ));
+    const legacyStatsRows = result?.legacyStats?.stampedRows ?? 0;
+    if (changedGames.length || legacyStatsRows > 0 || result?.tstRows > 0) {
+        logRatedInfo(client, { all: true }, 'whr.recalc_complete', {
+            games: changedGames.map(summarizeWhrGame).join(',') || 'unchanged',
+            legacyStats: `${legacyStatsRows}:1v1=${result?.legacyStats?.countedSingles ?? 0}:2v2=${result?.legacyStats?.countedDoubles ?? 0}`,
+            tstRows: result?.tstRows ?? 0
         });
     }
     return result;
+}
+
+// The recalculation runs beside the match engine: ticks never wait for it, and at most one run is active.
+let competitiveWhrRunInFlight = null;
+
+function scheduleCompetitiveWhrRunner(client, failureEvent) {
+    if (!competitiveWhrRunInFlight) {
+        competitiveWhrRunInFlight = recoverPendingCompetitiveWhrRunner(client)
+            .catch(error => {
+                console.error(`[RatedQueue] WHR recalculation failed: ${error.message}`);
+                logRatedError(client, { all: true }, failureEvent, error);
+            })
+            .finally(() => {
+                competitiveWhrRunInFlight = null;
+            });
+    }
+    return competitiveWhrRunInFlight;
 }
 
 async function tick(client) {
@@ -4274,9 +4301,7 @@ async function tick(client) {
     await recoverPendingCompetitiveWhrSync?.().catch(error => {
         logRatedError(client, { all: true }, 'whr.sync_recovery_failed', error);
     });
-    await recoverPendingCompetitiveWhrRunner(client, 'whr.runner_not_configured').catch(error => {
-        logRatedError(client, { all: true }, 'whr.runner_recovery_failed', error);
-    });
+    scheduleCompetitiveWhrRunner(client, 'whr.runner_recovery_failed');
     await runPendingCompetitiveDbOps(client).catch(error => {
         logRatedError(client, { all: true }, 'competitive_db.pending_recovery_failed', error);
     });
@@ -4340,12 +4365,7 @@ async function ensureCompetitiveRatedQueue(client) {
         console.error(`[RatedQueue] WHR/TST sync recovery failed: ${err.message}`);
         logRatedError(client, { all: true }, 'whr.sync_recovery_initial_failed', err);
     }
-    try {
-        await recoverPendingCompetitiveWhrRunner(client, 'whr.runner_initial_not_configured');
-    } catch (err) {
-        console.error(`[RatedQueue] WHR/TST runner recovery failed: ${err.message}`);
-        logRatedError(client, { all: true }, 'whr.runner_recovery_initial_failed', err);
-    }
+    scheduleCompetitiveWhrRunner(client, 'whr.runner_recovery_initial_failed');
     try {
         await runPendingCompetitiveDbOps(client);
     } catch (err) {
@@ -4999,6 +5019,7 @@ function __resetState() {
     }
     resetRuntimePersist();
     runtimeStateRecovered = false;
+    competitiveWhrRunInFlight = null;
 
     for (const search of state.activeSearchesById.values()) {
         clearSearchTimers(search);

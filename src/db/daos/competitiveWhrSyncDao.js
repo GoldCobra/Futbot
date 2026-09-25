@@ -58,43 +58,52 @@ function normalizeSyncRow(row) {
         legacyMultiMatchId: row.LegacyMultiMatchId ?? null,
         whrRunnerStatus: row.WhrRunnerStatus,
         lastError: row.LastError ?? null,
-        attemptCount: toNumber(row.AttemptCount)
-    };
-}
-
-function normalizeRunnerPartition(row) {
-    if (!row) return null;
-    return {
-        gameId: row.GameId,
-        mode: row.ModeCode,
-        syncIds: row.syncIds ?? [],
-        count: toNumber(row.SyncCount)
-    };
-}
-
-function buildSyncIdPredicate(syncIds, inputs) {
-    const ids = [...new Set((syncIds ?? [])
-        .map(value => Number(value))
-        .filter(value => Number.isInteger(value) && value > 0))];
-
-    if (!ids.length) {
-        return { predicate: '1 = 0', inputs };
-    }
-
-    const placeholders = ids.map((id, index) => {
-        const key = `syncId${index}`;
-        inputs[key] = [sql.Int, id];
-        return `@${key}`;
-    });
-
-    return {
-        predicate: `Id IN (${placeholders.join(', ')})`,
-        inputs
+        attemptCount: toNumber(row.AttemptCount),
+        legacyStatsAppliedAtUtc: row.LegacyStatsAppliedAtUtc ?? null
     };
 }
 
 function truncateError(value) {
     return String(value?.message ?? value ?? 'Unknown WHR/TST runner failure').slice(0, 1000);
+}
+
+// Rows still waiting for a WHR recalculation. 'running' only counts once it is clearly abandoned.
+const STALE_RUNNING_MINUTES = 30;
+const RUNNER_BACKLOG_PREDICATE = `SyncStatus IN ('synced','rolled_back')
+               AND (
+                    WhrRunnerStatus IN ('pending_external_runner','failed','not_configured')
+                    OR (WhrRunnerStatus = 'running' AND LastAttemptAtUtc < DATEADD(minute, -${STALE_RUNNING_MINUTES}, SYSUTCDATETIME()))
+               )`;
+
+// Adds (sign 1) or removes (sign -1) match and game records per player, the way ReportScore/ReportScore2
+// count them. The legs query yields one row per player and result: GameType, Player, GamesWon, GamesLost.
+function buildStatsDeltaUpdate(legsQuery, { doubles = false, sign = 1 } = {}) {
+    const suffix = doubles ? '2v2' : '';
+    const columns = [
+        [`MatchWins${suffix}`, 'SUM(CASE WHEN GamesWon > GamesLost THEN 1 ELSE 0 END)'],
+        [`MatchLosses${suffix}`, 'SUM(CASE WHEN GamesWon < GamesLost THEN 1 ELSE 0 END)'],
+        [`MatchDraws${suffix}`, 'SUM(CASE WHEN GamesWon = GamesLost THEN 1 ELSE 0 END)'],
+        [`Wins${suffix}`, 'SUM(GamesWon)'],
+        [`Losses${suffix}`, 'SUM(GamesLost)']
+    ];
+    const aggregates = columns.map(([column, expression]) => `${expression} AS ${column}`).join(', ');
+    const assignments = columns.map(([column]) => (sign > 0
+        ? `${column} = ps.${column} + delta.${column}`
+        : `${column} = CASE WHEN ps.${column} < delta.${column} THEN 0 ELSE ps.${column} - delta.${column} END`
+    )).join(',\n                     ');
+
+    return `;WITH legs AS (${legsQuery}
+             ),
+             delta AS (
+                 SELECT GameType, Player, ${aggregates}
+                 FROM legs
+                 WHERE Player IS NOT NULL
+                 GROUP BY GameType, Player
+             )
+             UPDATE ps
+             SET ${assignments}
+             FROM dbo.PlayerStats ps
+             INNER JOIN delta ON delta.Player = ps.Player AND delta.GameType = ps.GameType;`;
 }
 
 class CompetitiveWhrSyncDao {
@@ -126,143 +135,231 @@ class CompetitiveWhrSyncDao {
         return results;
     }
 
-    async getPendingRunnerPartitions({ limit = 50, includeFailed = false, includeNotConfigured = false } = {}) {
-        const statuses = ['pending_external_runner'];
-        if (includeFailed) statuses.push('failed');
-        if (includeNotConfigured) statuses.push('not_configured');
-
-        const statusInputs = {};
-        const statusPlaceholders = statuses.map((status, index) => {
-            const key = `runnerStatus${index}`;
-            statusInputs[key] = [sql.VarChar(30), status];
-            return `@${key}`;
-        });
-
+    async getRunnerBacklogByGame({ mode = '1v1' } = {}) {
         const result = await executeQuery(
-            `SET TRANSACTION ISOLATION LEVEL READ COMMITTED;
-
-             SELECT TOP (@limit)
-                Id,
-                GameId,
-                ModeCode
-             FROM ${T.whrSync} WITH (READPAST)
-             WHERE SyncStatus IN ('synced','rolled_back')
-               AND WhrRunnerStatus IN (${statusPlaceholders.join(', ')})
-             ORDER BY UpdatedAtUtc ASC, Id ASC`,
-            {
-                limit: [sql.Int, limit],
-                ...statusInputs
-            }
+            `SELECT GameId, COUNT(*) AS BacklogCount
+             FROM ${T.whrSync}
+             WHERE ModeCode = @modeCode
+               AND ${RUNNER_BACKLOG_PREDICATE}
+             GROUP BY GameId`,
+            { modeCode: [sql.VarChar(10), mode] }
         );
-
-        const partitions = new Map();
-        for (const row of result.recordset) {
-            const key = `${row.GameId}:${row.ModeCode}`;
-            if (!partitions.has(key)) {
-                partitions.set(key, {
-                    GameId: row.GameId,
-                    ModeCode: row.ModeCode,
-                    syncIds: [],
-                    SyncCount: 0
-                });
-            }
-            const partition = partitions.get(key);
-            partition.syncIds.push(row.Id);
-            partition.SyncCount += 1;
-        }
-
-        return [...partitions.values()].map(normalizeRunnerPartition).filter(Boolean);
+        return new Map(result.recordset.map(row => [Number(row.GameId), toNumber(row.BacklogCount)]));
     }
 
-    async markRunnerRunning({ gameId, mode, syncIds }) {
-        return this._updateRunnerStatus({
+    async markGameRunnerRunning({ gameId, mode = '1v1' }) {
+        return this._updateGameRunnerStatus({
             gameId,
             mode,
-            syncIds,
-            whrRunnerStatus: 'running',
-            clearError: true,
-            expectedRunnerStatuses: ['pending_external_runner', 'failed', 'not_configured']
+            predicate: RUNNER_BACKLOG_PREDICATE,
+            set: `WhrRunnerStatus = 'running',
+                 AttemptCount = AttemptCount + 1,
+                 LastError = NULL`
         });
     }
 
-    async markRunnerComplete({ gameId, mode, syncIds }) {
-        return this._updateRunnerStatus({
+    async markGameRunnerComplete({ gameId, mode = '1v1' }) {
+        return this._updateGameRunnerStatus({
             gameId,
             mode,
-            syncIds,
-            whrRunnerStatus: 'complete',
-            clearError: true,
-            expectedRunnerStatuses: ['running']
+            predicate: `SyncStatus IN ('synced','rolled_back') AND WhrRunnerStatus = 'running'`,
+            set: `WhrRunnerStatus = 'complete',
+                 LastError = NULL`
         });
     }
 
-    async markRunnerFailed({ gameId, mode, syncIds, error }) {
-        return this._updateRunnerStatus({
+    async markGameRunnerFailed({ gameId, mode = '1v1', error }) {
+        return this._updateGameRunnerStatus({
             gameId,
             mode,
-            syncIds,
-            whrRunnerStatus: 'failed',
-            lastError: truncateError(error),
-            expectedRunnerStatuses: ['running', 'pending_external_runner']
+            predicate: `SyncStatus IN ('synced','rolled_back') AND WhrRunnerStatus = 'running'`,
+            set: `WhrRunnerStatus = 'failed',
+                 LastError = @lastError`,
+            inputs: { lastError: [sql.NVarChar(1000), truncateError(error)] }
         });
     }
 
-    async markRunnerNotConfigured({ gameId, mode, syncIds, reason }) {
-        return this._updateRunnerStatus({
-            gameId,
-            mode,
-            syncIds,
-            whrRunnerStatus: 'not_configured',
-            lastError: truncateError(reason),
-            expectedRunnerStatuses: ['pending_external_runner']
-        });
-    }
-
-    async _updateRunnerStatus({
-        gameId,
-        mode,
-        syncIds,
-        whrRunnerStatus,
-        lastError = null,
-        clearError = false,
-        expectedRunnerStatuses = []
-    }) {
-        const inputs = {
-            gameId: [sql.TinyInt, gameId],
-            modeCode: [sql.VarChar(10), mode],
-            whrRunnerStatus: [sql.VarChar(30), whrRunnerStatus],
-            lastError: [sql.NVarChar(1000), lastError]
-        };
-        const { predicate } = buildSyncIdPredicate(syncIds, inputs);
-        const expectedStatuses = [...new Set(expectedRunnerStatuses.filter(Boolean))];
-        const expectedStatusClause = expectedStatuses.length
-            ? `AND WhrRunnerStatus IN (${expectedStatuses.map((status, index) => {
-                const key = `expectedRunnerStatus${index}`;
-                inputs[key] = [sql.VarChar(30), status];
-                return `@${key}`;
-            }).join(', ')})`
-            : '';
-        const lastErrorExpression = clearError ? 'NULL' : '@lastError';
-
+    async _updateGameRunnerStatus({ gameId, mode, predicate, set, inputs = {} }) {
         const result = await executeQuery(
             `UPDATE ${T.whrSync}
-             SET WhrRunnerStatus = @whrRunnerStatus,
+             SET ${set},
                  LastAttemptAtUtc = SYSUTCDATETIME(),
-                 AttemptCount = AttemptCount + 1,
-                 LastError = ${lastErrorExpression},
                  UpdatedAtUtc = SYSUTCDATETIME()
              WHERE GameId = @gameId
                AND ModeCode = @modeCode
-               AND SyncStatus IN ('synced','rolled_back')
-               ${expectedStatusClause}
                AND ${predicate}`,
-            inputs
+            {
+                gameId: [sql.TinyInt, gameId],
+                modeCode: [sql.VarChar(10), mode],
+                ...inputs
+            }
         );
+        return { updatedRows: result.rowsAffected?.[0] ?? 0 };
+    }
 
-        return {
-            updatedRows: result.rowsAffected?.[0] ?? 0,
-            whrRunnerStatus
-        };
+    // Marks every open row of a mode without a rating calculation (2v2/TST) with an explicit reason.
+    async markModeRunnerNotComputed({ mode = '2v2', reason }) {
+        const result = await executeQuery(
+            `UPDATE ${T.whrSync}
+             SET WhrRunnerStatus = 'not_configured',
+                 LastError = @lastError,
+                 LastAttemptAtUtc = SYSUTCDATETIME(),
+                 UpdatedAtUtc = SYSUTCDATETIME()
+             WHERE ModeCode = @modeCode
+               AND SyncStatus IN ('synced','rolled_back')
+               AND (
+                    WhrRunnerStatus IN ('pending_external_runner','failed','running')
+                    OR (WhrRunnerStatus = 'not_configured' AND ISNULL(LastError, N'') <> @lastError)
+               )`,
+            {
+                modeCode: [sql.VarChar(10), mode],
+                lastError: [sql.NVarChar(1000), truncateError(reason)]
+            }
+        );
+        return { updatedRows: result.rowsAffected?.[0] ?? 0 };
+    }
+
+    /**
+     * Adds futbot's own legacy mirrors to the PlayerStats match/game records, exactly once per sync row.
+     * Rows linked to a ReportScore/ReportScore2 result are only stamped, because those procs already counted them.
+     */
+    async applyPendingLegacyStats() {
+        const pool = await getPool();
+        const transaction = new sql.Transaction(pool);
+        await transaction.begin();
+
+        try {
+            const result = await runRequest(
+                transaction,
+                `SET XACT_ABORT ON;
+                 DECLARE @appliedAtUtc DATETIME2 = SYSUTCDATETIME();
+
+                 CREATE TABLE #PendingLegacyStats (
+                     SyncId INT NOT NULL PRIMARY KEY,
+                     ModeCode VARCHAR(10) NOT NULL,
+                     IsMirror BIT NOT NULL,
+                     LegacyMatchId INT NULL,
+                     LegacyMultiMatchId INT NULL
+                 );
+
+                 INSERT INTO #PendingLegacyStats (SyncId, ModeCode, IsMirror, LegacyMatchId, LegacyMultiMatchId)
+                 SELECT sync.Id,
+                        sync.ModeCode,
+                        CASE
+                            WHEN sync.ModeCode = '1v1'
+                                 AND legacy.Notes = CONCAT('CompetitiveRatedMatch:', sync.RatedMatchId) THEN 1
+                            WHEN sync.ModeCode = '2v2'
+                                 AND legacyMulti.Tournament = 'Competitive Rated'
+                                 AND legacyMulti.Channel = CONCAT('Competitive Rated ', game.Code, ' ', sync.ModeCode, ' #', sync.MatchNumber) THEN 1
+                            ELSE 0
+                        END,
+                        sync.LegacyMatchId,
+                        sync.LegacyMultiMatchId
+                 FROM ${T.whrSync} sync WITH (UPDLOCK, HOLDLOCK)
+                 INNER JOIN ${T.game} game ON game.Id = sync.GameId
+                 LEFT JOIN dbo.Match legacy ON legacy.[Match] = sync.LegacyMatchId
+                 LEFT JOIN dbo.MultiMatch legacyMulti ON legacyMulti.ID = sync.LegacyMultiMatchId
+                 WHERE sync.SyncStatus = 'synced'
+                   AND sync.LegacyStatsAppliedAtUtc IS NULL;
+
+                 ${buildStatsDeltaUpdate(`
+                     SELECT m.GameType, m.Player1 AS Player, m.P1Wins AS GamesWon, m.P1Losses AS GamesLost
+                     FROM #PendingLegacyStats p INNER JOIN dbo.Match m ON m.[Match] = p.LegacyMatchId
+                     WHERE p.IsMirror = 1 AND p.ModeCode = '1v1'
+                     UNION ALL
+                     SELECT m.GameType, m.Player2, m.P1Losses, m.P1Wins
+                     FROM #PendingLegacyStats p INNER JOIN dbo.Match m ON m.[Match] = p.LegacyMatchId
+                     WHERE p.IsMirror = 1 AND p.ModeCode = '1v1'`)}
+
+                 ${buildStatsDeltaUpdate(`
+                     SELECT mm.GameType, team.Player, mm.Team1Wins AS GamesWon, mm.Team1Losses AS GamesLost
+                     FROM #PendingLegacyStats p INNER JOIN dbo.MultiMatch mm ON mm.ID = p.LegacyMultiMatchId
+                     CROSS APPLY (VALUES (mm.Player1), (mm.Player2)) team(Player)
+                     WHERE p.IsMirror = 1 AND p.ModeCode = '2v2'
+                     UNION ALL
+                     SELECT mm.GameType, team.Player, mm.Team1Losses, mm.Team1Wins
+                     FROM #PendingLegacyStats p INNER JOIN dbo.MultiMatch mm ON mm.ID = p.LegacyMultiMatchId
+                     CROSS APPLY (VALUES (mm.Player5), (mm.Player6)) team(Player)
+                     WHERE p.IsMirror = 1 AND p.ModeCode = '2v2'`, { doubles: true })}
+
+                 UPDATE sync
+                 SET LegacyStatsAppliedAtUtc = @appliedAtUtc,
+                     UpdatedAtUtc = @appliedAtUtc
+                 FROM ${T.whrSync} sync
+                 INNER JOIN #PendingLegacyStats p ON p.SyncId = sync.Id;
+
+                 SELECT COUNT(*) AS StampedRows,
+                        COALESCE(SUM(CASE WHEN IsMirror = 1 AND ModeCode = '1v1' THEN 1 ELSE 0 END), 0) AS CountedSingles,
+                        COALESCE(SUM(CASE WHEN IsMirror = 1 AND ModeCode = '2v2' THEN 1 ELSE 0 END), 0) AS CountedDoubles
+                 FROM #PendingLegacyStats;`
+            );
+
+            await transaction.commit();
+            const row = result.recordset?.[0] ?? {};
+            return {
+                stampedRows: toNumber(row.StampedRows),
+                countedSingles: toNumber(row.CountedSingles),
+                countedDoubles: toNumber(row.CountedDoubles)
+            };
+        } catch (err) {
+            await transaction.rollback().catch(() => {});
+            throw err;
+        }
+    }
+
+    // Takes a legacy row's result back out of PlayerStats before a rollback deletes the row. A futbot mirror
+    // is only reversed once its stats were applied; any other linked row was counted by ReportScore itself.
+    async _reverseLegacyStats(transaction, sync) {
+        const statsApplied = sync.LegacyStatsAppliedAtUtc ? 1 : 0;
+
+        if (sync.LegacyMatchId) {
+            const filter = `m.[Match] = @legacyMatchId
+                       AND (@statsApplied = 1 OR ISNULL(m.Notes, N'') <> @mirrorNotes)`;
+            await runRequest(
+                transaction,
+                buildStatsDeltaUpdate(`
+                    SELECT m.GameType, m.Player1 AS Player, m.P1Wins AS GamesWon, m.P1Losses AS GamesLost
+                    FROM dbo.Match m WHERE ${filter}
+                    UNION ALL
+                    SELECT m.GameType, m.Player2, m.P1Losses, m.P1Wins
+                    FROM dbo.Match m WHERE ${filter}`, { sign: -1 }),
+                {
+                    legacyMatchId: [sql.Int, sync.LegacyMatchId],
+                    statsApplied: [sql.Int, statsApplied],
+                    mirrorNotes: [sql.NVarChar(200), `CompetitiveRatedMatch:${sync.RatedMatchId}`]
+                }
+            );
+        }
+
+        if (sync.LegacyMultiMatchId) {
+            const filter = `mm.ID = @legacyMultiMatchId
+                       AND (@statsApplied = 1 OR NOT (
+                            ISNULL(mm.Tournament, N'') = 'Competitive Rated'
+                            AND ISNULL(mm.Channel, N'') = CONCAT('Competitive Rated ', game.Code, ' ', @modeCode, ' #', @matchNumber)
+                       ))`;
+            await runRequest(
+                transaction,
+                buildStatsDeltaUpdate(`
+                    SELECT mm.GameType, team.Player, mm.Team1Wins AS GamesWon, mm.Team1Losses AS GamesLost
+                    FROM dbo.MultiMatch mm
+                    INNER JOIN ${T.game} game ON game.Id = @gameId
+                    CROSS APPLY (VALUES (mm.Player1), (mm.Player2)) team(Player)
+                    WHERE ${filter}
+                    UNION ALL
+                    SELECT mm.GameType, team.Player, mm.Team1Losses, mm.Team1Wins
+                    FROM dbo.MultiMatch mm
+                    INNER JOIN ${T.game} game ON game.Id = @gameId
+                    CROSS APPLY (VALUES (mm.Player5), (mm.Player6)) team(Player)
+                    WHERE ${filter}`, { doubles: true, sign: -1 }),
+                {
+                    legacyMultiMatchId: [sql.Int, sync.LegacyMultiMatchId],
+                    statsApplied: [sql.Int, statsApplied],
+                    gameId: [sql.TinyInt, sync.GameId],
+                    modeCode: [sql.VarChar(10), sync.ModeCode],
+                    matchNumber: [sql.Int, sync.MatchNumber]
+                }
+            );
+        }
     }
 
     async syncCompletedMatch({ ratedMatchId }) {
@@ -388,6 +485,10 @@ class CompetitiveWhrSyncDao {
             if (!sync) {
                 await transaction.commit();
                 return null;
+            }
+
+            if (sync.SyncStatus !== 'rolled_back') {
+                await this._reverseLegacyStats(transaction, sync);
             }
 
             if (sync.LegacyMatchId) {
@@ -779,3 +880,4 @@ class CompetitiveWhrSyncDao {
 }
 
 module.exports = CompetitiveWhrSyncDao;
+module.exports.buildStatsDeltaUpdate = buildStatsDeltaUpdate;

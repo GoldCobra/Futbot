@@ -33,6 +33,7 @@ async function migrate() {
                 LastAttemptAtUtc           DATETIME2 NULL,
                 AttemptCount               INT NOT NULL CONSTRAINT DF_CompetitiveWhrSync_AttemptCount DEFAULT (0),
                 LastError                  NVARCHAR(1000) NULL,
+                LegacyStatsAppliedAtUtc    DATETIME2 NULL,
                 CreatedAtUtc               DATETIME2 NOT NULL CONSTRAINT DF_CompetitiveWhrSync_CreatedAtUtc DEFAULT SYSUTCDATETIME(),
                 UpdatedAtUtc               DATETIME2 NOT NULL CONSTRAINT DF_CompetitiveWhrSync_UpdatedAtUtc DEFAULT SYSUTCDATETIME(),
                 CONSTRAINT PK_CompetitiveWhrSync PRIMARY KEY (Id),
@@ -50,6 +51,10 @@ async function migrate() {
                 )
             );
         END;
+
+        -- When the mirror's result was added to the PlayerStats records (NULL = not yet).
+        IF COL_LENGTH(N'${q('CompetitiveWhrSync')}', 'LegacyStatsAppliedAtUtc') IS NULL
+            ALTER TABLE ${q('CompetitiveWhrSync')} ADD LegacyStatsAppliedAtUtc DATETIME2 NULL;
 
         IF NOT EXISTS (
             SELECT 1
