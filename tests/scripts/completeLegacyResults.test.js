@@ -6,6 +6,7 @@ jest.mock('../../src/db/sqlClient', () => ({
 }));
 
 const {
+    QUEUE_CANDIDATES_QUERY,
     classifyQueueCandidates,
     buildApplySql,
     MAX_QUEUE_BACKFILL,
@@ -51,8 +52,15 @@ describe('completeLegacyResults', () => {
             [1, 'game ambiguous (2/3)'],
             [2, 'game unknown (no activity of both players within 60 days)'],
             [3, 'not decided (1-1, first to 2)'],
-            [4, 'pair already reported within 2 days with a different result']
+            [4, 'pair reported by hand within 2 days with a different result']
         ]);
+    });
+
+    it('never lets the result of another lobby of the same pair count as this match', () => {
+        expect(QUEUE_CANDIDATES_QUERY).toContain('NOT EXISTS (SELECT 1 FROM owned o WHERE o.RankedMatchId = r.ID)');
+        // both the "same result" and the "different result" check ignore rows owned by other lobbies
+        expect(QUEUE_CANDIDATES_QUERY.split('NOT EXISTS (SELECT 1 FROM owned o WHERE o.MatchId = m.[Match])')).toHaveLength(3);
+        expect(QUEUE_CANDIDATES_QUERY).toContain('WHERE (r.Player1 = qc.Player1 AND r.Player2 = qc.Player2) OR (r.Player1 = qc.Player2 AND r.Player2 = qc.Player1)');
     });
 
     it('writes with hard caps, idempotently and without reactivating players', () => {

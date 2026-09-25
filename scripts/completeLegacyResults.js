@@ -21,36 +21,46 @@ const PAIR_WINDOW_DAYS = 2;
 const RAPID_REREPORT_SECONDS = 60;
 const BACKFILL_TOURNAMENT = 'Ranked Queue (backfill)';
 
-// Ranked-queue ids referenced by dbo.Match channels such as "MSBL Rated Match 9636 - momjea".
-const LINKED_QUEUE_IDS_CTE = `linked AS (
-    SELECT DISTINCT TRY_CAST(SUBSTRING(m.Channel, PATINDEX('%Rated Match [0-9]%', m.Channel) + 12,
+// dbo.Match rows that belong to a ranked-queue lobby: the channel ("MSBL Rated Match 9636 - momjea") names a
+// RankedMatch of the same two players. Such a row is that lobby's result and never explains another lobby.
+const OWNED_BY_QUEUE_CTE = `queueChannel AS (
+    SELECT m.[Match] AS MatchId, m.Player1, m.Player2,
+           TRY_CAST(SUBSTRING(m.Channel, PATINDEX('%Rated Match [0-9]%', m.Channel) + 12,
                PATINDEX('%[^0-9]%', SUBSTRING(m.Channel, PATINDEX('%Rated Match [0-9]%', m.Channel) + 12, 20) + 'x') - 1) AS INT) AS RankedMatchId
     FROM dbo.Match m
     WHERE m.Channel LIKE '%Rated Match [0-9]%'
+),
+owned AS (
+    SELECT qc.MatchId, qc.RankedMatchId
+    FROM queueChannel qc
+    INNER JOIN dbo.RankedMatch r ON r.ID = qc.RankedMatchId
+    WHERE (r.Player1 = qc.Player1 AND r.Player2 = qc.Player2) OR (r.Player1 = qc.Player2 AND r.Player2 = qc.Player1)
 )`;
 
+// Rows of the same pair around the lobby date that belong to no queue lobby (e.g. reported by hand).
+const UNOWNED_NEARBY = `
+    FROM dbo.Match m
+    WHERE ((m.Player1 = r.Player1 AND m.Player2 = r.Player2) OR (m.Player1 = r.Player2 AND m.Player2 = r.Player1))
+      AND m.MatchDate BETWEEN DATEADD(day, -${PAIR_WINDOW_DAYS}, r.LobbyDate) AND DATEADD(day, ${PAIR_WINDOW_DAYS}, r.LobbyDate)
+      AND NOT EXISTS (SELECT 1 FROM owned o WHERE o.MatchId = m.[Match])`;
+
 const QUEUE_CANDIDATES_QUERY = `
-WITH ${LINKED_QUEUE_IDS_CTE},
+WITH ${OWNED_BY_QUEUE_CTE},
 candidates AS (
     SELECT r.ID, r.Player1, r.Player2, r.P1Wins, r.P2Wins, r.FirstTo, r.LobbyDate,
-           CASE WHEN EXISTS (
-               SELECT 1 FROM dbo.Match m
-               WHERE ((m.Player1 = r.Player1 AND m.Player2 = r.Player2) OR (m.Player1 = r.Player2 AND m.Player2 = r.Player1))
-                 AND m.MatchDate BETWEEN DATEADD(day, -${PAIR_WINDOW_DAYS}, r.LobbyDate) AND DATEADD(day, ${PAIR_WINDOW_DAYS}, r.LobbyDate)
-           ) THEN 1 ELSE 0 END AS PairReportedNearby
+           CASE WHEN EXISTS (SELECT 1 ${UNOWNED_NEARBY}) THEN 1 ELSE 0 END AS PairReportedNearby
     FROM dbo.RankedMatch r
     WHERE r.Status = '9'
       AND r.Player3 IS NULL
       AND r.P1Wins + r.P2Wins > 0
       AND r.Player1 <> r.Player2
-      AND NOT EXISTS (SELECT 1 FROM linked l WHERE l.RankedMatchId = r.ID)
+      AND NOT EXISTS (SELECT 1 FROM owned o WHERE o.RankedMatchId = r.ID)
       AND NOT EXISTS (SELECT 1 FROM dbo.Match m WHERE m.Notes = CONCAT('RankedMatch:', r.ID))
       -- reported by hand with the same result: already part of dbo.Match
       AND NOT EXISTS (
-          SELECT 1 FROM dbo.Match m
-          WHERE ((m.Player1 = r.Player1 AND m.Player2 = r.Player2 AND m.P1Wins = r.P1Wins AND m.P1Losses = r.P2Wins)
-              OR (m.Player1 = r.Player2 AND m.Player2 = r.Player1 AND m.P1Wins = r.P2Wins AND m.P1Losses = r.P1Wins))
-            AND m.MatchDate BETWEEN DATEADD(day, -${PAIR_WINDOW_DAYS}, r.LobbyDate) AND DATEADD(day, ${PAIR_WINDOW_DAYS}, r.LobbyDate)
+          SELECT 1 ${UNOWNED_NEARBY}
+            AND ((m.Player1 = r.Player1 AND m.P1Wins = r.P1Wins AND m.P1Losses = r.P2Wins)
+              OR (m.Player1 = r.Player2 AND m.P1Wins = r.P2Wins AND m.P1Losses = r.P1Wins))
       )
 )
 SELECT c.ID, c.Player1, c.Player2, c.P1Wins, c.P2Wins, c.FirstTo, c.LobbyDate, c.PairReportedNearby,
@@ -124,7 +134,7 @@ function classifyQueueCandidates(rows) {
     for (const candidate of byId.values()) {
         const decided = candidate.firstTo > 0 && Math.max(candidate.p1Wins, candidate.p2Wins) >= candidate.firstTo;
         let reason = null;
-        if (candidate.pairReportedNearby) reason = 'pair already reported within 2 days with a different result';
+        if (candidate.pairReportedNearby) reason = 'pair reported by hand within 2 days with a different result';
         else if (!decided) reason = `not decided (${candidate.p1Wins}-${candidate.p2Wins}, first to ${candidate.firstTo ?? '?'})`;
         else if (candidate.gameTypes.length === 0) reason = 'game unknown (no activity of both players within 60 days)';
         else if (candidate.gameTypes.length > 1) reason = `game ambiguous (${candidate.gameTypes.join('/')})`;
@@ -339,6 +349,7 @@ if (require.main === module) {
 }
 
 module.exports = {
+    QUEUE_CANDIDATES_QUERY,
     classifyQueueCandidates,
     buildApplySql,
     MAX_QUEUE_BACKFILL,
