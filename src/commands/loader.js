@@ -3,23 +3,14 @@ const path = require('node:path');
 const {
     Collection,
     MessageFlags,
-    PermissionsBitField,
     REST,
     Routes,
     SlashCommandBuilder
 } = require('discord.js');
-const CONSTANTS = require('../utils/constants');
 const {safeFollowUp} = require('../utils/discord');
+const { isStaffInteraction, memberHasAnyRole } = require('../utils/permissions');
 
 const STAFF_COMMAND_NAMES = new Set(['mslstaff']);
-const STAFF_COMMAND_ROLE_IDS = new Set([
-    CONSTANTS.ROLES.ADMIN,
-    CONSTANTS.ROLES.DEVELOPER,
-    CONSTANTS.ROLES.MSL_STAFF,
-    CONSTANTS.ROLES.MSL_STAFF_MSC,
-    CONSTANTS.ROLES.MSL_STAFF_SMS,
-    CONSTANTS.ROLES.MSL_STAFF_MSBL
-]);
 
 const COMMAND_PROFILES = {
 futbot: [
@@ -64,28 +55,6 @@ function commandFileIsIncluded(file, directory) {
         return false;
     }
     return true;
-}
-
-function memberHasAnyRole(member, roleIds) {
-    const roleCache = member?.roles?.cache;
-    if (roleCache && typeof roleCache.some === 'function') {
-        return roleCache.some(role => roleIds.has(role.id));
-    }
-
-    const roles = member?.roles;
-    if (Array.isArray(roles)) {
-        return roles.some(role => roleIds.has(typeof role === 'string' ? role : role?.id));
-    }
-
-    return false;
-}
-
-function canUseStaffCommand(interaction) {
-    if (interaction?.memberPermissions?.has?.(PermissionsBitField.Flags.Administrator)) {
-        return true;
-    }
-
-    return memberHasAnyRole(interaction?.member, STAFF_COMMAND_ROLE_IDS);
 }
 
 async function denyStaffCommand(interaction) {
@@ -209,7 +178,7 @@ async function execute(interaction) {
     let command = topLevelCommand;
 
     if (topLevelCommand instanceof Collection) {
-        if (STAFF_COMMAND_NAMES.has(interaction.commandName) && !canUseStaffCommand(interaction)) {
+        if (STAFF_COMMAND_NAMES.has(interaction.commandName) && !isStaffInteraction(interaction)) {
             await denyStaffCommand(interaction);
             return;
         }
@@ -280,7 +249,7 @@ module.exports = {
     loadCommands,
     execute,
     __private: {
-        canUseStaffCommand,
+        canUseStaffCommand: isStaffInteraction,
         memberHasAnyRole
     }
 }

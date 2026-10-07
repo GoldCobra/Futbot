@@ -1,24 +1,7 @@
-const { MessageFlags, PermissionsBitField, SlashCommandBuilder } = require('discord.js');
+const { MessageFlags, SlashCommandBuilder } = require('discord.js');
 
-const CONSTANTS = require('../../utils/constants');
 const competitiveRatedQueue = require('../../services/competitiveRatedQueue');
-
-const STAFF_ROLES = new Set([
-    CONSTANTS.ROLES.ADMIN,
-    CONSTANTS.ROLES.DEVELOPER,
-    CONSTANTS.ROLES.MSL_STAFF,
-    CONSTANTS.ROLES.MSL_STAFF_MSC,
-    CONSTANTS.ROLES.MSL_STAFF_SMS,
-    CONSTANTS.ROLES.MSL_STAFF_MSBL
-]);
-
-function canManageCompetitiveRatedQueue(interaction) {
-    if (interaction.memberPermissions?.has(PermissionsBitField.Flags.Administrator)) {
-        return true;
-    }
-
-    return interaction.member?.roles?.cache?.some(role => STAFF_ROLES.has(role.id)) ?? false;
-}
+const { isStaffInteraction } = require('../../utils/permissions');
 
 module.exports = {
     data: new SlashCommandBuilder()
@@ -26,7 +9,7 @@ module.exports = {
         .setDescription('Clear Competitive Rated queue state and rebuild the panels'),
 
     async execute(interaction) {
-        if (!canManageCompetitiveRatedQueue(interaction)) {
+        if (!isStaffInteraction(interaction)) {
             await interaction.reply({
                 content: 'You do not have permission to reset the Competitive Rated queue.',
                 flags: MessageFlags.Ephemeral

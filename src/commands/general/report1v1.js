@@ -1,9 +1,9 @@
 const { SlashCommandBuilder } = require('discord.js');
 
-const CONSTANTS = require('../../utils/constants');
 const startgg = require('../../integrations/startgg');
 const { getStandardizeSetUrl } = startgg;
 const manualReport = require('../../services/manualReport');
+const { memberHasAnyRole } = require('../../utils/permissions');
 
 function addGameOption(command) {
     return command.addStringOption(option =>
@@ -110,14 +110,8 @@ module.exports = {
             let seturi = null;
             if (rawSeturi) {
                 seturi = getStandardizeSetUrl(rawSeturi);
-                const preapprovedRoles = new Set([
-                    CONSTANTS.ROLES.DEVELOPER,
-                    CONSTANTS.ROLES.MSL_STAFF_MSBL,
-                    CONSTANTS.ROLES.MSL_STAFF_MSC,
-                    CONSTANTS.ROLES.MSL_STAFF_SMS,
-                    CONSTANTS.ROLES.ADMIN
-                ]);
-                const approvedSubmitter = interaction.member?.roles?.cache?.some(role => preapprovedRoles.has(role.id)) ?? false;
+                // Staff roles pre-approve the start.gg update (server admins without a role do not).
+                const approvedSubmitter = memberHasAnyRole(interaction.member);
 
                 validateWinOrder(winorder, p1Wins, p2Wins);
                 const discordIdWinOrder = [];

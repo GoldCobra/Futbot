@@ -3,12 +3,12 @@ const {
     ActionRowBuilder,
     ButtonBuilder,
     ButtonStyle,
-    ChannelType,
-    PermissionsBitField
+    ChannelType
 } = require('discord.js');
 
 const { fetchChannel } = require('../../utils/discord');
-const { CONFIG, PANEL_BYPASS_ROLES, PLAYER_COUNT_EMOJI } = require('./constants');
+const { isStaffMember } = require('../../utils/permissions');
+const { CONFIG, PLAYER_COUNT_EMOJI } = require('./constants');
 const { panelJoinCustomId } = require('./customIds');
 const { buildPanelImageMessage, getPanelImagePath } = require('./messages');
 const { logRatedInfo, logRatedWarn, logRatedError } = require('./runtimeLogger');
@@ -115,15 +115,7 @@ function getOrCreatePanelMeta(channelId) {
 }
 
 function hasBypassRole(member) {
-    if (!member?.roles?.cache) {
-        return false;
-    }
-
-    if (member.permissions?.has?.(PermissionsBitField.Flags.Administrator)) {
-        return true;
-    }
-
-    return member.roles.cache.some(role => PANEL_BYPASS_ROLES.has(role.id));
+    return isStaffMember(member);
 }
 
 function buildSearchCounts(channelId) {
