@@ -5,7 +5,7 @@
   "main": "index.js",
   "private": true,
   "engines": {
-    "node": ">=20 <25"
+    "node": ">=24 <25"
   },
   "scripts": {
     "start": "node index.js",
