@@ -25,6 +25,7 @@
     "whr:status": "node scripts/auditCompetitiveWhrSync.js",
     "whr:recalc": "node scripts/recalculateLegacyWhr.js",
     "whr:complete-results": "node scripts/completeLegacyResults.js",
+    "lint": "eslint .",
     "test": "jest --runInBand"
   },
   "dependencies": {
@@ -37,6 +38,9 @@
     "multimap": "^1.1.0"
   },
   "devDependencies": {
+    "@eslint/js": "^10.0.1",
+    "eslint": "^10.12.0",
+    "globals": "^17.13.0",
     "jest": "^28.1.0"
   },
   "license": "ISC"
