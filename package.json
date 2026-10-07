@@ -33,7 +33,7 @@
     "dotenv": "^10.0.0",
     "graphql": "^16.14.1",
     "graphql-request": "^6.1.0",
-    "mssql": "^7.2.1",
+    "mssql": "^12.7.4",
     "multimap": "^1.1.0"
   },
   "devDependencies": {
