@@ -39,6 +39,8 @@ npm run lint
 
 Tests never reach the production database or Discord: `tests/setup/isolate.js` clears the credentials and refuses every non-local network connection. `tests/contracts` compares the slash command definitions and other public formats with fixtures; regenerate them only for an intended change with `UPDATE_CONTRACTS=1 npm test`.
 
+GitHub Actions runs the same checks (`npm ci`, lint, tests on Node 24) on every push to master and every pull request (`.github/workflows/ci.yml`); Dependabot proposes dependency updates as pull requests (`.github/dependabot.yml`).
+
 ## Structure
 
 | Path | Responsibility |
