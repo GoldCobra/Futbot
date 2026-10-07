@@ -1,0 +1,356 @@
+{
+  "registration": [
+    {
+      "options": [
+        {
+          "type": 4,
+          "name": "strength",
+          "description": "Desired strength stat",
+          "required": true
+        },
+        {
+          "type": 4,
+          "name": "speed",
+          "description": "Desired speed stat",
+          "required": true
+        },
+        {
+          "type": 4,
+          "name": "shooting",
+          "description": "Desired shooting stat",
+          "required": true
+        },
+        {
+          "type": 4,
+          "name": "passing",
+          "description": "Desired passing stat",
+          "required": true
+        },
+        {
+          "type": 4,
+          "name": "technique",
+          "description": "Desired technique stat",
+          "required": true
+        },
+        {
+          "type": 3,
+          "name": "character",
+          "description": "Character name",
+          "required": true
+        }
+      ],
+      "name": "gear",
+      "description": "Gear Build Constructor",
+      "type": 1
+    },
+    {
+      "options": [],
+      "name": "gearrules",
+      "description": "Manual for /gear",
+      "type": 1
+    },
+    {
+      "options": [],
+      "name": "ratedreset",
+      "description": "Clear Competitive Rated queue state and rebuild the panels",
+      "type": 1
+    },
+    {
+      "options": [],
+      "name": "ratedsetup",
+      "description": "Create or repair the Competitive Rated queue panels",
+      "type": 1
+    },
+    {
+      "options": [
+        {
+          "type": 3,
+          "choices": [
+            {
+              "name": "MSBL",
+              "value": "MSBL"
+            },
+            {
+              "name": "MSC",
+              "value": "MSC"
+            },
+            {
+              "name": "SMS",
+              "value": "SMS"
+            }
+          ],
+          "name": "game",
+          "description": "Game to report this set for.",
+          "required": true
+        },
+        {
+          "name": "p1",
+          "description": "Player 1",
+          "required": true,
+          "type": 6
+        },
+        {
+          "name": "p2",
+          "description": "Player 2",
+          "required": true,
+          "type": 6
+        },
+        {
+          "min_value": 0,
+          "type": 4,
+          "name": "p1wins",
+          "description": "Number of games p1 won this set",
+          "required": true
+        },
+        {
+          "min_value": 0,
+          "type": 4,
+          "name": "p2wins",
+          "description": "Number of games p2 won this set",
+          "required": true
+        },
+        {
+          "type": 3,
+          "name": "winorder",
+          "description": "Win order of the set. Example: 11222",
+          "required": false
+        },
+        {
+          "type": 3,
+          "name": "seturi",
+          "description": "URI to uniquely identify the set.",
+          "required": false
+        },
+        {
+          "type": 3,
+          "name": "tournament",
+          "description": "The name of the tournament this set was for",
+          "required": false
+        },
+        {
+          "type": 3,
+          "name": "tournamentstage",
+          "description": "The stage of the tournament this set was for",
+          "required": false
+        }
+      ],
+      "name": "report1v1",
+      "description": "Report a 1v1 set.",
+      "type": 1
+    },
+    {
+      "options": [
+        {
+          "type": 3,
+          "choices": [
+            {
+              "name": "MSBL",
+              "value": "MSBL"
+            },
+            {
+              "name": "MSC",
+              "value": "MSC"
+            },
+            {
+              "name": "SMS",
+              "value": "SMS"
+            }
+          ],
+          "name": "game",
+          "description": "Game to report this set for.",
+          "required": true
+        },
+        {
+          "name": "team1p1",
+          "description": "Team 1 player 1",
+          "required": true,
+          "type": 6
+        },
+        {
+          "name": "team1p2",
+          "description": "Team 1 player 2",
+          "required": true,
+          "type": 6
+        },
+        {
+          "name": "team2p1",
+          "description": "Team 2 player 1",
+          "required": true,
+          "type": 6
+        },
+        {
+          "name": "team2p2",
+          "description": "Team 2 player 2",
+          "required": true,
+          "type": 6
+        },
+        {
+          "min_value": 0,
+          "type": 4,
+          "name": "team1wins",
+          "description": "Number of games team 1 won this set",
+          "required": true
+        },
+        {
+          "min_value": 0,
+          "type": 4,
+          "name": "team2wins",
+          "description": "Number of games team 2 won this set",
+          "required": true
+        },
+        {
+          "type": 3,
+          "name": "tournament",
+          "description": "The name of the tournament this set was for",
+          "required": false
+        },
+        {
+          "type": 3,
+          "name": "tournamentstage",
+          "description": "The stage of the tournament this set was for",
+          "required": false
+        },
+        {
+          "type": 3,
+          "name": "seturi",
+          "description": "URI to uniquely identify the set.",
+          "required": false
+        }
+      ],
+      "name": "report2v2",
+      "description": "Report a 2v2 set.",
+      "type": 1
+    },
+    {
+      "options": [
+        {
+          "type": 1,
+          "name": "comp-season",
+          "description": "Show competitive season status",
+          "options": [
+            {
+              "type": 3,
+              "choices": [
+                {
+                  "name": "status",
+                  "value": "status"
+                }
+              ],
+              "name": "action",
+              "description": "status",
+              "required": true
+            }
+          ]
+        },
+        {
+          "type": 1,
+          "name": "rated-queue-disable",
+          "description": "Disable rated 1v1 and 2v2 search globally. Running matches are unaffected.",
+          "options": []
+        },
+        {
+          "type": 1,
+          "name": "rated-queue-enable",
+          "description": "Re-enable rated 1v1 and 2v2 search globally.",
+          "options": []
+        },
+        {
+          "type": 1,
+          "name": "rollbackratedmatch",
+          "description": "Rollback one competitive rated match by game, mode and match number",
+          "options": [
+            {
+              "type": 3,
+              "choices": [
+                {
+                  "name": "MSC",
+                  "value": "msc"
+                },
+                {
+                  "name": "SMS",
+                  "value": "sms"
+                },
+                {
+                  "name": "MSBL",
+                  "value": "msbl"
+                }
+              ],
+              "name": "game",
+              "description": "Competitive game",
+              "required": true
+            },
+            {
+              "type": 3,
+              "choices": [
+                {
+                  "name": "1v1",
+                  "value": "1v1"
+                },
+                {
+                  "name": "2v2",
+                  "value": "2v2"
+                }
+              ],
+              "name": "mode",
+              "description": "Player size",
+              "required": true
+            },
+            {
+              "min_value": 1,
+              "type": 4,
+              "name": "matchnumber",
+              "description": "Visible match number from the thread title",
+              "required": true
+            },
+            {
+              "type": 3,
+              "name": "reason",
+              "description": "Why this match is being rolled back",
+              "required": true,
+              "max_length": 500,
+              "min_length": 3
+            },
+            {
+              "name": "confirm",
+              "description": "Must be true to execute the rollback",
+              "required": true,
+              "type": 5
+            }
+          ]
+        }
+      ],
+      "name": "mslstaff",
+      "description": "futbot staff commands",
+      "type": 1
+    }
+  ],
+  "dispatch": [
+    {
+      "name": "gear"
+    },
+    {
+      "name": "gearrules"
+    },
+    {
+      "name": "ratedreset"
+    },
+    {
+      "name": "ratedsetup"
+    },
+    {
+      "name": "report1v1"
+    },
+    {
+      "name": "report2v2"
+    },
+    {
+      "name": "mslstaff",
+      "subcommands": [
+        "comp-season",
+        "rated-queue-disable",
+        "rated-queue-enable",
+        "rollbackratedmatch"
+      ]
+    }
+  ]
+}

@@ -1,0 +1,22 @@
+{
+  "intents": [
+    "GuildMembers",
+    "GuildMessages",
+    "Guilds"
+  ],
+  "partials": [
+    1,
+    3
+  ],
+  "listeners": {
+    "clientReady": 1,
+    "error": 1,
+    "interactionCreate": 1,
+    "messageCreate": 1,
+    "shardDisconnect": 1
+  },
+  "processListeners": {
+    "unhandledRejection": 1,
+    "uncaughtException": 1
+  }
+}
