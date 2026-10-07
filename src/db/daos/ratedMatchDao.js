@@ -450,13 +450,15 @@ class RatedMatchDao {
         );
     }
 
+    // Only a match that is still running can be cancelled; a repeated call keeps the first
+    // reason and never touches completed or rolled-back rows.
     async cancelMatch({ matchCode, cancelReason }) {
         await executeQuery(
             `UPDATE ${T.ratedMatch}
              SET Status = 'cancelled',
                  CancelReason = @cancelReason,
                  CancelledAtUtc = SYSUTCDATETIME()
-             WHERE MatchCode = @matchCode AND Status <> 'completed'`,
+             WHERE MatchCode = @matchCode AND Status IN ('creating', 'active')`,
             { matchCode, cancelReason: cancelReason ?? null }
         );
     }
@@ -467,7 +469,7 @@ class RatedMatchDao {
              SET Status = 'cancelled',
                  CancelReason = @cancelReason,
                  CancelledAtUtc = SYSUTCDATETIME()
-             WHERE Id = @matchId AND Status <> 'completed'`,
+             WHERE Id = @matchId AND Status IN ('creating', 'active')`,
             { matchId, cancelReason: cancelReason ?? null }
         );
     }

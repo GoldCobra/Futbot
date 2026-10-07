@@ -1,4 +1,5 @@
 const { executeQuery, getPool, sql } = require('../sqlClient');
+const { RatedMatchStateError } = require('../errors');
 const { competitiveTable, PLACEMENT_GAMES_REQUIRED } = require('../../utils/competitiveConstants');
 const {
     advanceRewardProgress,
@@ -739,7 +740,7 @@ class CompetitiveRatingDao {
         try {
             const matchResult = await runRequest(
                 transaction,
-                `SELECT TOP 1 Id, SeasonId, GameId, ModeCode
+                `SELECT TOP 1 Id, SeasonId, GameId, ModeCode, Status
                  FROM ${T.ratedMatch} WITH (UPDLOCK, HOLDLOCK)
                  WHERE (@ratedMatchId IS NOT NULL AND Id = @ratedMatchId)
                     OR (@ratedMatchId IS NULL AND MatchCode = @matchCode)`,
@@ -792,6 +793,14 @@ class CompetitiveRatingDao {
                 }
                 await transaction.commit();
                 return existingChangesResult.recordset.map(normalizeChangeRow);
+            }
+            // A match the season finalization (or a cancel) closed meanwhile is never rated
+            // afterwards, e.g. by a result that waited in the retry queue during a DB outage.
+            if (match.Status === 'cancelled') {
+                throw new RatedMatchStateError(
+                    `RatedMatch ${resolvedRatedMatchId} is cancelled; its result is not rated`,
+                    { ratedMatchId: resolvedRatedMatchId, status: match.Status }
+                );
             }
 
             const defaultRating = await this.getDefaultRating(transaction);

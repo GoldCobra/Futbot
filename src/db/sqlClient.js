@@ -22,6 +22,10 @@ const TRANSIENT_DB_MESSAGES = [
   'timeout',
   'socket hang up'
 ];
+// SQL Server rolls the whole batch back for a deadlock victim, so running it again is safe.
+const TRANSIENT_DB_ERROR_NUMBERS = new Set([
+  1205 // deadlock victim
+]);
 
 function sleep(ms) {
   return new Promise(resolve => setTimeout(resolve, ms));
@@ -30,6 +34,7 @@ function sleep(ms) {
 function isTransientDbError(err) {
   if (!err) return false;
   if (TRANSIENT_DB_CODES.has(err.code)) return true;
+  if (TRANSIENT_DB_ERROR_NUMBERS.has(Number(err.number))) return true;
   const message = `${err.message ?? ''} ${err.stack ?? ''}`;
   return TRANSIENT_DB_MESSAGES.some(pattern => message.includes(pattern));
 }
