@@ -18,9 +18,13 @@ const CONSTANTS = require('./src/utils/constants');
 const errors = require('./src/utils/errors');
 const commandLoader = require('./src/commands/loader');
 const competitiveRatedQueue = require('./src/services/competitiveRatedQueue');
+const { closePool } = require('./src/db/sqlClient');
 const { fetchChannel, safeFollowUp, safeSend } = require('./src/utils/discord');
+const { sendSplitMessages } = require('./src/utils/helpers');
 
 const ACTIVITY_REFRESH_INTERVAL_MS = 10 * 60_000;
+const LOGIN_MAX_ATTEMPTS = 10;
+const SHUTDOWN_TIMEOUT_MS = 10_000;
 const stadiums = [...CONSTANTS.MSC_ALL_STADIUMS, ...CONSTANTS.BL_ALL_STADIUMS];
 
 process.on('unhandledRejection', reason => {
@@ -56,19 +60,21 @@ client.on('interactionCreate', async interaction => {
             return await competitiveRatedQueue.handleInteraction(interaction);
         }
 
-    } catch (err) {
+    } catch (thrown) {
+        const err = thrown instanceof Error ? thrown : new Error(String(thrown));
         console.error('[Futbot] Interaction error:', err);
         const debugChannel = await fetchChannel(interaction.guild, CONSTANTS.CHANNELS.DEBUG_ERRORS)
             || await fetchChannel(client, CONSTANTS.CHANNELS.DEBUG_ERRORS);
         if (debugChannel) {
-            await safeSend(debugChannel,
+            await sendSplitMessages(part => safeSend(debugChannel, part),
 `**Futbot exception**
 **Time** <t:${Math.floor(new Date().getTime() / 1000)}>
 **Command name:** ${interaction.commandName ?? interaction.customId ?? 'unknown'}
 **Executed by:** ${interaction.user?.toString?.() ?? interaction.user?.id ?? 'unknown'}
 **Error Message:** ${err.message}
 **Stack trace:**
-${err.stack}`
+${err.stack}`,
+                false
             );
         }
         await safeFollowUp(interaction, {
@@ -113,20 +119,38 @@ async function messageManager(msg) {
 }
 
 async function loginWithRetry(token, attempt = 0) {
-    const MAX_ATTEMPTS = 10;
     const BASE_DELAY_MS = 5000;
     try {
         await client.login(token);
     } catch (err) {
-        if (attempt >= MAX_ATTEMPTS) {
-            console.error(`[Futbot] Login failed after ${MAX_ATTEMPTS} attempts: ${err.message}`);
-            return;
+        if (attempt >= LOGIN_MAX_ATTEMPTS) {
+            // Exit instead of idling logged out: the container's restart policy starts over.
+            console.error(`[Futbot] Login failed after ${LOGIN_MAX_ATTEMPTS} attempts: ${err.message}`);
+            process.exit(1);
         }
         const delayMs = Math.min(BASE_DELAY_MS * Math.pow(2, attempt), 300000);
         console.error(`[Futbot] Login failed (attempt ${attempt + 1}): ${err.message}. Retrying in ${Math.round(delayMs / 1000)}s...`);
-        const timer = setTimeout(() => loginWithRetry(token, attempt + 1), delayMs);
-        timer.unref?.();
+        setTimeout(() => loginWithRetry(token, attempt + 1), delayMs);
     }
+}
+
+let shuttingDown = false;
+
+// docker compose stops and recreates the container with SIGTERM: save the rated queue's runtime
+// state, leave the gateway and close the DB pool before exiting.
+async function shutdown(signal) {
+    if (shuttingDown) return;
+    shuttingDown = true;
+    console.log(`[Futbot] ${signal} received, shutting down.`);
+    setTimeout(() => process.exit(1), SHUTDOWN_TIMEOUT_MS).unref();
+    try {
+        await competitiveRatedQueue.stopCompetitiveRatedQueue();
+        await client.destroy();
+        await closePool();
+    } catch (err) {
+        console.error('[Futbot] Shutdown failed:', err);
+    }
+    process.exit(0);
 }
 
 function start() {
@@ -136,6 +160,8 @@ function start() {
     }
 
     console.log('Starting Futbot...');
+    process.once('SIGTERM', () => shutdown('SIGTERM'));
+    process.once('SIGINT', () => shutdown('SIGINT'));
     loginWithRetry(FUTBOT_TOKEN);
 }
 

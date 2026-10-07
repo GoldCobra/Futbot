@@ -129,7 +129,7 @@ const {
 } = require('./matchState');
 const {
     clearRuntimeLogTimers,
-    flushRuntimeLogsForTests,
+    flushRuntimeLogs,
     logRatedError,
     logRatedInfo,
     logRatedWarn,
@@ -172,6 +172,7 @@ const {
 const {
     createId,
     flushMatchOutputQueuesForTests,
+    flushRuntimeStatePersist,
     getMatchLogDetails,
     getSearchLogDetails,
     hasPendingMatchOutput,
@@ -4523,6 +4524,19 @@ async function ensureCompetitiveRatedQueue(client) {
 // Staff escape hatch (/ratedreset): drops every search and live match from memory, including
 // stuck operation queues. Results waiting in the pending-write queue are kept; the DB rows of
 // the dropped matches are cancelled ('staff_reset') so they do not stay active until season end.
+// Shutdown (SIGTERM from docker compose): stops the queue's timers, sends buffered log lines and
+// saves the runtime state one last time, so the restarted bot resumes from the latest state.
+async function stopCompetitiveRatedQueue() {
+    if (state.reconcileTimer) {
+        clearInterval(state.reconcileTimer);
+        state.reconcileTimer = null;
+    }
+    clearMatchmakingRetryTimers();
+    await flushRuntimeLogs().catch(() => {});
+    clearRuntimeLogTimers();
+    await flushRuntimeStatePersist('shutdown');
+}
+
 async function resetCompetitiveRatedQueue(client) {
     const activeSearches = [...state.activeSearchesById.values()];
     for (const search of activeSearches) {
@@ -5306,7 +5320,7 @@ function __seedStateForTests({
 
 module.exports = {
     __createCompetitiveRatedMatchForTests: createCompetitiveRatedMatch,
-    __flushRuntimeLogsForTests: flushRuntimeLogsForTests,
+    __flushRuntimeLogsForTests: flushRuntimeLogs,
     __flushOutputQueuesForTests: flushMatchOutputQueuesForTests,
     __getStateSnapshot,
     __postInitialGameSetupForTests: postInitialGameSetup,
@@ -5345,5 +5359,6 @@ module.exports = {
     normalizeDiscordId,
     renderFinalMatchResultMessage,
     renderGameResultMessage,
-    resetCompetitiveRatedQueue
+    resetCompetitiveRatedQueue,
+    stopCompetitiveRatedQueue
 };

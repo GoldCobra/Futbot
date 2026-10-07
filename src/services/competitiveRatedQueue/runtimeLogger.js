@@ -263,7 +263,7 @@ function logRatedError(client, scope, event, error, details = {}) {
     logRated('error', client, scope, event, errorDetails);
 }
 
-async function flushRuntimeLogsForTests() {
+async function flushRuntimeLogs() {
     for (const threadId of [...state.runtimeLogBuffersByThreadId.keys()]) {
         flushInfoBuffer(threadId);
     }
@@ -406,7 +406,7 @@ async function runRatedRuntimeLogCleanup(client, now = Date.now()) {
     for (const route of getAllLogRoutes()) {
         flushInfoBuffer(route.threadId);
     }
-    await flushRuntimeLogsForTests();
+    await flushRuntimeLogs();
 
     const cutoffTimestamp = now - RATED_RUNTIME_LOG_RETENTION_MS;
     for (const route of getAllLogRoutes()) {
@@ -439,7 +439,7 @@ function startRatedRuntimeLogCleanupLoop(client) {
 
 module.exports = {
     clearRuntimeLogTimers,
-    flushRuntimeLogsForTests,
+    flushRuntimeLogs,
     formatLogLine,
     logRatedError,
     logRatedInfo,

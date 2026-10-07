@@ -15,7 +15,7 @@ jest.mock('../../src/services/competitiveRating', () => ({
 
 const { RatedMatchStateError } = require('../../src/db/errors');
 const { state } = require('../../src/services/competitiveRatedQueue/state');
-const { flushRuntimeLogsForTests } = require('../../src/services/competitiveRatedQueue/runtimeLogger');
+const { flushRuntimeLogs } = require('../../src/services/competitiveRatedQueue/runtimeLogger');
 const { enqueueCompetitiveDbOp, runPendingCompetitiveDbOps } = require('../../src/services/competitiveRatedQueue/dbOps');
 
 const MSC_1V1_LOG_THREAD = '1503758199638196255';
@@ -52,7 +52,7 @@ function completePayload(overrides = {}) {
 }
 
 async function logLines(client, threadId) {
-    await flushRuntimeLogsForTests();
+    await flushRuntimeLogs();
     const thread = client.threads.get(threadId);
     return (thread?.send.mock.calls ?? []).map(([payload]) => payload.content).join('\n');
 }

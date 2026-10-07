@@ -40,9 +40,10 @@ function isTransientDbError(err) {
   return TRANSIENT_DB_MESSAGES.some(pattern => message.includes(pattern));
 }
 
-function resetPoolForTransientError(err) {
+// After a transient error new requests wait briefly (circuit breaker) instead of hammering an
+// unreachable server. The pool itself stays: it drops broken connections and opens new ones.
+function openCircuitForTransientError(err) {
   if (!isTransientDbError(err)) return;
-  poolPromise = null;
   circuitOpenUntil = Date.now() + Number(process.env.DB_CIRCUIT_OPEN_MS ?? 10000);
 }
 
@@ -66,7 +67,7 @@ async function withDbRetry(operation) {
       return result;
     } catch (err) {
       lastError = err;
-      resetPoolForTransientError(err);
+      openCircuitForTransientError(err);
       if (!isTransientDbError(err) || attempt >= attempts) {
         throw err;
       }

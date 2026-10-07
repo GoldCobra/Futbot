@@ -55,7 +55,8 @@ describe('competitiveRatedQueue internal modules', () => {
             'normalizeDiscordId',
             'renderFinalMatchResultMessage',
             'renderGameResultMessage',
-            'resetCompetitiveRatedQueue'
+            'resetCompetitiveRatedQueue',
+            'stopCompetitiveRatedQueue'
         ]);
     });
 

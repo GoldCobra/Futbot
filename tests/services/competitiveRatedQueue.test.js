@@ -5951,6 +5951,19 @@ describe('competitiveRatedQueue', () => {
                 expect(mockRecordCompetitiveResult).not.toHaveBeenCalled();
             });
 
+            it('saves the latest runtime state when the bot shuts down', async () => {
+                competitiveRatedQueue.__seedStateForTests({
+                    activeMatches: [createMatchFixture({ stage: 'awaiting_winner', score: { team1: 1, team2: 0 } })]
+                });
+
+                await competitiveRatedQueue.stopCompetitiveRatedQueue();
+
+                const loaded = await runtimeState.loadCompetitiveRatedRuntimeState();
+                expect(loaded.activeMatches.map(match => [match.id, match.stage, match.score])).toEqual([
+                    ['match-1', 'awaiting_winner', { team1: 1, team2: 0 }]
+                ]);
+            });
+
             it('keeps an unreadable runtime file aside instead of overwriting it', async () => {
                 await fsPromises.mkdir(runtimeDir, { recursive: true });
                 await fsPromises.writeFile(runtimeState.getRuntimeStatePath(), '{ not json', 'utf8');

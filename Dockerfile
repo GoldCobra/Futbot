@@ -12,4 +12,4 @@ COPY data ./data
 COPY scripts ./scripts
 COPY src ./src
 
-CMD ["npm", "start"]
+CMD ["node", "index.js"]

@@ -1,6 +1,7 @@
 const CONSTANTS = require('./constants');
 const EMOJIS = require('./emoji');
 const discord = require('./discord');
+const helpers = require('./helpers');
 const { PermissionsBitField } = require('discord.js');
 
 function normalizeError(err) {
@@ -33,13 +34,13 @@ const errorHandler = (err, client = undefined, msg = false, location = "internal
                 console.error(debugMessage);
                 return;
             }
-            await discord.safeSend(debugChannel, debugMessage);
+            await helpers.sendSplitMessages(async part => await discord.safeSend(debugChannel, part), debugMessage, false);
         })().catch((sendErr) => {
             console.error(sendErr && sendErr.message ? sendErr.message : JSON.stringify(sendErr));
         });
     }
     else {
-        console.error(err.message);
+        console.error(err.stack ?? err.message);
     }
 };
 
