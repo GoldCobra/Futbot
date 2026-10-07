@@ -34,10 +34,11 @@ module.exports = {
             return;
         }
 
+        // Repairing the panels takes longer than Discord's 3-second reply window.
+        await interaction.deferReply({ flags: MessageFlags.Ephemeral });
         await competitiveRatedQueue.ensureCompetitiveRatedQueue(interaction.client);
-        await interaction.reply({
-            content: 'Competitive Rated panels repaired and channel locks reapplied.',
-            flags: MessageFlags.Ephemeral
+        await interaction.editReply({
+            content: 'Competitive Rated panels repaired and channel locks reapplied.'
         });
     }
 };

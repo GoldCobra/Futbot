@@ -156,7 +156,7 @@ const {
     editOrSendRequiredThreadMessage,
     fetchThreadMessage
 } = require('./threadMessages');
-const { runMatchTransition } = require('./matchTransitions');
+const { isTerminalStage, runMatchTransition, transitionMatchStage } = require('./matchTransitions');
 const {
     createIssueReportPost,
     isReportableMatch,
@@ -226,9 +226,23 @@ async function recoverRuntimeState(client) {
     runtimeStateRecovered = true;
 
     const runtimeState = await loadCompetitiveRatedRuntimeState();
+    let restoredDbOps = 0;
+    for (const op of runtimeState.pendingCompetitiveDbOps) {
+        if (!state.pendingCompetitiveDbOpsByKey.has(op.key)) {
+            state.pendingCompetitiveDbOpsByKey.set(op.key, op);
+            restoredDbOps += 1;
+        }
+    }
+
     let restoredMatches = 0;
+    let interruptedMatches = 0;
     for (const match of runtimeState.activeMatches) {
         if (state.activeMatchesById.has(match.id)) {
+            continue;
+        }
+        if (isTerminalStage(match.stage)) {
+            await recoverInterruptedTerminalMatch(match, client);
+            interruptedMatches += 1;
             continue;
         }
         restoreRuntimeMatchIndexes(match);
@@ -239,22 +253,59 @@ async function recoverRuntimeState(client) {
         }));
     }
 
-    let restoredDbOps = 0;
-    for (const op of runtimeState.pendingCompetitiveDbOps) {
-        if (!state.pendingCompetitiveDbOpsByKey.has(op.key)) {
-            state.pendingCompetitiveDbOpsByKey.set(op.key, op);
-            restoredDbOps += 1;
-        }
-    }
-
-    if (restoredMatches || restoredDbOps) {
+    if (restoredMatches || restoredDbOps || interruptedMatches) {
         logRatedWarn(client, { all: true }, 'runtime_state.recovered', {
             activeMatches: restoredMatches,
+            interruptedMatches,
             pendingCompetitiveDbOps: restoredDbOps
         });
         await reconcileActiveMatchControls(client);
         scheduleRuntimeStatePersist('runtime_recovered');
     }
+}
+
+// A match reaches the runtime file with a terminal stage only when the bot stopped in the
+// middle of completeMatch/cancelMatch. Its players are released right away; the one-time DB
+// write is finished through the idempotent pending-write queue and the thread is closed.
+async function recoverInterruptedTerminalMatch(match, client) {
+    logRatedWarn(client, match, 'runtime_state.interrupted_terminal_match', getMatchLogDetails(match, {
+        cancelReason: match.cancelReason ?? null
+    }));
+    if (match.stage === 'complete') {
+        if (match.ratedMatchId && isReportableMatch(match) && !match.competitiveDbFailed) {
+            const winnerTeamNumber = match.score.team1 >= match.firstTo ? 1 : 2;
+            enqueueCompetitiveDbOp(
+                'complete_competitive',
+                buildCompleteCompetitiveDbPayload(match, winnerTeamNumber),
+                match,
+                client,
+                'runtime_recovered_completion'
+            );
+        }
+        scheduleCompletedThreadClose(match, client);
+        return;
+    }
+
+    if (match.cancelReason && match.ratedMatchId) {
+        enqueueCompetitiveDbOp('cancel_match', buildCancelMatchDbPayload(match, match.cancelReason), match, client, 'runtime_recovered_cancel');
+    }
+    await finalizeThreadLifecycle(match, client, {
+        prefix: CANCELLED_THREAD_PREFIX,
+        closeReason: `${match.gameType} competitive match cancel recovery`,
+        renameReason: `${match.gameType} competitive match cancel recovery rename`,
+        result: 'cancelled',
+        source: 'runtime_recovery'
+    });
+}
+
+function setMatchStage(match, stage, reason) {
+    transitionMatchStage(match, stage, {
+        onInvalid: fromStage => logRatedWarn(state.client, match, 'match.stage_transition_unexpected', getMatchLogDetails(match, {
+            from: fromStage,
+            to: stage,
+            reason
+        }))
+    });
 }
 
 function hasExpectedMatchStageAndToken(match, interaction, expectedStage, gameNumber = getNextGameNumber(match)) {
@@ -1541,6 +1592,27 @@ async function addSearch(search, client) {
     scheduleMatchmaking(search.channelId, client);
 }
 
+const MATCHMAKING_RETRY_DELAY_MS = 30_000;
+
+function scheduleMatchmakingRetry(channelId, client) {
+    if (state.matchmakingRetryTimersByChannelId.has(channelId)) {
+        return;
+    }
+    const timer = setTimeout(() => {
+        state.matchmakingRetryTimersByChannelId.delete(channelId);
+        scheduleMatchmaking(channelId, client);
+    }, MATCHMAKING_RETRY_DELAY_MS);
+    timer.unref?.();
+    state.matchmakingRetryTimersByChannelId.set(channelId, timer);
+}
+
+function clearMatchmakingRetryTimers() {
+    for (const timer of state.matchmakingRetryTimersByChannelId.values()) {
+        clearTimeout(timer);
+    }
+    state.matchmakingRetryTimersByChannelId.clear();
+}
+
 function scheduleMatchmaking(channelId, client) {
     if (state.matchmakingTimersByChannelId.has(channelId)) {
         state.pendingMatchmakingChannels.add(channelId);
@@ -1809,6 +1881,11 @@ async function createCompetitiveRatedMatch(panelConfig, searches, client, {
             channel: channel.id,
             searches: searches.map(search => search.id)
         });
+        // Nothing was written, so the waiting players are tried again once the DB is back
+        // instead of only when someone else joins the pool.
+        if (isTransientDbError(error)) {
+            scheduleMatchmakingRetry(panelConfig.channelId, client);
+        }
         return null;
     }
 
@@ -1849,10 +1926,6 @@ async function createCompetitiveRatedMatch(panelConfig, searches, client, {
         homeTeam: homeTeamIndex,
         players: searches.map(search => search.userId)
     });
-
-    for (const search of searches) {
-        await closeSearch(search, 'matched', client);
-    }
 
     const match = {
         id: matchId,
@@ -1906,18 +1979,24 @@ async function createCompetitiveRatedMatch(panelConfig, searches, client, {
         competitiveDbPendingNoticeMessageId: null
     };
 
+    // The players count as "in a match" before their searches are closed, so no join on
+    // another panel can slip in while the searches are being cleaned up.
+    const allMemberIds = match.teams.flatMap(team => team.memberIds);
     state.activeMatchesById.set(match.id, match);
     state.activeMatchesByThreadId.set(thread.id, match);
+    for (const memberId of allMemberIds) {
+        state.activeMatchesByUserId.set(memberId, match);
+    }
     scheduleRuntimeStatePersist('match_created');
+
+    for (const search of searches) {
+        await closeSearch(search, 'matched', client);
+    }
+
     const participantMentions = getMatchParticipantMentions(match);
     for (const search of searches) {
         search.matchedThreadUrl = threadUrl;
         search.matchmakingReservedBy = null;
-    }
-
-    const allMemberIds = match.teams.flatMap(team => team.memberIds);
-    for (const memberId of allMemberIds) {
-        state.activeMatchesByUserId.set(memberId, match);
     }
     await Promise.all(allMemberIds.map(memberId =>
         thread.members.add(memberId).catch(err =>
@@ -1987,7 +2066,7 @@ async function createCompetitiveRatedMatch(panelConfig, searches, client, {
             reason: 'no_setup_required'
         }));
         await postInitialGameSetup(match, client);
-        match.stage = 'awaiting_winner';
+        setMatchStage(match, 'awaiting_winner', 'no_setup_auto_start');
         await postGameImageIfMissing(match, client, thread);
         await postWinnerControl(match, client, thread);
     }
@@ -2496,10 +2575,13 @@ async function cancelMatch(match, client, {
     const thread = await client.channels.fetch(match.threadId).catch(() => null);
     logRatedWarn(client, match, logEvent, getMatchLogDetails(match, logDetails));
 
-    match.stage = 'cancelled';
+    setMatchStage(match, 'cancelled', source);
+    match.cancelReason = cancelReason;
     if (cancelReason && match.ratedMatchId) {
+        // Not awaited, so a slow or unreachable DB never delays the thread notice; a transient
+        // failure is retried from the pending-write queue instead of being lost.
         ratedMatchDao.cancelMatch({ matchCode: match.id, cancelReason })
-            .catch(err => logRatedError(client, match, 'rated_match.cancel_failed', err, getMatchLogDetails(match)));
+            .catch(err => handleRatedMatchCancelFailure(match, client, cancelReason, err));
     }
     if (thread?.send) {
         await clearCurrentSetupComponents(match, thread);
@@ -2515,6 +2597,23 @@ async function cancelMatch(match, client, {
         result: 'cancelled',
         source
     });
+}
+
+function buildCancelMatchDbPayload(match, cancelReason) {
+    return {
+        ratedMatchId: match.ratedMatchId,
+        matchCode: match.id,
+        threadId: match.threadId,
+        cancelReason
+    };
+}
+
+function handleRatedMatchCancelFailure(match, client, cancelReason, err) {
+    if (isTransientDbError(err)) {
+        enqueueCompetitiveDbOp('cancel_match', buildCancelMatchDbPayload(match, cancelReason), match, client, 'transient_cancel_failure');
+        return;
+    }
+    logRatedError(client, match, 'rated_match.cancel_failed', err, getMatchLogDetails(match));
 }
 
 async function cancelMatchForInactivity(match, phase, client) {
@@ -2700,7 +2799,14 @@ async function postInitialGameSetupInner(match, client) {
     }
 }
 
+// Output worker for a game whose stadium and captain are set; the stage is already
+// awaiting_winner when it is queued. It runs outside the match lock, so it must never move the
+// stage itself: a win reported (or a cancel) while it waits would otherwise be undone.
 async function advanceMatchToWinnerControlAfterSelections(match, client, thread = null) {
+    if (match.stage !== 'awaiting_winner') {
+        logRatedInfo(client, match, 'match.output.stale_winner_control_skipped', getMatchLogDetails(match));
+        return;
+    }
     thread ??= await client.channels.fetch(match.threadId).catch(() => null);
     const block = getOrCreateGameBlock(match);
 
@@ -2716,13 +2822,16 @@ async function advanceMatchToWinnerControlAfterSelections(match, client, thread 
         }
     }
 
-    match.stage = 'awaiting_winner';
+    if (match.stage !== 'awaiting_winner') {
+        logRatedInfo(client, match, 'match.output.stale_winner_control_skipped', getMatchLogDetails(match));
+        return;
+    }
     if (thread) await clearStartButtonComponents(thread, block);
     await postWinnerControl(match, client, thread);
 }
 
 function queueAdvanceMatchToWinnerControlAfterSelections(match, client, thread = null, source = 'manual_selection') {
-    match.stage = 'awaiting_winner';
+    setMatchStage(match, 'awaiting_winner', source);
     return queueMatchOutput(match, client, 'advance_to_winner_control_after_selections', async () => {
         await advanceMatchToWinnerControlAfterSelections(match, client, thread);
     }, {
@@ -3164,7 +3273,7 @@ async function finishMatchWithCompetitiveDbPending(match, winnerMention, client,
 
 async function completeMatch(match, winnerMention, client) {
     if (match.stage === 'complete') return;
-    match.stage = 'complete';
+    setMatchStage(match, 'complete', 'match_decided');
     const thread = await client.channels.fetch(match.threadId).catch(() => null);
     const completedThreadName = buildTerminalThreadName(match, COMPLETED_THREAD_PREFIX);
     const winnerTeamNumber = match.score.team1 >= match.firstTo ? 1 : 2;
@@ -3346,7 +3455,7 @@ async function handleWinnerSelection(interaction, match) {
 
     match.selectedStadium = null;
     match.selectedCaptain = null;
-    match.stage = 'awaiting_loser_confirmation';
+    setMatchStage(match, 'awaiting_loser_confirmation', 'game_win_reported');
 
     if (!requiresSetup(match.gameType)) {
         interaction.deleteReply().catch(error => {
@@ -3402,17 +3511,20 @@ async function handleLoserConfirm(interaction, match) {
         return;
     }
 
+    // loserAdvantagePromptShown doubles as "this game's result is recorded": it is set only after
+    // recordConfirmedGameResult succeeded, so a failed write leaves the confirmation retryable
+    // instead of letting the timeout path skip the write.
     if (!requiresSetup(match.gameType)) {
         await ensureDeferredReply(interaction);
         const confirmedGameNumber = pendingGameNumber;
         const isMatchComplete = isMatchDecided(match);
         if (isMatchComplete) {
-            match.loserAdvantagePromptShown = true;
             const winnerMention = getPendingResultWinnerMention(match);
             if (!await recordConfirmedGameResult(match, interaction.client, interaction.user.id)) {
                 await interaction.deleteReply().catch(() => {});
                 return;
             }
+            match.loserAdvantagePromptShown = true;
             clearPendingResult(match);
             await interaction.deleteReply().catch(() => {});
             await completeMatch(match, winnerMention, interaction.client);
@@ -3424,14 +3536,14 @@ async function handleLoserConfirm(interaction, match) {
         }
 
         const confirmedResultMessage = renderNoSetupGameResultMessage(match, '');
-        match.loserAdvantagePromptShown = true;
         if (!await recordConfirmedGameResult(match, interaction.client, interaction.user.id)) {
             await interaction.deleteReply().catch(() => {});
             return;
         }
+        match.loserAdvantagePromptShown = true;
         clearPendingResult(match);
         match.startClickedUserIds = [];
-        match.stage = 'awaiting_winner';
+        setMatchStage(match, 'awaiting_winner', 'loss_confirmed_no_setup');
         logRatedInfo(interaction.client, match, 'game.loss_confirmed', getMatchLogDetails(match, {
             game: confirmedGameNumber,
             loser: interaction.user.id
@@ -3464,12 +3576,12 @@ async function handleLoserConfirm(interaction, match) {
     const confirmedGameNumber = pendingGameNumber;
     const isMatchComplete = isMatchDecided(match);
     if (isMatchComplete) {
-        match.loserAdvantagePromptShown = true;
         const winnerMention = getPendingResultWinnerMention(match);
         if (!await recordConfirmedGameResult(match, interaction.client, interaction.user.id)) {
             await interaction.deleteReply().catch(() => {});
             return;
         }
+        match.loserAdvantagePromptShown = true;
         await clearWinnerWaitingPrompt(match);
         clearPendingResult(match);
         await interaction.deleteReply().catch(() => {});
@@ -3571,7 +3683,7 @@ async function handleLoserAdvantage(interaction, match, choice) {
     match.startClickedUserIds = [];
     clearPendingResult(match);
     match.loserAdvantagePromptShown = false;
-    match.stage = 'awaiting_start';
+    setMatchStage(match, 'awaiting_start', 'advantage_chosen');
     clearMatchTimers(match);
 
     const loserSelectionPlayer = choice === 'home' ? 'home' : 'away';
@@ -3695,7 +3807,7 @@ async function resolveLoserConfirmationIfTimedOut(matchId, phase, client) {
             clearPendingResult(match);
             match.loserAdvantagePromptShown = false;
             match.startClickedUserIds = [];
-            match.stage = 'awaiting_winner';
+            setMatchStage(match, 'awaiting_winner', 'loss_confirm_timeout_no_setup');
             logRatedWarn(client, match, 'game.loss_confirm_timeout', getMatchLogDetails(match, {
                 game: timedOutGameNumber
             }));
@@ -3737,17 +3849,21 @@ async function resolveLoserConfirmationIfTimedOut(matchId, phase, client) {
         const nextSides = applyLoserChoice(match.homeTeamIndex, match.loserTeamIndex, choice);
         const timedOutGameNumber = getPendingResultGameNumber(match);
         const winnerMention = getPendingResultWinnerMention(match);
+        const randomStadium = options.stadiums[Math.floor(Math.random() * options.stadiums.length)];
+        const randomCaptain = options.captains[Math.floor(Math.random() * options.captains.length)];
+        await clearWinnerWaitingPrompt(match);
+        // Sides and picks for the next game change only once the timed-out game is recorded; a
+        // failed write leaves the match as it was, so the next attempt cannot swap twice.
+        if (!advantagePromptAlreadyShown && !await recordConfirmedGameResult(match, client, null)) return;
         match.homeTeamIndex = nextSides.homeTeamIndex;
         match.awayTeamIndex = nextSides.awayTeamIndex;
-        match.selectedStadium = options.stadiums[Math.floor(Math.random() * options.stadiums.length)];
-        match.selectedCaptain = options.captains[Math.floor(Math.random() * options.captains.length)];
-        await clearWinnerWaitingPrompt(match);
-        if (!advantagePromptAlreadyShown && !await recordConfirmedGameResult(match, client, null)) return;
+        match.selectedStadium = randomStadium;
+        match.selectedCaptain = randomCaptain;
         storeDelayedGameResult(match, timedOutGameNumber, winnerMention);
         clearPendingResult(match);
         match.loserAdvantagePromptShown = false;
         match.startClickedUserIds = [];
-        match.stage = 'awaiting_winner';
+        setMatchStage(match, 'awaiting_winner', 'advantage_timeout');
         logRatedWarn(client, match, 'game.advantage_timeout', getMatchLogDetails(match, {
             game: timedOutGameNumber,
             choice,
@@ -3868,7 +3984,7 @@ async function handleSetupSelection(interaction, match, kind) {
     block[config.deliveredKey] = false;
 
     if (match[config.otherSelectedKey]) {
-        match.stage = 'awaiting_winner';
+        setMatchStage(match, 'awaiting_winner', 'selections_complete');
         queueMatchOutput(match, interaction.client, 'advance_to_winner_control_after_manual_selection', async () => {
             const thread = await interaction.client.channels.fetch(match.threadId).catch(() => null);
             if (selectedOpenButtonId) {
@@ -4309,17 +4425,48 @@ async function tick(client) {
     await reconcileAllPanels(client);
 }
 
+// A slow tick (season finalization, a guild-wide rank role sweep) must not overlap the next one.
+let tickInFlight = false;
+
 function startReconcileLoop(client) {
     if (state.reconcileTimer) {
         return;
     }
 
     state.reconcileTimer = setInterval(() => {
-        tick(client).catch(error => {
-            console.error(`Competitive pool tick failed: ${error.message}`);
-            logRatedError(client, { all: true }, 'queue.tick_failed', error);
-        });
+        if (tickInFlight) {
+            return;
+        }
+        tickInFlight = true;
+        tick(client)
+            .catch(error => {
+                console.error(`Competitive pool tick failed: ${error.message}`);
+                logRatedError(client, { all: true }, 'queue.tick_failed', error);
+            })
+            .finally(() => {
+                tickInFlight = false;
+            });
     }, CONFIG.STATUS_RECONCILE_INTERVAL_MS);
+}
+
+// Match buttons clicked right after a restart can arrive before the runtime file is restored.
+// They wait briefly (inside Discord's 3-second acknowledgement window) instead of finding no
+// match and being dropped.
+const RUNTIME_RECOVERY_CLICK_WAIT_MS = 2000;
+let runtimeRecoveryInFlight = null;
+
+async function waitForRuntimeRecovery() {
+    if (!runtimeRecoveryInFlight) {
+        return;
+    }
+    let timer = null;
+    await Promise.race([
+        runtimeRecoveryInFlight,
+        new Promise(resolve => {
+            timer = setTimeout(resolve, RUNTIME_RECOVERY_CLICK_WAIT_MS);
+        })
+    ]);
+    clearTimeout(timer);
 }
 
 async function ensureCompetitiveRatedQueue(client) {
@@ -4329,12 +4476,23 @@ async function ensureCompetitiveRatedQueue(client) {
     for (const panelConfig of CONFIG.PANEL_CHANNELS) {
         logRatedInfo(client, panelConfig, 'queue.started', { channel: panelConfig.channelId });
     }
-    await prewarmOptionsForPanelGameTypes(client);
+    let finishRuntimeRecovery = null;
+    if (!runtimeStateRecovered && isRuntimeStateEnabled()) {
+        runtimeRecoveryInFlight = new Promise(resolve => {
+            finishRuntimeRecovery = resolve;
+        });
+    }
     try {
+        await prewarmOptionsForPanelGameTypes(client);
         await recoverRuntimeState(client);
     } catch (err) {
         console.error(`[RatedQueue] Runtime state recovery failed: ${err.message}`);
         logRatedError(client, { all: true }, 'runtime_state.recovery_failed', err);
+    } finally {
+        if (finishRuntimeRecovery) {
+            finishRuntimeRecovery();
+            runtimeRecoveryInFlight = null;
+        }
     }
     for (const meta of state.panelMetaByChannelId.values()) {
         meta.channelLockApplied = false;
@@ -4374,6 +4532,9 @@ async function ensureCompetitiveRatedQueue(client) {
     }
 }
 
+// Staff escape hatch (/ratedreset): drops every search and live match from memory, including
+// stuck operation queues. Results waiting in the pending-write queue are kept; the DB rows of
+// the dropped matches are cancelled ('staff_reset') so they do not stay active until season end.
 async function resetCompetitiveRatedQueue(client) {
     const activeSearches = [...state.activeSearchesById.values()];
     for (const search of activeSearches) {
@@ -4381,7 +4542,8 @@ async function resetCompetitiveRatedQueue(client) {
         removeSearchFromState(search);
     }
 
-    for (const match of state.activeMatchesById.values()) {
+    const droppedMatches = [...state.activeMatchesById.values()];
+    for (const match of droppedMatches) {
         clearMatchTimers(match);
     }
     clearCompletedThreadCloseTimers();
@@ -4404,11 +4566,25 @@ async function resetCompetitiveRatedQueue(client) {
         clearTimeout(timer);
     }
     state.matchmakingTimersByChannelId.clear();
+    clearMatchmakingRetryTimers();
     for (const timer of state.panelStatusRefreshTimersByChannelId.values()) {
         clearTimeout(timer);
     }
     state.panelStatusRefreshTimersByChannelId.clear();
     state.runtimeLogQueuesByThreadId.clear();
+
+    for (const match of droppedMatches) {
+        if (!match.ratedMatchId) {
+            continue;
+        }
+        await ratedMatchDao.cancelMatch({ matchCode: match.id, cancelReason: 'staff_reset' })
+            .catch(err => handleRatedMatchCancelFailure(match, client, 'staff_reset', err));
+    }
+    if (droppedMatches.length) {
+        logRatedWarn(client, { all: true }, 'queue.reset_matches_cancelled', {
+            matches: droppedMatches.map(match => match.id)
+        });
+    }
 
     startRatedRuntimeLogCleanupLoop(client);
     await reconcileAllPanels(client);
@@ -4866,7 +5042,11 @@ async function handleMatchInteraction(interaction) {
         return await handleRematchInteraction(interaction);
     }
 
-    const match = state.activeMatchesById.get(matchId);
+    let match = state.activeMatchesById.get(matchId);
+    if (!match && runtimeRecoveryInFlight) {
+        await waitForRuntimeRecovery();
+        match = state.activeMatchesById.get(matchId);
+    }
     if (!match) {
         await silentlyAcknowledgeInteraction(interaction);
         return true;
@@ -5019,6 +5199,8 @@ function __resetState() {
     }
     resetRuntimePersist();
     runtimeStateRecovered = false;
+    runtimeRecoveryInFlight = null;
+    tickInFlight = false;
     competitiveWhrRunInFlight = null;
 
     for (const search of state.activeSearchesById.values()) {
@@ -5051,6 +5233,7 @@ function __resetState() {
         clearTimeout(timer);
     }
     state.matchmakingTimersByChannelId.clear();
+    clearMatchmakingRetryTimers();
     for (const timer of state.panelStatusRefreshTimersByChannelId.values()) {
         clearTimeout(timer);
     }

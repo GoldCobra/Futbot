@@ -18,6 +18,7 @@ const state = {
     operationQueues: new Map(),
     pendingMatchmakingChannels: new Set(),
     matchmakingTimersByChannelId: new Map(),
+    matchmakingRetryTimersByChannelId: new Map(),
     panelStatusRefreshTimersByChannelId: new Map(),
     outputQueuesByMatchId: new Map(),
     outputQueueMetaByMatchId: new Map(),
@@ -38,6 +39,9 @@ async function withOperationQueue(scopeKey, callback) {
     });
 
     state.operationQueues.set(scopeKey, cleanup);
+    // A failure reaches the caller through `queued`; the stored chain only orders later callers
+    // and must not surface the same error again as an unhandled rejection.
+    cleanup.catch(() => {});
     return await queued;
 }
 

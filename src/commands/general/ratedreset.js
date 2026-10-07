@@ -34,11 +34,12 @@ module.exports = {
             return;
         }
 
+        // Reset and panel rebuild take longer than Discord's 3-second reply window.
+        await interaction.deferReply({ flags: MessageFlags.Ephemeral });
         await competitiveRatedQueue.resetCompetitiveRatedQueue(interaction.client);
         await competitiveRatedQueue.ensureCompetitiveRatedQueue(interaction.client);
-        await interaction.reply({
-            content: 'Competitive Rated queue state cleared and panels rebuilt.',
-            flags: MessageFlags.Ephemeral
+        await interaction.editReply({
+            content: 'Competitive Rated queue state cleared and panels rebuilt.'
         });
     }
 };

@@ -95,6 +95,18 @@ async function saveCompetitiveRatedRuntimeState({ activeMatches = [], pendingCom
     return true;
 }
 
+// A file that cannot be read may still hold pending results; it is moved aside so the next
+// save does not overwrite it and staff can recover it by hand.
+async function keepUnreadableRuntimeState(statePath) {
+    const keptPath = `${statePath}.unreadable-${Date.now()}`;
+    try {
+        await fs.rename(statePath, keptPath);
+        return keptPath;
+    } catch (error) {
+        return `<not kept: ${error.message}>`;
+    }
+}
+
 async function loadCompetitiveRatedRuntimeState() {
     if (!isRuntimeStateEnabled()) {
         return {
@@ -121,11 +133,13 @@ async function loadCompetitiveRatedRuntimeState() {
     try {
         payload = JSON.parse(rawText);
     } catch {
-        console.error('[RatedQueue] Runtime state file is malformed — starting fresh.');
+        const keptAt = await keepUnreadableRuntimeState(statePath);
+        console.error(`[RatedQueue] Runtime state file is malformed — starting fresh (kept as ${keptAt}).`);
         return { activeMatches: [], pendingCompetitiveDbOps: [] };
     }
     if (payload?.version !== RUNTIME_STATE_VERSION) {
-        console.error(`[RatedQueue] Runtime state version mismatch (found ${payload?.version}, expected ${RUNTIME_STATE_VERSION}) — starting fresh.`);
+        const keptAt = await keepUnreadableRuntimeState(statePath);
+        console.error(`[RatedQueue] Runtime state version mismatch (found ${payload?.version}, expected ${RUNTIME_STATE_VERSION}) — starting fresh (kept as ${keptAt}).`);
         return { activeMatches: [], pendingCompetitiveDbOps: [] };
     }
 

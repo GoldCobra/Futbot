@@ -5471,4 +5471,490 @@ describe('competitiveRatedQueue', () => {
             expect(getButtonCustomIdByLabel(confirmPayload, 'Cancel Match')).toBeUndefined();
         });
     });
+
+    // Repeated clicks, racing timers and crashes must never apply a one-time effect twice or
+    // leave a match half-changed (SYSTEM-OVERVIEW §3c, refactoring 2026-10).
+    describe('one-time effects under repeats, races and failures', () => {
+        function transientDbError(message = 'Timeout: Request failed to complete') {
+            return Object.assign(new Error(message), { transientDbError: true });
+        }
+
+        function decidedMsblMatch(overrides = {}) {
+            return createMatchFixture({
+                firstTo: 1,
+                gameType: 'MSBL',
+                score: { team1: 1, team2: 0 },
+                stage: 'awaiting_loser_confirmation',
+                loserTeamIndex: 2,
+                loserRepMention: '<@away-user>',
+                pendingResult: {
+                    gameNumber: 1,
+                    winnerTeamIndex: 1,
+                    winnerMention: '<@home-user>',
+                    loserTeamIndex: 2,
+                    homeTeamNumber: 1
+                },
+                pendingResultGameNumber: 1,
+                ...overrides
+            });
+        }
+
+        it('counts a GAME WIN clicked twice at the same time only once', async () => {
+            const { client } = createMatchClientMock();
+            const match = createMatchFixture({ gameType: 'MSBL', stage: 'awaiting_winner' });
+            competitiveRatedQueue.__seedStateForTests({ activeMatches: [match] });
+
+            await Promise.all([1, 2].map(() => competitiveRatedQueue.handleInteraction(createButtonInteractionMock({
+                customId: 'rated:competitive:match:winner:match-1:1',
+                userId: 'home-user',
+                client
+            }))));
+            await flushOutputQueues();
+
+            expect(match.score).toEqual({ team1: 1, team2: 0 });
+            expect(match.stage).toBe('awaiting_loser_confirmation');
+        });
+
+        it('writes the deciding game and the ratings once when the confirmation and its timeout race', async () => {
+            const { client } = createMatchClientMock();
+            const match = decidedMsblMatch({
+                timeoutPhase: 'loser_confirmation',
+                timeoutDeadlineAt: Date.now() - 1000
+            });
+            competitiveRatedQueue.__seedStateForTests({ activeMatches: [match] });
+
+            await Promise.all([
+                competitiveRatedQueue.handleInteraction(createButtonInteractionMock({
+                    customId: 'rated:competitive:match:loser_confirm:match-1:1',
+                    userId: 'away-user',
+                    client
+                })),
+                competitiveRatedQueue.__tickForTests(client)
+            ]);
+            await flushOutputQueues();
+
+            expect(mockRatedMatchDao.recordGame).toHaveBeenCalledTimes(1);
+            expect(mockRecordCompetitiveResult).toHaveBeenCalledTimes(1);
+            expect(match.stage).toBe('complete');
+            expect(competitiveRatedQueue.__getStateSnapshot().activeMatchCount).toBe(0);
+        });
+
+        it('either cancels or scores a match when the last cancel vote and a GAME WIN race, never both', async () => {
+            const { client } = createMatchClientMock();
+            const match = createMatchFixture({
+                gameType: 'MSBL',
+                stage: 'awaiting_winner',
+                cancelVoteUserIds: ['home-user'],
+                cancelVoteGameNumber: 1
+            });
+            competitiveRatedQueue.__seedStateForTests({ activeMatches: [match] });
+
+            await Promise.all([
+                competitiveRatedQueue.handleInteraction(createButtonInteractionMock({
+                    customId: 'rated:competitive:match:cancel:match-1:1',
+                    userId: 'away-user',
+                    client
+                })),
+                competitiveRatedQueue.handleInteraction(createButtonInteractionMock({
+                    customId: 'rated:competitive:match:winner:match-1:1',
+                    userId: 'home-user',
+                    client
+                }))
+            ]);
+            await flushOutputQueues();
+
+            const cancelled = mockRatedMatchDao.cancelMatch.mock.calls.length > 0;
+            if (cancelled) {
+                expect(match.stage).toBe('cancelled');
+                expect(match.score).toEqual({ team1: 0, team2: 0 });
+            } else {
+                expect(match.stage).toBe('awaiting_loser_confirmation');
+                expect(match.score).toEqual({ team1: 1, team2: 0 });
+            }
+            expect(mockRecordCompetitiveResult).not.toHaveBeenCalled();
+        });
+
+        it('keeps a result that hit a transient DB error and rates it once the DB answers again', async () => {
+            const { client, thread } = createMatchClientMock();
+            competitiveRatedQueue.__seedStateForTests({ activeMatches: [decidedMsblMatch()] });
+            mockRecordCompetitiveResult.mockRejectedValueOnce(transientDbError());
+
+            await competitiveRatedQueue.handleInteraction(createButtonInteractionMock({
+                customId: 'rated:competitive:match:loser_confirm:match-1:1',
+                userId: 'away-user',
+                client
+            }));
+
+            expect(findThreadPayload(thread, payload => payload.content?.includes('Competitive DB sync pending'))).toBeDefined();
+            expect(competitiveRatedQueue.__getStateSnapshot()).toEqual(expect.objectContaining({
+                activeMatchCount: 0,
+                pendingCompetitiveDbOpCount: 1
+            }));
+
+            await competitiveRatedQueue.__tickForTests(client);
+            await competitiveRatedQueue.__tickForTests(client);
+
+            expect(mockRecordCompetitiveResult).toHaveBeenCalledTimes(2);
+            expect(competitiveRatedQueue.__getStateSnapshot().pendingCompetitiveDbOpCount).toBe(0);
+            expect(countThreadPayloads(thread, payload => payload.content?.includes('Competitive DB sync completed'))).toBe(1);
+        });
+
+        it('keeps the deciding confirmation retryable when its game write fails', async () => {
+            const { client } = createMatchClientMock();
+            const match = createMatchFixture({
+                stage: 'awaiting_loser_confirmation',
+                score: { team1: 2, team2: 0 },
+                loserTeamIndex: 2,
+                loserRepMention: '<@away-user>',
+                selectedStadium: createMatchOptions().stadiums[0],
+                selectedCaptain: createMatchOptions().captains[0],
+                pendingResult: {
+                    gameNumber: 2,
+                    winnerTeamIndex: 1,
+                    winnerMention: '<@home-user>',
+                    loserTeamIndex: 2,
+                    homeTeamNumber: 1
+                },
+                pendingResultGameNumber: 2
+            });
+            competitiveRatedQueue.__seedStateForTests({
+                activeMatches: [match],
+                cachedOptionsByGameType: { MSC: createMatchOptions() }
+            });
+            mockRatedMatchDao.recordGame.mockRejectedValueOnce(new Error('Violation of PRIMARY KEY constraint'));
+            const confirm = () => competitiveRatedQueue.handleInteraction(createButtonInteractionMock({
+                customId: 'rated:competitive:match:loser_confirm:match-1:2',
+                userId: 'away-user',
+                client
+            }));
+
+            await confirm();
+            expect(match.stage).toBe('awaiting_loser_confirmation');
+            expect(match.loserAdvantagePromptShown).toBe(false);
+            expect(mockRecordCompetitiveResult).not.toHaveBeenCalled();
+
+            await confirm();
+            expect(mockRatedMatchDao.recordGame).toHaveBeenCalledTimes(2);
+            expect(mockRecordCompetitiveResult).toHaveBeenCalledTimes(1);
+            expect(match.stage).toBe('complete');
+        });
+
+        it('changes sides and picks only after the timed-out game is written', async () => {
+            const randomSpy = jest.spyOn(Math, 'random').mockReturnValue(0.5);
+            try {
+                const { client } = createMatchClientMock();
+                const match = createMatchFixture({
+                    stage: 'awaiting_loser_confirmation',
+                    score: { team1: 1, team2: 0 },
+                    loserTeamIndex: 2,
+                    loserRepMention: '<@away-user>',
+                    pendingResult: {
+                        gameNumber: 1,
+                        winnerTeamIndex: 1,
+                        winnerMention: '<@home-user>',
+                        loserTeamIndex: 2,
+                        homeTeamNumber: 1
+                    },
+                    pendingResultGameNumber: 1,
+                    timeoutPhase: 'loser_confirmation',
+                    timeoutDeadlineAt: Date.now() - 1000
+                });
+                competitiveRatedQueue.__seedStateForTests({
+                    activeMatches: [match],
+                    cachedOptionsByGameType: { MSC: createMatchOptions() }
+                });
+                mockRatedMatchDao.recordGame.mockRejectedValueOnce(new Error('Violation of FOREIGN KEY constraint'));
+
+                await competitiveRatedQueue.__tickForTests(client);
+
+                expect(match.stage).toBe('awaiting_loser_confirmation');
+                expect(match.homeTeamIndex).toBe(1);
+                expect(match.selectedStadium).toBeNull();
+                expect(match.selectedCaptain).toBeNull();
+
+                match.timeoutPhase = 'loser_confirmation';
+                match.timeoutDeadlineAt = Date.now() - 1000;
+                await competitiveRatedQueue.__tickForTests(client);
+                await flushOutputQueues();
+
+                expect(mockRatedMatchDao.recordGame).toHaveBeenCalledTimes(2);
+                expect(match.stage).toBe('awaiting_winner');
+                // The loser (team 2) "chose" home: it plays HOME in game 2, swapped exactly once.
+                expect(match.homeTeamIndex).toBe(2);
+                expect(match.awayTeamIndex).toBe(1);
+                expect(match.selectedStadium).toEqual(createMatchOptions().stadiums[2]);
+            } finally {
+                randomSpy.mockRestore();
+            }
+        });
+
+        it('lets a stale watchdog worker finish without undoing a win reported meanwhile', async () => {
+            const { client, thread } = createMatchClientMock();
+            const options = createMatchOptions();
+            // Only the game image is missing, so the watchdog queues the full winner-output
+            // recovery; the selections message of game 1 is already in the thread.
+            const match = createMatchFixture({
+                stage: 'awaiting_winner',
+                selectedStadium: options.stadiums[0],
+                selectedCaptain: options.captains[0],
+                gameBlocks: [{
+                    gameNumber: 1,
+                    gameImageMessageId: null,
+                    startMessageId: null,
+                    homeOpenButtonMessageId: null,
+                    awayOpenButtonMessageId: null,
+                    homeSelectionDelivered: false,
+                    awaySelectionDelivered: false,
+                    selectionsMessageId: 'existing-selections-message',
+                    delayedResult: null,
+                    delayedResultMessageId: null
+                }]
+            });
+            competitiveRatedQueue.__seedStateForTests({
+                activeMatches: [match],
+                cachedOptionsByGameType: { MSC: options }
+            });
+            let releaseImage;
+            const originalSend = thread.send.getMockImplementation();
+            thread.send.mockImplementation(async payload => {
+                if ((payload.files ?? []).length && !releaseImage) {
+                    await new Promise(resolve => {
+                        releaseImage = resolve;
+                    });
+                }
+                return originalSend(payload);
+            });
+
+            await competitiveRatedQueue.__tickForTests(client);
+            await flushAsyncTasks();
+            expect(releaseImage).toBeDefined();
+
+            await competitiveRatedQueue.handleInteraction(createButtonInteractionMock({
+                customId: 'rated:competitive:match:winner:match-1:1',
+                userId: 'home-user',
+                client
+            }));
+            expect(match.stage).toBe('awaiting_loser_confirmation');
+
+            releaseImage();
+            await flushOutputQueues();
+            await flushOutputQueues();
+
+            expect(match.stage).toBe('awaiting_loser_confirmation');
+            expect(match.score).toEqual({ team1: 1, team2: 0 });
+        });
+
+        it('locks matched players before their searches are closed', async () => {
+            const { channel, client } = createMatchClientMock();
+            let releaseWarningCleanup;
+            const searches = [
+                createCompetitiveRatedSearch({ id: 'search-1', userId: 'home-user', username: 'Home', createdAt: 1 }),
+                createCompetitiveRatedSearch({ id: 'search-2', userId: 'away-user', username: 'Away', createdAt: 2 })
+            ];
+            searches[1].warningMessage = {
+                edit: jest.fn(() => new Promise(resolve => {
+                    releaseWarningCleanup = resolve;
+                }))
+            };
+            competitiveRatedQueue.__seedStateForTests({ activeSearches: searches });
+
+            const creation = competitiveRatedQueue.__createCompetitiveRatedMatchForTests(
+                { channelId: channel.id, gameType: 'MSBL' },
+                searches,
+                client,
+                { skipReconcile: true }
+            );
+            for (let attempt = 0; attempt < 20 && !releaseWarningCleanup; attempt += 1) {
+                await flushAsyncTasks();
+            }
+            expect(releaseWarningCleanup).toBeDefined();
+
+            // The first search is already closed at this point; its player must still count as busy.
+            expect(competitiveRatedQueue.getCompetitiveRatedBusyReason('home-user'))
+                .toBe('You are already in an active match thread.');
+
+            releaseWarningCleanup();
+            await creation;
+            expect(competitiveRatedQueue.__getStateSnapshot().activeSearchCount).toBe(0);
+        });
+
+        it('retries matchmaking after a transient DB error instead of waiting for the next join', async () => {
+            jest.useFakeTimers({ doNotFake: ['performance'] });
+            try {
+                const { channel, client } = createMatchClientMock();
+                const msblChannelId = '1502350088431992852';
+                channel.id = msblChannelId;
+                competitiveRatedQueue.__seedStateForTests({
+                    activeSearches: [
+                        createCompetitiveRatedSearch({ id: 'search-1', userId: 'home-user', username: 'Home', createdAt: 1, gameType: 'MSBL', channelId: msblChannelId }),
+                        createCompetitiveRatedSearch({ id: 'search-2', userId: 'away-user', username: 'Away', createdAt: 2, gameType: 'MSBL', channelId: msblChannelId })
+                    ]
+                });
+                mockRatedMatchDao.createMatchHeader.mockRejectedValueOnce(transientDbError('Failed to connect'));
+
+                await competitiveRatedQueue.__runMatchmakingForTests(msblChannelId, client);
+                expect(competitiveRatedQueue.__getStateSnapshot().activeMatchCount).toBe(0);
+                expect(channel.threads.create).not.toHaveBeenCalled();
+
+                jest.advanceTimersByTime(30_000);
+                for (let attempt = 0; attempt < 10; attempt += 1) {
+                    jest.advanceTimersByTime(1);
+                    await flushAsyncTasks();
+                }
+
+                expect(mockRatedMatchDao.createMatchHeader).toHaveBeenCalledTimes(2);
+                expect(channel.threads.create).toHaveBeenCalledTimes(1);
+            } finally {
+                competitiveRatedQueue.__resetState();
+                jest.useRealTimers();
+            }
+        });
+
+        it('cancels the DB rows of the matches /ratedreset drops and keeps waiting results', async () => {
+            const { client } = createMatchClientMock();
+            competitiveRatedQueue.__seedStateForTests({
+                activeMatches: [createMatchFixture({ stage: 'awaiting_winner' })],
+                pendingCompetitiveDbOps: [{
+                    key: 'complete_competitive:4000',
+                    type: 'complete_competitive',
+                    payload: { ratedMatchId: 4000 },
+                    nextRetryAt: Date.now() + 60_000,
+                    createdAt: 1,
+                    attempts: 1
+                }]
+            });
+
+            await competitiveRatedQueue.resetCompetitiveRatedQueue(client);
+
+            expect(mockRatedMatchDao.cancelMatch).toHaveBeenCalledWith({ matchCode: 'match-1', cancelReason: 'staff_reset' });
+            expect(competitiveRatedQueue.__getStateSnapshot()).toEqual(expect.objectContaining({
+                activeMatchCount: 0,
+                pendingCompetitiveDbOpCount: 1
+            }));
+        });
+
+        it('retries a DB cancel that failed on a transient error', async () => {
+            const { client } = createMatchClientMock();
+            const match = createMatchFixture({
+                gameType: 'MSBL',
+                stage: 'awaiting_winner',
+                cancelVoteUserIds: ['home-user'],
+                cancelVoteGameNumber: 1
+            });
+            competitiveRatedQueue.__seedStateForTests({ activeMatches: [match] });
+            mockRatedMatchDao.cancelMatch.mockRejectedValueOnce(transientDbError());
+
+            await competitiveRatedQueue.handleInteraction(createButtonInteractionMock({
+                customId: 'rated:competitive:match:cancel:match-1:1',
+                userId: 'away-user',
+                client
+            }));
+            await flushAsyncTasks();
+            expect(competitiveRatedQueue.__getStateSnapshot().pendingCompetitiveDbOpCount).toBe(1);
+
+            await competitiveRatedQueue.__tickForTests(client);
+
+            expect(mockRatedMatchDao.cancelMatchById).toHaveBeenCalledWith({ matchId: 5000, cancelReason: 'player_vote' });
+            expect(competitiveRatedQueue.__getStateSnapshot().pendingCompetitiveDbOpCount).toBe(0);
+        });
+
+        describe('restart in the middle of completing or cancelling', () => {
+            const fsPromises = require('node:fs/promises');
+            const os = require('node:os');
+            const path = require('node:path');
+            const runtimeState = require('../../src/services/competitiveRatedQueue/runtimeState');
+            let runtimeDir;
+            let previousEnv;
+
+            beforeEach(async () => {
+                previousEnv = {
+                    FUTBOT_RUNTIME_DIR: process.env.FUTBOT_RUNTIME_DIR,
+                    FUTBOT_RUNTIME_STATE_TEST: process.env.FUTBOT_RUNTIME_STATE_TEST
+                };
+                runtimeDir = await fsPromises.mkdtemp(path.join(os.tmpdir(), 'futbot-runtime-'));
+                process.env.FUTBOT_RUNTIME_DIR = runtimeDir;
+                process.env.FUTBOT_RUNTIME_STATE_TEST = '1';
+            });
+
+            afterEach(async () => {
+                competitiveRatedQueue.__resetState();
+                for (const [name, value] of Object.entries(previousEnv)) {
+                    if (value === undefined) {
+                        delete process.env[name];
+                    } else {
+                        process.env[name] = value;
+                    }
+                }
+                await fsPromises.rm(runtimeDir, { recursive: true, force: true });
+            });
+
+            function withPanelFixtures(channel) {
+                const fixtures = createPanelMessageFixtures();
+                channel.messages.fetch = jest.fn(async arg => {
+                    if (typeof arg === 'string') {
+                        throw new Error('not found');
+                    }
+                    return new Map(Object.values(fixtures).map(message => [message.id, message]));
+                });
+            }
+
+            it('releases the players and finishes the rating of a match stopped while completing', async () => {
+                const { channel, client } = createMatchClientMock();
+                withPanelFixtures(channel);
+                await runtimeState.saveCompetitiveRatedRuntimeState({
+                    activeMatches: [createMatchFixture({
+                        stage: 'complete',
+                        seasonId: 2,
+                        score: { team1: 0, team2: 2 },
+                        threadId: 'thread-complete'
+                    })],
+                    pendingCompetitiveDbOps: []
+                });
+
+                await competitiveRatedQueue.ensureCompetitiveRatedQueue(client);
+
+                expect(competitiveRatedQueue.getCompetitiveRatedBusyReason('home-user')).toBeNull();
+                expect(competitiveRatedQueue.__getStateSnapshot().activeMatchCount).toBe(0);
+                expect(mockRecordCompetitiveResult).toHaveBeenCalledTimes(1);
+                expect(mockRecordCompetitiveResult).toHaveBeenCalledWith(expect.objectContaining({
+                    ratedMatchId: 5000,
+                    winnerTeamNumber: 2,
+                    team1Score: 0,
+                    team2Score: 2
+                }));
+            });
+
+            it('releases the players, cancels the DB row and closes the thread of a match stopped while cancelling', async () => {
+                const { channel, client, thread } = createMatchClientMock();
+                withPanelFixtures(channel);
+                await runtimeState.saveCompetitiveRatedRuntimeState({
+                    activeMatches: [createMatchFixture({ stage: 'cancelled', cancelReason: 'player_vote' })],
+                    pendingCompetitiveDbOps: []
+                });
+
+                await competitiveRatedQueue.ensureCompetitiveRatedQueue(client);
+
+                expect(competitiveRatedQueue.getCompetitiveRatedBusyReason('away-user')).toBeNull();
+                expect(mockRatedMatchDao.cancelMatchById).toHaveBeenCalledWith({ matchId: 5000, cancelReason: 'player_vote' });
+                expect(thread.setArchived).toHaveBeenCalled();
+                expect(thread.setLocked).toHaveBeenCalled();
+                expect(mockRecordCompetitiveResult).not.toHaveBeenCalled();
+            });
+
+            it('keeps an unreadable runtime file aside instead of overwriting it', async () => {
+                await fsPromises.mkdir(runtimeDir, { recursive: true });
+                await fsPromises.writeFile(runtimeState.getRuntimeStatePath(), '{ not json', 'utf8');
+                const errorSpy = jest.spyOn(console, 'error').mockImplementation(() => {});
+                try {
+                    const loaded = await runtimeState.loadCompetitiveRatedRuntimeState();
+                    expect(loaded).toEqual({ activeMatches: [], pendingCompetitiveDbOps: [] });
+                } finally {
+                    errorSpy.mockRestore();
+                }
+
+                const files = await fsPromises.readdir(runtimeDir);
+                expect(files.some(file => file.startsWith('competitive-rated-runtime.json.unreadable-'))).toBe(true);
+            });
+        });
+    });
 });
