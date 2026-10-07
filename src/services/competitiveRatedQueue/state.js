@@ -26,6 +26,8 @@ const state = {
     runtimeLogBuffersByThreadId: new Map(),
     runtimeLogFlushTimersByThreadId: new Map(),
     runtimeLogCleanupTimer: null,
+    // Set while the runtime file is being restored after a start (see waitForRuntimeRecovery).
+    runtimeRecoveryInFlight: null,
     queueSearchEnabled: true
 };
 

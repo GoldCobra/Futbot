@@ -4442,15 +4442,14 @@ function startReconcileLoop(client) {
 // They wait briefly (inside Discord's 3-second acknowledgement window) instead of finding no
 // match and being dropped.
 const RUNTIME_RECOVERY_CLICK_WAIT_MS = 2000;
-let runtimeRecoveryInFlight = null;
 
 async function waitForRuntimeRecovery() {
-    if (!runtimeRecoveryInFlight) {
+    if (!state.runtimeRecoveryInFlight) {
         return;
     }
     let timer = null;
     await Promise.race([
-        runtimeRecoveryInFlight,
+        state.runtimeRecoveryInFlight,
         new Promise(resolve => {
             timer = setTimeout(resolve, RUNTIME_RECOVERY_CLICK_WAIT_MS);
         })
@@ -4467,7 +4466,7 @@ async function ensureCompetitiveRatedQueue(client) {
     }
     let finishRuntimeRecovery = null;
     if (!runtimeStateRecovered && isRuntimeStateEnabled()) {
-        runtimeRecoveryInFlight = new Promise(resolve => {
+        state.runtimeRecoveryInFlight = new Promise(resolve => {
             finishRuntimeRecovery = resolve;
         });
     }
@@ -4480,7 +4479,7 @@ async function ensureCompetitiveRatedQueue(client) {
     } finally {
         if (finishRuntimeRecovery) {
             finishRuntimeRecovery();
-            runtimeRecoveryInFlight = null;
+            state.runtimeRecoveryInFlight = null;
         }
     }
     for (const meta of state.panelMetaByChannelId.values()) {
@@ -5045,7 +5044,7 @@ async function handleMatchInteraction(interaction) {
     }
 
     let match = state.activeMatchesById.get(matchId);
-    if (!match && runtimeRecoveryInFlight) {
+    if (!match && state.runtimeRecoveryInFlight) {
         await waitForRuntimeRecovery();
         match = state.activeMatchesById.get(matchId);
     }
@@ -5201,7 +5200,7 @@ function __resetState() {
     }
     resetRuntimePersist();
     runtimeStateRecovered = false;
-    runtimeRecoveryInFlight = null;
+    state.runtimeRecoveryInFlight = null;
     tickInFlight = false;
     competitiveWhrRunInFlight = null;
 
