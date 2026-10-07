@@ -1,6 +1,5 @@
 const CONSTANTS = require('./constants');
 const EMOJIS = require('./emoji');
-const helpers = require('./helpers');
 const discord = require('./discord');
 const { PermissionsBitField } = require('discord.js');
 
@@ -44,59 +43,9 @@ const errorHandler = (err, client = undefined, msg = false, location = "internal
     }
 };
 
- async function handleErrorWithInteraction (err, interaction, followUp = false, additionalText='') {
-    err = normalizeError(err);
-    const client = interaction.client;
-    const guild = interaction.guild || await discord.fetchGuild(client, CONSTANTS.GUILD_ID);
-    const channel = guild ? await discord.fetchChannel(guild, CONSTANTS.CHANNELS.DEBUG_ERRORS) : await discord.fetchChannel(client, CONSTANTS.CHANNELS.DEBUG_ERRORS);
-    const subcommand = interaction.options && typeof interaction.options.getSubcommand === 'function'
-        ? interaction.options.getSubcommand(false)
-        : interaction.options?._subcommand;
-
-    const debugMessage =
-`**Command exception**
-**Time** <t:${Math.floor(new Date().getTime() / 1000)}>
-**Command name:** ${interaction.commandName} ${subcommand ?? ''}
-**Message:** ${interaction.message}
-**Executed by:** ${interaction.user.toString()}
-**Error Message:** ${err.message}
-**Stack trace:**
-${err.stack}`;
-
-    if (channel && canSendToChannel(channel, client)) {
-        await helpers.sendSplitMessages(async msg => await discord.safeSend(channel, msg), debugMessage, false);
-    } else {
-        console.error(debugMessage);
-    }
-
-    await discord.safeFollowUp(interaction, { content: `There was an error while executing this command! ${additionalText}`, ephemeral: true });
-}
-
-const errorHandlerWithContext = (context, err, client = undefined, msg = false, location = "internal") => {
-    err = normalizeError(err);
-    const newErr = new Error(context ? `${context} ${err.message}` : err.message);
-    newErr.stack = err.stack;
-    if (err.code) {
-        newErr.code = err.code;
-    }
-    errorHandler(newErr, client, msg, location);
-};
-
-const logErrorWithContext = (context) => {
-    return (err) => {
-        if (err) {
-            console.error(`${context} throws error: "${err.message ? err.message : JSON.stringify(err)}"`);
-        }
-    }
-};
-
 function canSendToChannel(channel, client) {
     const permissions = channel?.permissionsFor?.(channel.guild?.members?.me ?? client?.user);
     return permissions ? permissions.has(PermissionsBitField.Flags.SendMessages) : true;
 }
 
 module.exports.handle = errorHandler;
-module.exports.handleWithContext = errorHandlerWithContext;
-module.exports.log = logErrorWithContext;
-module.exports.handleErrorWithInteraction = handleErrorWithInteraction;
-module.exports.normalizeError = normalizeError;

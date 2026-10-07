@@ -104,23 +104,6 @@ async function executeQuery(query, inputs = {}) {
   });
 }
 
-async function executeProcedure(name, inputs = {}) {
-  return await withDbRetry(async () => {
-    const pool = await getPool();
-    const request = pool.request();
-
-    for (const [key, value] of Object.entries(inputs)) {
-      if (Array.isArray(value)) {
-        request.input(key, value[0], value[1]);
-      } else {
-        request.input(key, value);
-      }
-    }
-
-    return await request.execute(name);
-  });
-}
-
 async function closePool() {
   if (!poolPromise) return;
   const pool = await poolPromise;
@@ -132,7 +115,6 @@ module.exports = {
   sql,
   getPool,
   executeQuery,
-  executeProcedure,
   closePool,
   isTransientDbError
 };

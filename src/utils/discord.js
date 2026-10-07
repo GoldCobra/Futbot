@@ -88,23 +88,6 @@ async function fetchChannel(clientOrGuild, channelId) {
   return null;
 }
 
-async function fetchGuild(client, guildId) {
-  if (!client || !guildId) return null;
-
-  const cached = client.guilds?.cache?.get(guildId);
-  if (cached) return cached;
-
-  if (typeof client.guilds?.fetch === 'function') {
-    try {
-      return await client.guilds.fetch(guildId);
-    } catch (err) {
-      console.error(`fetchGuild(${guildId}) failed: ${err.message ? err.message : JSON.stringify(err)}`);
-    }
-  }
-
-  return null;
-}
-
 function isExpiredInteractionError(err) {
   return err?.code === 10062
     || err?.code === 10015
@@ -118,6 +101,5 @@ module.exports = {
   safeSend,
   normalizeInteractionPayload,
   fetchChannel,
-  fetchGuild,
   isExpiredInteractionError
 };

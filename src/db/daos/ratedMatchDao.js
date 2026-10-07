@@ -342,11 +342,6 @@ class RatedMatchDao {
         };
     }
 
-    async createMatch(input) {
-        const match = await this.createMatchWithDetails(input);
-        return match.id;
-    }
-
     async recordGame({
         ratedMatchId,
         gameNumber,
@@ -431,23 +426,6 @@ class RatedMatchDao {
             }
         );
         return result.recordset[0] ?? null;
-    }
-
-    async completeMatch({ matchCode, team1Score, team2Score, winnerTeamNumber, homeTeamNumber, awayTeamNumber }) {
-        await executeQuery(
-            `UPDATE ${T.ratedMatch}
-             SET Status = 'completed',
-                 Team1Score = @team1Score,
-                 Team2Score = @team2Score,
-                 WinnerTeamNumber = @winnerTeamNumber,
-                 HomeTeamNumber = @homeTeamNumber,
-                 AwayTeamNumber = @awayTeamNumber,
-                 CompletedAtUtc = SYSUTCDATETIME(),
-                 CancelledAtUtc = NULL,
-                 CancelReason = NULL
-             WHERE MatchCode = @matchCode`,
-            { matchCode, team1Score, team2Score, winnerTeamNumber, homeTeamNumber, awayTeamNumber }
-        );
     }
 
     // Only a match that is still running can be cancelled; a repeated call keeps the first

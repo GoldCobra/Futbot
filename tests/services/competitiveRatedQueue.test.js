@@ -203,13 +203,6 @@ async function flushAsyncTasks() {
     }
 }
 
-async function flushScheduledTasks() {
-    for (let index = 0; index < 3; index += 1) {
-        await new Promise(resolve => setTimeout(resolve, 0));
-        await flushAsyncTasks();
-    }
-}
-
 function createSinglesSearch({ minBestOf, maxBestOf, threshold, elo }) {
     return {
         options: {

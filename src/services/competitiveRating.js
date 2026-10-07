@@ -41,13 +41,6 @@ async function getDefaultCompetitiveRating() {
     return defaultRating;
 }
 
-function clearRankThresholdCache() {
-    rankThresholdCache = {
-        expiresAt: 0,
-        rows: null
-    };
-}
-
 function toCompetitiveRankRoleIds(thresholds) {
     return thresholds
         .map(row => row.DiscordRoleId)
@@ -304,12 +297,6 @@ async function rollbackCompetitiveMatch({
     return rollback;
 }
 
-async function getLeaderboard(gameType, mode = '1v1') {
-    const season = await dao.getActiveSeason();
-    if (!season) return [];
-    return dao.getLeaderboard(gameType, season.Id, mode);
-}
-
 async function getPlayerRating(discordId, gameType, mode = '1v1') {
     const season = await dao.getActiveSeason();
     if (!season) return null;
@@ -319,10 +306,6 @@ async function getPlayerRating(discordId, gameType, mode = '1v1') {
 async function getPlayerRatingForSeason(discordId, gameType, seasonId, mode = '1v1') {
     if (!seasonId) return null;
     return dao.getPlayerRating(discordId, gameType, seasonId, mode);
-}
-
-async function getSeasonHistory(discordId, gameType) {
-    return dao.getSeasonHistory(discordId, gameType);
 }
 
 async function getAllRankThresholds() {
@@ -349,35 +332,11 @@ async function activateDueSeason() {
     return dao.activateDueSeason();
 }
 
-function indexRatingsByMode(rows) {
-    return rows.reduce((acc, row) => {
-        acc[row.Mode] = row;
-        return acc;
-    }, {});
-}
-
-async function getAllPlayerRatings(discordId) {
-    const season = await dao.getActiveSeason();
-    if (!season) return null;
-    const [mscRows, smsRows, msblRows] = await Promise.all([
-        dao.getPlayerRatingsByGame(discordId, 1, season.Id),
-        dao.getPlayerRatingsByGame(discordId, 2, season.Id),
-        dao.getPlayerRatingsByGame(discordId, 3, season.Id)
-    ]);
-    return {
-        season,
-        msc: indexRatingsByMode(mscRows),
-        sms: indexRatingsByMode(smsRows),
-        msbl: indexRatingsByMode(msblRows)
-    };
-}
-
 module.exports = {
     recordCompetitiveResult,
     rollbackCompetitiveMatch,
     assignCompRankRoles,
     clearAllCompetitiveRankRoles,
-    getLeaderboard,
     getPlayerRating,
     getPlayerRatingForSeason,
     getActiveSeason,
@@ -385,11 +344,8 @@ module.exports = {
     beginDueSeasonEnding,
     finalizeDueEndingSeason,
     activateDueSeason,
-    getAllPlayerRatings,
-    getSeasonHistory,
     getAllRankThresholds,
     getDefaultCompetitiveRating,
-    clearRankThresholdCache,
     calculateCompetitiveEloDelta,
     rebuildRatingPartition,
     scheduleCompetitiveWhrSync,

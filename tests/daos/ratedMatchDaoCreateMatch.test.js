@@ -1,6 +1,6 @@
 const RatedMatchDao = require('../../src/db/daos/ratedMatchDao');
 
-describe('RatedMatchDao.createMatch', () => {
+describe('RatedMatchDao.createMatchWithDetails', () => {
     afterEach(() => {
         jest.restoreAllMocks();
     });
@@ -37,9 +37,9 @@ describe('RatedMatchDao.createMatch', () => {
         });
         const activateMatch = jest.spyOn(dao, 'activateMatch').mockResolvedValue([]);
 
-        const result = await dao.createMatch(createMatchInput());
+        const result = await dao.createMatchWithDetails(createMatchInput());
 
-        expect(result).toBe(99);
+        expect(result.id).toBe(99);
         expect(activateMatch).not.toHaveBeenCalled();
     });
 
@@ -85,9 +85,9 @@ describe('RatedMatchDao.createMatch', () => {
         const activateMatch = jest.spyOn(dao, 'activateMatch').mockResolvedValue([]);
 
         const input = createMatchInput();
-        const result = await dao.createMatch(input);
+        const result = await dao.createMatchWithDetails(input);
 
-        expect(result).toBe(100);
+        expect(result.id).toBe(100);
         expect(activateMatch).toHaveBeenCalledWith(expect.objectContaining({
             matchId: 100,
             participants: input.participants

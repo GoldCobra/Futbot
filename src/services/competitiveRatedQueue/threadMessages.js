@@ -93,31 +93,6 @@ async function editOrSendRequiredThreadMessage(thread, messageId, payload, optio
     return await sendRequiredThreadMessage(thread, payload, options);
 }
 
-async function deleteSetupMessageAndPostConfirmation(thread, setupMessageId, confirmationMessageId, payload) {
-    const threadPayload = quoteThreadPayload(payload);
-    if (confirmationMessageId) {
-        return await editOrSendThreadMessage(thread, confirmationMessageId, threadPayload);
-    }
-
-    const setupMessage = await fetchThreadMessage(thread, setupMessageId);
-    if (setupMessage) {
-        try {
-            await setupMessage.delete();
-        } catch {
-            await setupMessage.edit(threadPayload).catch(() => {});
-            return setupMessage;
-        }
-        return await thread.send(threadPayload);
-    }
-
-    return await thread.send(threadPayload);
-}
-
-async function clearSetupMessageComponents(thread, messageId) {
-    const message = await fetchThreadMessage(thread, messageId);
-    await message?.edit?.({ components: [] }).catch(() => {});
-}
-
 async function deleteThreadMessage(thread, messageId) {
     if (!thread?.send || !messageId) return;
     if (thread?.messages?.delete) {
@@ -172,8 +147,6 @@ async function clearCurrentControlMessage(match, client, content, thread = null,
 
 module.exports = {
     clearCurrentControlMessage,
-    clearSetupMessageComponents,
-    deleteSetupMessageAndPostConfirmation,
     deleteThreadMessage,
     editOrSendThreadMessage,
     editOrSendRequiredThreadMessage,

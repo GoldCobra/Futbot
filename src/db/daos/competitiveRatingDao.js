@@ -554,14 +554,6 @@ class CompetitiveRatingDao {
         return result.recordset[0]?.Id ?? null;
     }
 
-    async getDiscordIdByPlayerId(playerId) {
-        const result = await executeQuery(
-            'SELECT DiscordID FROM dbo.Player WHERE Id = @playerId',
-            { playerId }
-        );
-        return result.recordset[0]?.DiscordID ?? null;
-    }
-
     async getPlayerRating(discordId, gameType, seasonId, mode = '1v1') {
         const result = await executeQuery(
             `SELECT cpr.*,
@@ -583,48 +575,6 @@ class CompetitiveRatingDao {
             { discordId, gameType, seasonId, mode }
         );
         return result.recordset[0] ?? null;
-    }
-
-    async getPlayerRatingsByGame(discordId, gameType, seasonId) {
-        const result = await executeQuery(
-            `SELECT cpr.*,
-                    cpr.GameId AS GameType,
-                    cpr.ModeCode AS Mode,
-                    cpr.RankNumber AS Rank,
-                    cpr.PeakRankNumber AS PeakRank,
-                    crt.Name AS RankName,
-                    crt.Tier AS RankTier,
-                    crt.DiscordRoleId
-             FROM ${T.rating} cpr
-             INNER JOIN dbo.Player p ON cpr.PlayerId = p.Id
-             LEFT JOIN ${T.threshold} crt
-                ON cpr.RankNumber = crt.RankNumber AND crt.IsActive = 1
-             WHERE p.DiscordID = @discordId
-               AND cpr.GameId = @gameType
-               AND cpr.SeasonId = @seasonId`,
-            { discordId, gameType, seasonId }
-        );
-        return result.recordset;
-    }
-
-    async getActiveGames() {
-        const result = await executeQuery(
-            `SELECT Id, Code, DisplayName, ShortName, SortOrder
-             FROM ${T.game}
-             WHERE IsActive = 1
-             ORDER BY SortOrder ASC, Id ASC`
-        );
-        return result.recordset;
-    }
-
-    async getActiveModes() {
-        const result = await executeQuery(
-            `SELECT Code, DisplayName, TeamCount, PlayersPerTeam, TotalPlayers, SortOrder
-             FROM ${T.mode}
-             WHERE IsActive = 1
-             ORDER BY SortOrder ASC, Code ASC`
-        );
-        return result.recordset;
     }
 
     async getAllRankThresholds() {
@@ -660,30 +610,6 @@ class CompetitiveRatingDao {
         return result.recordset[0]?.RankNumber ?? 1;
     }
 
-    async getLeaderboard(gameType, seasonId, mode = '1v1') {
-        const result = await executeQuery(
-            `SELECT *
-             FROM ${T.leaderboard}
-             WHERE SeasonId = @seasonId
-               AND GameType = @gameType
-               AND Mode = @mode
-             ORDER BY Position ASC`,
-            { seasonId, gameType, mode }
-        );
-        return result.recordset;
-    }
-
-    async getAllLeaderboards(seasonId) {
-        const result = await executeQuery(
-            `SELECT *
-             FROM ${T.leaderboard}
-             WHERE SeasonId = @seasonId
-             ORDER BY GameType ASC, Mode ASC, Position ASC`,
-            { seasonId }
-        );
-        return result.recordset;
-    }
-
     async getBestCompletedOneVOneRank(playerId, seasonId) {
         const result = await executeQuery(
             `SELECT COALESCE(MAX(CASE
@@ -697,27 +623,6 @@ class CompetitiveRatingDao {
             { playerId, seasonId }
         );
         return result.recordset[0]?.HighestRank ?? 0;
-    }
-
-    async getSeasonHistory(discordId, gameType) {
-        const result = await executeQuery(
-            `SELECT css.*,
-                    css.GameId AS GameType,
-                    css.ModeCode AS Mode,
-                    cs.DisplayName AS SeasonName,
-                    crt.Name AS PeakRankName,
-                    crt.Tier AS PeakRankTier
-             FROM ${T.snapshot} css
-             INNER JOIN dbo.Player p ON css.PlayerId = p.Id
-             INNER JOIN ${T.season} cs ON css.SeasonId = cs.Id
-             LEFT JOIN ${T.threshold} crt
-                ON css.PeakRankNumber = crt.RankNumber AND crt.IsActive = 1
-             WHERE p.DiscordID = @discordId
-               AND css.GameId = @gameType
-             ORDER BY css.SeasonId DESC, css.ModeCode ASC`,
-            { discordId, gameType }
-        );
-        return result.recordset;
     }
 
     async recordMatchCompletion({
@@ -1200,27 +1105,6 @@ class CompetitiveRatingDao {
         };
     }
 
-    async rebuildSeasonRewardProgress({ seasonId, gameId, mode }) {
-        const pool = await getPool();
-        const transaction = new sql.Transaction(pool);
-        await transaction.begin(sql.ISOLATION_LEVEL.SERIALIZABLE);
-
-        try {
-            await this._acquirePartitionLock(transaction, seasonId, gameId, mode);
-            const result = await this._rebuildRewardPartition(transaction, {
-                seasonId,
-                gameId,
-                mode,
-                writeFinalEarned: false
-            });
-            await transaction.commit();
-            return result;
-        } catch (err) {
-            await transaction.rollback().catch(() => {});
-            throw err;
-        }
-    }
-
     async rebuildRatingPartition({ seasonId, gameId, mode }, calculateDelta) {
         const pool = await getPool();
         const transaction = new sql.Transaction(pool);
@@ -1277,10 +1161,6 @@ class CompetitiveRatingDao {
             await transaction.rollback().catch(() => {});
             throw err;
         }
-    }
-
-    async rebuildSeasonRewards({ seasonId, gameId, mode }) {
-        return this.finalizeSeasonRewards({ seasonId, gameId, mode });
     }
 
     async finalizeSeasonRewardsForSeason(seasonId) {
@@ -1345,38 +1225,6 @@ class CompetitiveRatingDao {
             await transaction.rollback().catch(() => {});
             throw err;
         }
-    }
-
-    async rebuildSeasonAwardsForSeason(seasonId) {
-        const partitions = await executeQuery(
-            `SELECT season.Id AS SeasonId, game.Id AS GameId, mode.Code AS ModeCode
-             FROM ${T.season} season
-             CROSS JOIN ${T.game} game
-             CROSS JOIN ${T.mode} mode
-             WHERE season.Id = @seasonId
-               AND season.IsCompleted = 1
-             ORDER BY game.SortOrder ASC, mode.SortOrder ASC`,
-            { seasonId }
-        );
-        if (!partitions.recordset.length) {
-            await this._assertSeasonCompleted(null, seasonId);
-        }
-
-        const results = [];
-        for (const partition of partitions.recordset) {
-            const result = await this.rebuildSeasonAwards({
-                seasonId: partition.SeasonId,
-                gameId: partition.GameId,
-                mode: partition.ModeCode
-            });
-            results.push({
-                seasonId: partition.SeasonId,
-                gameId: partition.GameId,
-                mode: partition.ModeCode,
-                ...result
-            });
-        }
-        return results;
     }
 
     async _assertSeasonCompleted(runner, seasonId) {

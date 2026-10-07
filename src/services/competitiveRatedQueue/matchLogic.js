@@ -57,7 +57,7 @@ function buildBalancedDoublesTeams(searches) {
         clubCounts.set(player.clubId, (clubCounts.get(player.clubId) ?? 0) + 1);
     }
 
-    let oddsTeamPlayers = [];
+    let oddsTeamPlayers;
     const duplicateClub = [...clubCounts.entries()].find(([, count]) => count > 1)?.[0] ?? null;
     if (duplicateClub !== null) {
         oddsTeamPlayers = players

@@ -34,7 +34,6 @@ const {
     CANCELLED_THREAD_PREFIX,
     CAPTAIN_DISPLAY_OVERRIDES,
     CAPTAIN_BUTTON_ORDER_BY_GAME_TYPE,
-    COMPLETED_THREAD_CLOSE_DELAY_MS,
     COMPLETED_THREAD_PREFIX,
     CONFIG,
     CONSTANTS,
@@ -149,8 +148,6 @@ const {
 } = require('./runtimeState');
 const {
     clearCurrentControlMessage,
-    clearSetupMessageComponents,
-    deleteSetupMessageAndPostConfirmation,
     deleteThreadMessage,
     editOrSendThreadMessage,
     editOrSendRequiredThreadMessage,
@@ -1859,7 +1856,7 @@ async function createCompetitiveRatedMatch(panelConfig, searches, client, {
         : 2;
     const homeTeamIndex = Math.random() >= 0.5 ? 1 : 2;
     const awayTeamIndex = homeTeamIndex === 1 ? 2 : 1;
-    let matchHeader = null;
+    let matchHeader;
     try {
         const season = await getActiveSeason();
         if (!season?.Id) {
@@ -2888,17 +2885,6 @@ async function postWinnerControl(match, client, thread = null) {
     }));
 }
 
-async function recoverNextSetupViaStartGate(match, client, reason) {
-    clearSelectionTimers(match);
-    match.startClickedUserIds = [];
-    match.stage = 'awaiting_start';
-    match.controlVersion = (match.controlVersion ?? 0) + 1;
-    logRatedWarn(client, match, 'setup.private_prompt_reopened', getMatchLogDetails(match, {
-        reason
-    }));
-    await updateMatchControlMessage(match, client);
-}
-
 function getLoserControlTimeoutPhase(match) {
     if (match.stage !== 'awaiting_loser_confirmation') {
         return null;
@@ -3347,19 +3333,6 @@ async function completeMatch(match, winnerMention, client) {
             );
             return;
         }
-    } else if (match.ratedMatchId) {
-        try {
-            await ratedMatchDao.completeMatch({
-                matchCode:        match.id,
-                team1Score:       match.score.team1,
-                team2Score:       match.score.team2,
-                winnerTeamNumber,
-                homeTeamNumber:   match.homeTeamIndex,
-                awayTeamNumber:   match.awayTeamIndex
-            });
-        } catch (err) {
-            logRatedError(client, match, 'rated_match.complete_failed', err, getMatchLogDetails(match));
-        }
     }
 
     const hasCompetitiveSummary = Array.isArray(competitiveResult?.changes) && competitiveResult.changes.length > 0;
@@ -3439,7 +3412,6 @@ async function handleWinnerSelection(interaction, match) {
         score: `${match.score.team1}-${match.score.team2}`
     }));
 
-    const isMatchComplete = isMatchDecided(match);
     const loserTeamIndex = teamIndex === 1 ? 2 : 1;
     setPendingResult(match, {
         gameNumber: completedGameNumber,
