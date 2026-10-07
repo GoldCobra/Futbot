@@ -16,6 +16,8 @@ describe('test isolation', () => {
     });
 
     test('the database client cannot connect', async () => {
+        process.env.DB_TRANSIENT_RETRY_ATTEMPTS = '1';
+        process.env.DB_CIRCUIT_MAX_WAIT_MS = '0';
         const { executeQuery } = require('../src/db/sqlClient');
         await expect(executeQuery('SELECT 1')).rejects.toThrow();
     });
