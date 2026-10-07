@@ -230,6 +230,46 @@ describe('manual report service', () => {
         expect(query).not.toMatch(/SCOPE_IDENTITY/);
     });
 
+    it('runs concurrent 2v2 legacy writes one at a time so each finds its own MultiMatch row', async () => {
+        let running = 0;
+        let maxRunning = 0;
+        const releases = [];
+        mockExecuteQuery.mockImplementation(() => new Promise(resolve => {
+            running += 1;
+            maxRunning = Math.max(maxRunning, running);
+            releases.push(id => {
+                running -= 1;
+                resolve({ recordset: [{ Id: id }] });
+            });
+        }));
+        const settle = () => new Promise(resolve => setImmediate(resolve));
+        const { reportScore2SQLV2 } = manualReport._private;
+
+        const first = reportScore2SQLV2('MSBL', '111', '222', '333', '444', 2, 0, 'channel-1', 'guild-1');
+        const second = reportScore2SQLV2('MSBL', '555', '666', '777', '888', 2, 1, 'channel-1', 'guild-1');
+        await settle();
+        expect(releases).toHaveLength(1);
+
+        releases[0](101);
+        await expect(first).resolves.toEqual([{ Id: 101 }]);
+        await settle();
+        expect(releases).toHaveLength(2);
+
+        releases[1](102);
+        await expect(second).resolves.toEqual([{ Id: 102 }]);
+        expect(maxRunning).toBe(1);
+    });
+
+    it('keeps serializing 2v2 legacy writes after one of them fails', async () => {
+        mockExecuteQuery
+            .mockRejectedValueOnce(new Error('proc failed'))
+            .mockResolvedValueOnce({ recordset: [{ Id: 103 }] });
+        const { reportScore2SQLV2 } = manualReport._private;
+
+        await expect(reportScore2SQLV2('MSBL', '1', '2', '3', '4', 2, 0, 'c', 'g')).rejects.toThrow('proc failed');
+        await expect(reportScore2SQLV2('MSBL', '5', '6', '7', '8', 2, 0, 'c', 'g')).resolves.toEqual([{ Id: 103 }]);
+    });
+
     it('builds short stable manual match codes that fit the current RatedMatch schema', () => {
         const singlesCode = manualReport._private.buildManualMatchCode({ legacyMatchId: 1234567890 });
         const doublesCode = manualReport._private.buildManualMatchCode({ legacyMultiMatchId: 2234567890 });

@@ -105,7 +105,22 @@ async function reportScoreSQLV2(gametype, p1, p2, p1Wins, p2Wins, channel, tourn
     return result.recordset;
 }
 
-async function reportScore2SQLV2(gametype, team1p1, team1p2, team2p1, team2p2, team1Wins, team2Wins, channel, serverid, delt1 = 0, delt2 = 0, delt5 = 0, delt6 = 0) {
+// The batch below finds its MultiMatch row as "the newest id above the one seen before the
+// call", so two 2v2 reports running at the same time could take each other's row. futbot runs
+// them one at a time; other writers of dbo.MultiMatch are outside its reach.
+let legacyDoublesReportChain = Promise.resolve();
+
+function runLegacyDoublesReportExclusively(work) {
+    const run = legacyDoublesReportChain.then(work, work);
+    legacyDoublesReportChain = run.catch(() => {});
+    return run;
+}
+
+async function reportScore2SQLV2(...args) {
+    return await runLegacyDoublesReportExclusively(() => reportScore2SQLV2Unlocked(...args));
+}
+
+async function reportScore2SQLV2Unlocked(gametype, team1p1, team1p2, team2p1, team2p2, team1Wins, team2Wins, channel, serverid, delt1 = 0, delt2 = 0, delt5 = 0, delt6 = 0) {
     const command = getLegacyReportCommandForGame(gametype, true);
     // dbo.ReportScore2 inserts the MultiMatch row but, unlike dbo.ReportScore, never returns its
     // id. extractLegacyId() therefore came back null and every 2v2 report threw before it could
