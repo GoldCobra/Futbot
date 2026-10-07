@@ -1,4 +1,5 @@
 const { executeQuery, getPool, sql } = require('../sqlClient');
+const { bindInputs } = require('../requests');
 
 // WHR works on UTC days. Days are counted from this epoch in SQL and written back as midnight datetimes.
 const WHR_DAY_EPOCH = '2000-01-01';
@@ -31,13 +32,6 @@ async function runInTransaction(work) {
         await transaction.rollback().catch(() => {});
         throw error;
     }
-}
-
-function bindInputs(request, inputs) {
-    for (const [key, [type, value]] of Object.entries(inputs)) {
-        request.input(key, type, value);
-    }
-    return request;
 }
 
 // Both writers use the same temp tables: #WhrHistory holds history rows, #WhrRatings final ratings.

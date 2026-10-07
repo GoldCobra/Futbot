@@ -1,4 +1,5 @@
 const { executeQuery, getPool, sql } = require('../sqlClient');
+const { runRequest } = require('../requests');
 const { competitiveTable } = require('../../utils/competitiveConstants');
 
 const T = {
@@ -10,18 +11,6 @@ const T = {
     seasonMatchSequence: competitiveTable('CompetitiveSeasonMatchSequence')
 };
 const COMPLETED_THREAD_ICON = String.fromCodePoint(0x2705);
-
-function bindInputs(request, inputs = {}) {
-    for (const [key, value] of Object.entries(inputs)) {
-        request.input(key, value);
-    }
-    return request;
-}
-
-async function runRequest(runner, query, inputs = {}) {
-    const request = bindInputs(runner.request(), inputs);
-    return request.query(query);
-}
 
 function buildTeamName(participants, teamNumber) {
     const names = participants

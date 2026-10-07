@@ -1,5 +1,6 @@
 const sql = require('mssql');
 const {config} = require('./config');
+const { runRequest } = require('./requests');
 
 let poolPromise = null;
 let circuitOpenUntil = 0;
@@ -90,17 +91,7 @@ async function getPool() {
 async function executeQuery(query, inputs = {}) {
   return await withDbRetry(async () => {
     const pool = await getPool();
-    const request = pool.request();
-
-    for (const [key, value] of Object.entries(inputs)) {
-      if (Array.isArray(value)) {
-        request.input(key, value[0], value[1]);
-      } else {
-        request.input(key, value);
-      }
-    }
-
-    return await request.query(query);
+    return await runRequest(pool, query, inputs);
   });
 }
 

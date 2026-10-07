@@ -1,4 +1,5 @@
 const { executeQuery, getPool, sql } = require('../sqlClient');
+const { runRequest } = require('../requests');
 const { RatedMatchStateError } = require('../errors');
 const { competitiveTable, PLACEMENT_GAMES_REQUIRED } = require('../../utils/competitiveConstants');
 const {
@@ -55,22 +56,6 @@ function placedPlayerFilter(playerColumn) {
                   )`;
 }
 
-function bindInputs(request, inputs = {}) {
-    for (const [key, value] of Object.entries(inputs)) {
-        if (Array.isArray(value)) {
-            request.input(key, value[0], value[1]);
-        } else {
-            request.input(key, value);
-        }
-    }
-    return request;
-}
-
-async function runRequest(runner, query, inputs = {}) {
-    const request = bindInputs(runner.request(), inputs);
-    return request.query(query);
-}
-
 function toNumber(value, fallback = 0) {
     const number = Number(value);
     return Number.isFinite(number) ? number : fallback;
@@ -111,6 +96,9 @@ function normalizeRewardChange(change) {
     };
 }
 
+// Rank rule (also in getRankNumberForElo and the season carry-over SQL): the highest active rank
+// whose MinElo the rating reaches, at least rank 1. This copy works on preloaded thresholds so
+// partition rebuilds do not query once per row.
 function rankForEloFromThresholds(elo, thresholds) {
     const rank = thresholds
         .filter(row => row.IsActive !== false && toNumber(row.RankNumber) > 0 && toNumber(row.MinElo) <= elo)

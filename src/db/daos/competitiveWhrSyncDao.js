@@ -1,4 +1,5 @@
 const { executeQuery, getPool, sql } = require('../sqlClient');
+const { runRequest } = require('../requests');
 const { competitiveTable } = require('../../utils/competitiveConstants');
 
 const T = {
@@ -8,22 +9,6 @@ const T = {
     ratedParticipant: competitiveTable('RatedMatchParticipant'),
     whrSync: competitiveTable('CompetitiveWhrSync')
 };
-
-function bindInputs(request, inputs = {}) {
-    for (const [key, value] of Object.entries(inputs)) {
-        if (Array.isArray(value)) {
-            request.input(key, value[0], value[1]);
-        } else {
-            request.input(key, value);
-        }
-    }
-    return request;
-}
-
-async function runRequest(runner, query, inputs = {}) {
-    const request = bindInputs(runner.request(), inputs);
-    return request.query(query);
-}
 
 function toNumber(value, fallback = 0) {
     const number = Number(value);
