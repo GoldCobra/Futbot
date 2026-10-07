@@ -92,6 +92,7 @@ const {
 const { reconcileActiveMatchControls } = require('./watchdog');
 const { handleAutomaticSeasonTransitions } = require('./season');
 const { handleInteraction, isCompetitiveRatedInteraction } = require('./interactionRouter');
+const { logBackgroundJobError, startDbOutageLog, stopDbOutageLog } = require('./dbOutage');
 
 let runtimeStateRecovered = false;
 
@@ -235,7 +236,7 @@ function scheduleCompetitiveWhrRunner(client, failureEvent) {
         competitiveWhrRunInFlight = recoverPendingCompetitiveWhrRunner(client)
             .catch(error => {
                 console.error(`[RatedQueue] WHR recalculation failed: ${error.message}`);
-                logRatedError(client, { all: true }, failureEvent, error);
+                logBackgroundJobError(client, failureEvent, error);
             })
             .finally(() => {
                 competitiveWhrRunInFlight = null;
@@ -263,7 +264,7 @@ async function tick(client) {
     const now = Date.now();
     pruneReportableMatches(now);
     await handleAutomaticSeasonTransitions(client).catch(error => {
-        logRatedError(client, { all: true }, 'season.transition_failed', error);
+        logBackgroundJobError(client, 'season.transition_failed', error);
     });
 
     const searches = [...state.activeSearchesById.values()];
@@ -292,14 +293,14 @@ async function tick(client) {
     }
 
     await recoverCompletedThreadFinalizations(client, now).catch(error => {
-        logRatedError(client, { all: true }, 'thread.finalize_recovery_failed', error);
+        logBackgroundJobError(client, 'thread.finalize_recovery_failed', error);
     });
     await recoverPendingCompetitiveWhrSync?.().catch(error => {
-        logRatedError(client, { all: true }, 'whr.sync_recovery_failed', error);
+        logBackgroundJobError(client, 'whr.sync_recovery_failed', error);
     });
     scheduleCompetitiveWhrRunner(client, 'whr.runner_recovery_failed');
     await runPendingCompetitiveDbOps(client).catch(error => {
-        logRatedError(client, { all: true }, 'competitive_db.pending_recovery_failed', error);
+        logBackgroundJobError(client, 'competitive_db.pending_recovery_failed', error);
     });
     await finalizeOverdueCompletedThreads(client, now);
     await reconcileAllPanels(client);
@@ -321,7 +322,7 @@ function startReconcileLoop(client) {
         tick(client)
             .catch(error => {
                 console.error(`Competitive pool tick failed: ${error.message}`);
-                logRatedError(client, { all: true }, 'queue.tick_failed', error);
+                logBackgroundJobError(client, 'queue.tick_failed', error);
             })
             .finally(() => {
                 tickInFlight = false;
@@ -331,6 +332,7 @@ function startReconcileLoop(client) {
 
 async function ensureCompetitiveRatedQueue(client) {
     state.client = client;
+    startDbOutageLog(client);
     startReconcileLoop(client);
     startRatedRuntimeLogCleanupLoop(client);
     for (const panelConfig of CONFIG.PANEL_CHANNELS) {
@@ -361,7 +363,7 @@ async function ensureCompetitiveRatedQueue(client) {
         await handleAutomaticSeasonTransitions(client);
     } catch (err) {
         console.error(`[RatedQueue] Season transition recovery failed: ${err.message}`);
-        logRatedError(client, { all: true }, 'season.transition_recovery_failed', err);
+        logBackgroundJobError(client, 'season.transition_recovery_failed', err);
     }
     try {
         await reconcileAllPanels(client);
@@ -375,20 +377,20 @@ async function ensureCompetitiveRatedQueue(client) {
         await recoverCompletedThreadFinalizations(client);
     } catch (err) {
         console.error(`[RatedQueue] Completed thread recovery failed: ${err.message}`);
-        logRatedError(client, { all: true }, 'thread.finalize_recovery_initial_failed', err);
+        logBackgroundJobError(client, 'thread.finalize_recovery_initial_failed', err);
     }
     try {
         await recoverPendingCompetitiveWhrSync?.();
     } catch (err) {
         console.error(`[RatedQueue] WHR/TST sync recovery failed: ${err.message}`);
-        logRatedError(client, { all: true }, 'whr.sync_recovery_initial_failed', err);
+        logBackgroundJobError(client, 'whr.sync_recovery_initial_failed', err);
     }
     scheduleCompetitiveWhrRunner(client, 'whr.runner_recovery_initial_failed');
     try {
         await runPendingCompetitiveDbOps(client);
     } catch (err) {
         console.error(`[RatedQueue] Pending Competitive DB op recovery failed: ${err.message}`);
-        logRatedError(client, { all: true }, 'competitive_db.pending_recovery_initial_failed', err);
+        logBackgroundJobError(client, 'competitive_db.pending_recovery_initial_failed', err);
     }
 }
 
@@ -402,6 +404,7 @@ async function stopCompetitiveRatedQueue() {
         clearInterval(state.reconcileTimer);
         state.reconcileTimer = null;
     }
+    stopDbOutageLog();
     clearMatchmakingRetryTimers();
     await flushRuntimeLogs().catch(() => {});
     clearRuntimeLogTimers();
@@ -469,6 +472,7 @@ function __resetState() {
         state.reconcileTimer = null;
     }
     resetRuntimePersist();
+    stopDbOutageLog();
     runtimeStateRecovered = false;
     state.runtimeRecoveryInFlight = null;
     tickInFlight = false;

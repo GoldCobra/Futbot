@@ -1,6 +1,7 @@
 const sql = require('mssql');
 const {config} = require('./config');
 const { runRequest } = require('./requests');
+const { recordQueryFailure, recordQuerySuccess } = require('./connectionHealth');
 
 let poolPromise = null;
 let circuitOpenUntil = 0;
@@ -64,11 +65,13 @@ async function withDbRetry(operation) {
       await waitForCircuit();
       const result = await operation();
       circuitOpenUntil = 0;
+      recordQuerySuccess();
       return result;
     } catch (err) {
       lastError = err;
       openCircuitForTransientError(err);
       if (!isTransientDbError(err) || attempt >= attempts) {
+        recordQueryFailure(err);
         throw err;
       }
       await sleep(baseDelayMs * attempt);

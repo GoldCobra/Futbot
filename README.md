@@ -52,6 +52,7 @@ GitHub Actions runs the same checks (`npm ci`, lint, tests on Node 24) on every 
 | `src/services/competitiveWhrRunner.js`, `wholeHistoryRating.js` | Whole History Rating of the legacy 1v1 history |
 | `src/services/manualReport.js` | `/report1v1` and `/report2v2` |
 | `src/db/sqlClient.js` | Connection pool, retries of transient errors, circuit breaker |
+| `src/db/connectionHealth.js` | Database reachability from query outcomes (outage start and end) |
 | `src/db/requests.js`, `src/db/errors.js` | Shared request helpers; `RatedMatchStateError` for writes that can never succeed |
 | `src/db/daos` | SQL of the competitive tables, rated matches and WHR |
 | `src/utils` | Constants, permissions (staff roles), Discord helpers |
@@ -102,6 +103,14 @@ MSBL has no setup and starts in `awaiting_winner`. The DB row (`RatedMatch.Statu
 **Failures and restarts.**
 - A DB write that fails transiently is kept in the pending-write queue and retried in order. A completion waits for the game results of its match.
 - Writes that can never succeed are dropped and logged (`competitive_db.op_dropped`).
+- **Database connection.** A fresh login to the external server takes about 2 s and sometimes more than 15 s,
+  so the pool waits up to 30 s for a login (`DB_CONNECTION_TIMEOUT_MS`) and keeps idle connections for 10 minutes
+  (`DB_POOL_IDLE_TIMEOUT_MS`): the one-minute tick reuses a connection instead of logging in each time.
+- **Database outages in the rated log** (`dbOutage.js`). The tick's background jobs (season check, thread
+  finalization, WHR sync, pending writes) run again every minute, so a lost connection is not logged as their
+  error. An outage that lasts `DB_OUTAGE_WARN_AFTER_MS` (default 5 minutes) gets one `db.unreachable` warning and
+  one `db.reachable_again` note when queries work again; shorter blips only reach the console. Every other error
+  of a background job, and every failure of a player's action, is still logged as an error.
 - The in-memory state (searches, matches, pending writes) is saved to `competitive-rated-runtime.json` in `FUTBOT_RUNTIME_DIR`. It is restored on start:
   - a match that had already reached `complete` or `cancelled` is finished;
   - clicks that arrive during this recovery wait for it.

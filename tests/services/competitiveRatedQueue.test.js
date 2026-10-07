@@ -5981,3 +5981,49 @@ describe('competitiveRatedQueue', () => {
         });
     });
 });
+
+describe('competitiveRatedQueue tick and database outages', () => {
+    const competitiveRating = require('../../src/services/competitiveRating');
+
+    function connectionError() {
+        return Object.assign(new Error('Failed to connect to yew.arvixe.com:1433 in 30000ms'), { name: 'ConnectionError', code: 'ETIMEOUT' });
+    }
+
+    beforeEach(() => {
+        competitiveRatedQueue.__resetState();
+        jest.spyOn(console, 'warn').mockImplementation(() => {});
+    });
+
+    afterEach(() => {
+        competitiveRatedQueue.__resetState();
+        competitiveRating.beginDueSeasonEnding.mockReset();
+        competitiveRating.beginDueSeasonEnding.mockResolvedValue(null);
+        console.warn.mockRestore();
+    });
+
+    it('logs no error for a background job that lost the database connection', async () => {
+        const { client, logThreads } = createMatchClientMock();
+        competitiveRating.beginDueSeasonEnding.mockRejectedValueOnce(connectionError());
+        mockRatedMatchDao.getPendingCompletedThreadFinalizations.mockRejectedValueOnce(connectionError());
+
+        await competitiveRatedQueue.__tickForTests(client);
+        await flushRuntimeLogs();
+
+        const lines = Object.values(RATED_LOG_THREAD_IDS).flatMap(threadId => getLogContents(logThreads, threadId));
+        expect(lines.filter(line => line.includes('[ERROR]'))).toEqual([]);
+        expect(console.warn).toHaveBeenCalledWith(expect.stringContaining('season.transition_failed: database unreachable'));
+        expect(console.warn).toHaveBeenCalledWith(expect.stringContaining('thread.finalize_recovery_failed: database unreachable'));
+    });
+
+    it('still logs any other background job failure as an error', async () => {
+        const { client, logThreads } = createMatchClientMock();
+        competitiveRating.beginDueSeasonEnding.mockRejectedValueOnce(new Error('Invalid object name CompetitiveSeason'));
+
+        await competitiveRatedQueue.__tickForTests(client);
+        await flushRuntimeLogs();
+
+        const lines = getLogContents(logThreads, RATED_LOG_THREAD_IDS.MSC_1V1);
+        expect(lines.some(line => line.includes('[ERROR]') && line.includes('season.transition_failed')
+            && line.includes('Invalid object name CompetitiveSeason'))).toBe(true);
+    });
+});
