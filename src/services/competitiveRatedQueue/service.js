@@ -4352,8 +4352,24 @@ function scheduleCompetitiveWhrRunner(client, failureEvent) {
     return competitiveWhrRunInFlight;
 }
 
+// Snapshots of finished matches serve Report Issue and Rematch. Old ones are rebuilt from the DB
+// on demand, so they are dropped after a week unless an issue post or a rematch still uses them.
+const REPORTABLE_MATCH_RETENTION_MS = 7 * 24 * 60 * 60_000;
+
+function pruneReportableMatches(now) {
+    for (const [matchId, snapshot] of state.reportableMatchesById) {
+        if (snapshot.issueThreadId || state.pendingRematchesByMatchId.has(matchId)) {
+            continue;
+        }
+        if (now - (snapshot.completedAtMs ?? now) > REPORTABLE_MATCH_RETENTION_MS) {
+            state.reportableMatchesById.delete(matchId);
+        }
+    }
+}
+
 async function tick(client) {
     const now = Date.now();
+    pruneReportableMatches(now);
     await handleAutomaticSeasonTransitions(client).catch(error => {
         logRatedError(client, { all: true }, 'season.transition_failed', error);
     });

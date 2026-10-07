@@ -5851,6 +5851,23 @@ describe('competitiveRatedQueue', () => {
             expect(competitiveRatedQueue.__getStateSnapshot().pendingCompetitiveDbOpCount).toBe(0);
         });
 
+        it('forgets week-old finished match snapshots unless an issue post or a rematch uses them', async () => {
+            const { client } = createMatchClientMock();
+            const weekAgo = Date.now() - 8 * 24 * 60 * 60_000;
+            const snapshot = (id, extra = {}) => ({ id, threadId: `thread-${id}`, participantIds: [], completedAtMs: weekAgo, ...extra });
+            competitiveRatedQueue.__seedStateForTests({
+                reportableMatches: [
+                    snapshot('old'),
+                    snapshot('reported', { issueThreadId: 'issue-thread' }),
+                    snapshot('recent', { completedAtMs: Date.now() - 60_000 })
+                ]
+            });
+
+            await competitiveRatedQueue.__tickForTests(client);
+
+            expect(competitiveRatedQueue.__getStateSnapshot().reportableMatchCount).toBe(2);
+        });
+
         describe('restart in the middle of completing or cancelling', () => {
             const fsPromises = require('node:fs/promises');
             const os = require('node:os');
