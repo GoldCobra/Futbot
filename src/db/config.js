@@ -20,7 +20,7 @@ const config = {
         encrypt: true,
         trustServerCertificate: true,
         cryptoCredentialsDetails: {
-              minVersion: 'TLSv1'
+              minVersion: 'TLSv1.2'
           }
     }
 }
