@@ -1,7 +1,7 @@
 // Pool defaults for the external server: fresh logins sometimes take over 15 s, and the one-minute
 // queue tick must find an idle connection instead of logging in again.
 describe('database config', () => {
-    const KEYS = ['DB_CONNECTION_TIMEOUT_MS', 'DB_POOL_IDLE_TIMEOUT_MS'];
+    const KEYS = ['DB_CONNECTION_TIMEOUT_MS', 'DB_POOL_IDLE_TIMEOUT_MS', 'DB_SERVER'];
     let saved;
 
     beforeEach(() => {
@@ -13,6 +13,7 @@ describe('database config', () => {
 
     afterEach(() => {
         jest.dontMock('dotenv');
+        jest.dontMock('mssql');
         for (const key of KEYS) {
             if (saved[key] === undefined) delete process.env[key];
             else process.env[key] = saved[key];
@@ -32,5 +33,20 @@ describe('database config', () => {
         const { config } = require('../../src/db/config');
         expect(config.connectionTimeout).toBe(20000);
         expect(config.pool.idleTimeoutMillis).toBe(120000);
+    });
+
+    // The host moved the database on 2026-10-28; the server is configuration, never code.
+    it('takes the database server from DB_SERVER', () => {
+        process.env.DB_SERVER = 'db.example.test';
+        const { config } = require('../../src/db/config');
+        expect(config.server).toBe('db.example.test');
+    });
+
+    it('refuses to connect without DB_SERVER and names the setting', async () => {
+        const connect = jest.fn();
+        jest.doMock('mssql', () => ({ connect }));
+        const { getPool } = require('../../src/db/sqlClient');
+        await expect(getPool()).rejects.toThrow('DB_SERVER is not set: add the database server to .env.');
+        expect(connect).not.toHaveBeenCalled();
     });
 });

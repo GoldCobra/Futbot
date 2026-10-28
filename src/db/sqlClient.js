@@ -82,6 +82,9 @@ async function withDbRetry(operation) {
 }
 
 async function getPool() {
+  if (!config.server) {
+    throw new Error('DB_SERVER is not set: add the database server to .env.');
+  }
   if (!poolPromise) {
     poolPromise = sql.connect(config).catch((err) => {
       poolPromise = null;

@@ -3,7 +3,8 @@ require('dotenv').config()
 const config = {
     user: process.env.DB_USER,
     password: process.env.DB_PASS,
-    server: 'yew.arvixe.com',
+    // From .env, so a move of the database by the host is a configuration change, not a code change.
+    server: process.env.DB_SERVER,
     port: Number(process.env.DB_PORT ?? 1433),
     database: 'MarioStrikers',
     // A fresh login to the external server takes ~2 s and sometimes over 15 s (measured 2026-10-07):

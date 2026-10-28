@@ -9,6 +9,8 @@ const net = require('net');
 for (const name of ['DB_USER', 'DB_PASS', 'BOT_TOKEN', 'FUTBOT_TOKEN', 'MODMAIL_TOKEN', 'START_GG_TOKEN']) {
     process.env[name] = '';
 }
+// The database server is set, but to loopback: a test can never reach the production server.
+process.env.DB_SERVER = '127.0.0.1';
 
 const LOOPBACK_HOSTS = new Set(['localhost', '127.0.0.1', '::1', '::ffff:127.0.0.1']);
 const GUARD = Symbol.for('mario-strikers.tests.networkGuard');
