@@ -268,10 +268,16 @@ async function ensureCompetitivePlayer(discordId, displayName = null) {
     }
 
     try {
+        // OUTPUT INTO, not a plain OUTPUT: dbo.Player has an INSERT trigger (Player.Activity), and SQL Server
+        // rejects a plain OUTPUT on a table with an enabled trigger for that action (error 334).
         const inserted = await executeQuery(`
+            DECLARE @Inserted TABLE (Id INT);
+
             INSERT INTO dbo.Player (Name, DiscordID)
-            OUTPUT INSERTED.ID AS Id
-            VALUES (@name, @discordId)
+            OUTPUT INSERTED.ID INTO @Inserted
+            VALUES (@name, @discordId);
+
+            SELECT TOP 1 Id FROM @Inserted
         `, {
             discordId: normalizedDiscordId,
             name: normalizePlayerName(displayName, normalizedDiscordId)

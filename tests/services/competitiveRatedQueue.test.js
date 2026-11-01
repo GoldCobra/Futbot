@@ -110,6 +110,10 @@ const mockExecuteQuery = jest.fn(async (query, params = {}) => {
         return { recordset: id ? [{ Id: id }] : [] };
     }
     if (sql.includes('INSERT INTO dbo.Player')) {
+        // dbo.Player has an INSERT trigger, so SQL Server rejects OUTPUT without INTO on it (error 334).
+        if (/\bOUTPUT\b/i.test(sql) && !/\bOUTPUT\b[^;]*\bINTO\b/i.test(sql)) {
+            throw new Error("The target table 'dbo.Player' of the DML statement cannot have any enabled triggers if the statement contains an OUTPUT clause without INTO clause.");
+        }
         const id = mockNextPlayerId;
         mockNextPlayerId += 1;
         mockPlayerIdsByDiscordId.set(String(params.discordId), id);
