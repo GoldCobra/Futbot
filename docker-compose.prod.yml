@@ -12,3 +12,11 @@ services:
       - ./runtime:/app/runtime
     restart: unless-stopped
     init: true
+    # mssql: the SQL Server container on the VPS (/opt/mssql), reachable as host "mssql".
+    networks:
+      - default
+      - mssql
+
+networks:
+  mssql:
+    external: true
