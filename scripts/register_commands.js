@@ -1,4 +1,4 @@
-require('dotenv').config();
+require('dotenv').config({ quiet: true });
 
 const CONSTANTS = require('../src/utils/constants');
 const { registerCommands } = require('../src/commands/loader');

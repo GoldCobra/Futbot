@@ -1,4 +1,4 @@
-require('dotenv').config();
+require('dotenv').config({ quiet: true });
 
 const { executeQuery, sql, closePool } = require('../src/db/sqlClient');
 const RatedMatchDao = require('../src/db/daos/ratedMatchDao');

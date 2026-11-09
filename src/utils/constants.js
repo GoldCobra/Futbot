@@ -1,4 +1,4 @@
-require('dotenv').config();
+require('dotenv').config({ quiet: true });
 
 const ROLES = {
     ADMIN: '1070908166725967942',

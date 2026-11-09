@@ -1,4 +1,4 @@
-require('dotenv').config();
+require('dotenv').config({ quiet: true });
 
 const { GraphQLClient } = require('graphql-request');
 const helpers = require('../utils/helpers');

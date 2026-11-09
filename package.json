@@ -29,18 +29,18 @@
     "test": "jest --runInBand"
   },
   "dependencies": {
-    "discord.js": "14.27.0",
-    "dotenv": "^10.0.0",
-    "graphql": "^16.14.1",
+    "discord.js": "14.28.1",
+    "dotenv": "^18.0.10",
+    "graphql": "^16.15.0",
     "graphql-request": "^6.1.0",
-    "mssql": "^12.7.4",
+    "mssql": "^12.7.14",
     "multimap": "^1.1.0"
   },
   "devDependencies": {
     "@eslint/js": "^10.0.1",
-    "eslint": "^10.12.0",
-    "globals": "^17.13.0",
-    "jest": "^28.1.0"
+    "eslint": "^10.14.0",
+    "globals": "^17.14.0",
+    "jest": "^30.5.2"
   },
   "license": "ISC"
 }

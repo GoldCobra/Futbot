@@ -1,4 +1,4 @@
-require('dotenv').config();
+require('dotenv').config({ quiet: true });
 
 const FUTBOT_TOKEN = process.env.FUTBOT_TOKEN;
 const FUTBOT_ID = process.env.FUTBOT_ID;
