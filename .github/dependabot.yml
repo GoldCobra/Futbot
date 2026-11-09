@@ -9,6 +9,12 @@ updates:
     groups:
       minor-and-patch:
         update-types: [minor, patch]
+    ignore:
+      # graphql 17 and graphql-request 7 (ESM-only) would mean rebuilding the start.gg integration for no gain.
+      - dependency-name: graphql
+        update-types: ["version-update:semver-major"]
+      - dependency-name: graphql-request
+        update-types: ["version-update:semver-major"]
 
   - package-ecosystem: github-actions
     directory: /
