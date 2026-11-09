@@ -1049,7 +1049,7 @@ describe('competitiveRatedQueue', () => {
         expect(competitiveRatedQueue.buildLeavePoolLabel('2v2')).toBe('Leave 2vs2');
     });
 
-    it('joins the pool directly for the fixed 15 minute live search window', async () => {
+    it('joins the pool directly for the fixed 15 minute live search window (ends 15 s before the token)', async () => {
         const nowSpy = jest.spyOn(Date, 'now').mockReturnValue(1_000_000);
         try {
             const { client } = createMatchClientMock();
@@ -1069,7 +1069,7 @@ describe('competitiveRatedQueue', () => {
                 flags: MessageFlags.Ephemeral
             });
             expect(replyPayload.content).toBe(
-                `You joined the 1vs1 pool.\n${COMP_RANK_EMOJIS[0]} **Unranked 0/${PLACEMENT_GAMES_REQUIRED}** (500)\n<:bltime:986232783569551360> Time remaining: ${relativeTimestamp(1_900_000)}.`
+                `You joined the 1vs1 pool.\n${COMP_RANK_EMOJIS[0]} **Unranked 0/${PLACEMENT_GAMES_REQUIRED}** (500)\n<:bltime:986232783569551360> Time remaining: ${relativeTimestamp(1_885_000)}.`
             );
             expect(replyPayload.content).not.toContain('Choose how long');
             expect(leaveButton.label).toBe('Leave 1vs1');
@@ -1226,6 +1226,28 @@ describe('competitiveRatedQueue', () => {
         }
     });
 
+    it('counts the pool time from the interaction token, not from the end of the join work', async () => {
+        const nowSpy = jest.spyOn(Date, 'now').mockReturnValue(1_000_000);
+        try {
+            const { client } = createMatchClientMock();
+            const interaction = createButtonInteractionMock({
+                customId: 'rated:competitive:join:1501486517464600657:1v1',
+                userId: 'slow-join-user',
+                client
+            });
+            // The click was created 4 s before the bot got to the pool entry (slow DB lookups).
+            interaction.createdTimestamp = 996_000;
+
+            await competitiveRatedQueue.handleInteraction(interaction);
+
+            const replyPayload = interaction.editReply.mock.calls.at(-1)[0];
+            expect(replyPayload.content).toContain(`Time remaining: ${relativeTimestamp(996_000 + 15 * 60000 - 15_000)}`);
+        } finally {
+            nowSpy.mockRestore();
+            competitiveRatedQueue.__resetState();
+        }
+    });
+
     it('shows current competitive rank in pool join reply when a rating row exists', async () => {
         const nowSpy = jest.spyOn(Date, 'now').mockReturnValue(1_000_000);
         try {
@@ -1242,7 +1264,7 @@ describe('competitiveRatedQueue', () => {
             expect(replyPayload.content).toContain(
                 `${COMP_RANK_EMOJIS[7]} **${COMP_RANK_NAMES[7]}** (1300)`
             );
-            expect(replyPayload.content).toContain(`Time remaining: ${relativeTimestamp(1_900_000)}`);
+            expect(replyPayload.content).toContain(`Time remaining: ${relativeTimestamp(1_885_000)}`);
         } finally {
             nowSpy.mockRestore();
         }
@@ -1411,11 +1433,12 @@ describe('competitiveRatedQueue', () => {
             jest.advanceTimersByTime(13 * 60_000);
             await flushAsyncTasks();
             expect(interaction.followUp.mock.calls.some(([payload]) =>
-                payload.content === `Your 2vs2 pool entry is still active.\n<:bltime:986232783569551360> Time remaining: ${relativeTimestamp(1_900_000)}.`
+                payload.content === `Your 2vs2 pool entry is still active.\n<:bltime:986232783569551360> Time remaining: ${relativeTimestamp(1_885_000)}.`
             )).toBe(true);
             expect(competitiveRatedQueue.__getStateSnapshot().activeSearchCount).toBe(1);
 
-            jest.advanceTimersByTime(2 * 60_000);
+            // 14:45 after the join: the expiry notice goes out while the interaction token (15 min) still works.
+            jest.advanceTimersByTime(105_000);
             await flushAsyncTasks();
             expect(interaction.followUp.mock.calls.some(([payload]) =>
                 payload.content === '<:blx:1502366790116708382> Your 2vs2 pool entry **expired**. You were removed from the pool!'
@@ -5189,8 +5212,8 @@ describe('competitiveRatedQueue', () => {
             await competitiveRatedQueue.handleInteraction(firstInteraction);
 
             expect(search.durationMinutes).toBe(15);
-            expect(search.expiresAt).toBe(1_000_000 + 15 * 60000);
-            expect(search.warningAt).toBe(1_000_000 + 13 * 60000);
+            expect(search.expiresAt).toBe(1_000_000 + 15 * 60000 - 15_000);
+            expect(search.warningAt).toBe(1_000_000 + 13 * 60000 - 15_000);
             expect(search.hasWarnedExpiry).toBe(false);
             expect(firstInteraction.followUp.mock.calls.at(-1)[0].content)
                 .toBe(`Your 1vs1 pool entry was extended.\n<:bltime:986232783569551360> Time remaining: ${relativeTimestamp(search.expiresAt)}.`);
@@ -5203,8 +5226,8 @@ describe('competitiveRatedQueue', () => {
             });
             await competitiveRatedQueue.handleInteraction(secondInteraction);
 
-            expect(search.expiresAt).toBe(1_000_000 + 15 * 60000);
-            expect(search.warningAt).toBe(1_000_000 + 13 * 60000);
+            expect(search.expiresAt).toBe(1_000_000 + 15 * 60000 - 15_000);
+            expect(search.warningAt).toBe(1_000_000 + 13 * 60000 - 15_000);
             expect(search.hasWarnedExpiry).toBe(false);
             expect(secondInteraction.followUp).not.toHaveBeenCalled();
         } finally {

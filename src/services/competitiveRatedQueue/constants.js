@@ -102,6 +102,10 @@ const RATED_RUNTIME_LOG_CLEANUP_FETCH_LIMIT = 100;
 const COMPLETED_THREAD_CLOSE_DELAY_MS = 10 * 60_000;
 const REMATCH_CONFIRM_TIMEOUT_MS = 5 * 60_000;
 const DEFAULT_POOL_DURATION_MINUTES = 15;
+// Private pool notices (expiry warning, "pool expired") are follow-ups on the player's last interaction;
+// Discord keeps that token for 15 minutes, so a pool entry ends this much earlier.
+const INTERACTION_TOKEN_LIFETIME_MS = 15 * 60_000;
+const INTERACTION_TOKEN_SAFETY_MS = 15_000;
 const SCORE_EMOJIS = {
     0: '<:rm0:1501918549877325944>',
     1: '<:rm1:1501918592017371167>',
@@ -131,6 +135,8 @@ module.exports = {
     CONSTANTS,
     CONTROL_EXPIRY_MESSAGE,
     DEFAULT_POOL_DURATION_MINUTES,
+    INTERACTION_TOKEN_LIFETIME_MS,
+    INTERACTION_TOKEN_SAFETY_MS,
     LOSER_CHOICE_TIMEOUT_MINUTES,
     MATCH_TIMEOUT_PHASES,
     MSBL_RATED_ISSUE_SUPPORT_CHANNEL_ID,

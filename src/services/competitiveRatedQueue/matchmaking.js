@@ -31,7 +31,9 @@ const {
     CONFIG,
     CONSTANTS,
     CONTROL_EXPIRY_MESSAGE,
-    DEFAULT_POOL_DURATION_MINUTES
+    DEFAULT_POOL_DURATION_MINUTES,
+    INTERACTION_TOKEN_LIFETIME_MS,
+    INTERACTION_TOKEN_SAFETY_MS
 } = require('./constants');
 const {
     cancelSearchCustomId,
@@ -578,8 +580,22 @@ async function closeAllSearchesForSeasonEnd(client) {
     return searches.length;
 }
 
+// End and warning time of a pool entry. The private notices go out as follow-ups on `interaction`, whose
+// token Discord keeps for 15 minutes from its creation: the entry ends while that token still works.
+function getSearchTiming(interaction, durationMinutes, now) {
+    const created = Number(interaction?.createdTimestamp);
+    const tokenStart = Number.isFinite(created) && created > 0 ? Math.min(created, now) : now;
+    const expiresAt = Math.min(
+        now + durationMinutes * 60000,
+        tokenStart + INTERACTION_TOKEN_LIFETIME_MS - INTERACTION_TOKEN_SAFETY_MS
+    );
+    const warningAt = Math.max(expiresAt - CONFIG.EXPIRING_SOON_MINUTES * 60000, now);
+    return { expiresAt, warningAt };
+}
+
 function createSearchFromInteraction(interaction, panelConfig, mode, durationMinutes, options, ratingProfile) {
     const now = Date.now();
+    const { expiresAt, warningAt } = getSearchTiming(interaction, durationMinutes, now);
     return {
         id: createId(),
         channelId: panelConfig.channelId,
@@ -591,8 +607,8 @@ function createSearchFromInteraction(interaction, panelConfig, mode, durationMin
         username: getInteractionDisplayName(interaction),
         createdAt: now,
         durationMinutes,
-        expiresAt: now + durationMinutes * 60000,
-        warningAt: now + Math.max(durationMinutes - CONFIG.EXPIRING_SOON_MINUTES, 0) * 60000,
+        expiresAt,
+        warningAt,
         hasWarnedExpiry: false,
         matchedThreadUrl: null,
         warningMessage: null,
@@ -1201,8 +1217,9 @@ async function handleExtendSearch(interaction) {
         search.notificationInteraction = interaction;
         search.hasWarnedExpiry = false;
         search.durationMinutes = durationMinutes;
-        search.expiresAt = now + durationMinutes * 60000;
-        search.warningAt = now + Math.max(durationMinutes - CONFIG.EXPIRING_SOON_MINUTES, 0) * 60000;
+        const timing = getSearchTiming(interaction, durationMinutes, now);
+        search.expiresAt = timing.expiresAt;
+        search.warningAt = timing.warningAt;
         await deleteSearchWarningMessage(search, interaction.client);
         scheduleSearchTimers(search, interaction.client);
 
