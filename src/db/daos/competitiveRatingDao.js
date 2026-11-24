@@ -1030,10 +1030,10 @@ class CompetitiveRatingDao {
                     rm.MatchNumber,
                     rm.MatchCode,
                     game.Code AS GameCode,
-                    rollback.Id AS RollbackId,
-                    rollback.RatedMatchId AS RollbackRatedMatchId,
-                    rollback.RolledBackByDiscordId,
-                    rollback.Reason,
+                    lastRollback.Id AS RollbackId,
+                    lastRollback.RatedMatchId AS RollbackRatedMatchId,
+                    lastRollback.RolledBackByDiscordId,
+                    lastRollback.Reason,
                     ISNULL(snapshotStats.SnapshotCount, 0) AS RollbackSnapshotCount,
                     ISNULL(changeStats.ChangeCount, 0) AS CurrentChangeCount,
                     whr.Id AS WhrSyncId,
@@ -1047,11 +1047,11 @@ class CompetitiveRatingDao {
                 FROM ${T.rollback} rb
                 WHERE rb.RatedMatchId = rm.Id
                 ORDER BY rb.Id DESC
-             ) rollback
+             ) lastRollback
              OUTER APPLY (
                 SELECT COUNT(1) AS SnapshotCount
                 FROM ${T.rollbackSnapshot} snapshot
-                WHERE snapshot.RollbackId = rollback.Id
+                WHERE snapshot.RollbackId = lastRollback.Id
              ) snapshotStats
              OUTER APPLY (
                 SELECT COUNT(1) AS ChangeCount

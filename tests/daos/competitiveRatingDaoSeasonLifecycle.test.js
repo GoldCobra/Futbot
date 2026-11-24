@@ -237,6 +237,10 @@ describe('CompetitiveRatingDao rollback commit readback', () => {
         expect(query).toContain('CompetitiveMatchRollback');
         expect(query).toContain('CompetitiveMatchRollbackChangeSnapshot');
         expect(query).toContain('CompetitiveWhrSync');
+        // ROLLBACK is a reserved T-SQL keyword: as an alias it broke the whole statement on the server
+        // ("Incorrect syntax near the keyword 'ORDER'") after the rollback itself had committed.
+        expect(query).not.toMatch(/\)\s*rollback\b/i);
+        expect(query).not.toMatch(/\brollback\./i);
         expect(inputs).toEqual({
             gameId: 3,
             mode: '1v1',
