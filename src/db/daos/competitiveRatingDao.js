@@ -106,6 +106,15 @@ function rankForEloFromThresholds(elo, thresholds) {
     return rank || 1;
 }
 
+// The placement counter counts a player's rated matches until the placement matches are played, then
+// stays where it is: everything that reads it only asks for placement progress or "placed yet". The
+// matches themselves keep counting in MatchWins/MatchLosses (INT), with no limit at all. Counting on
+// overflowed the TINYINT columns (PlacementPlayed and the PlacementBefore/After copies) at a player's
+// 255th rated match of a season, so that match could not be recorded. Used by live rating and rebuilds.
+function nextPlacementPlayed(placementBefore) {
+    return placementBefore < PLACEMENT_GAMES_REQUIRED ? placementBefore + 1 : placementBefore;
+}
+
 class CompetitiveRatingDao {
     async getActiveSeason() {
         const result = await executeQuery(
@@ -730,7 +739,7 @@ class CompetitiveRatingDao {
                 const opponentTeamNumber = row.participant.TeamNumber === 1 ? 2 : 1;
                 const delta = calculateDelta(eloBefore, teamAverages.get(opponentTeamNumber), isWinner ? 1 : 0, !placementCompleteBefore);
                 const eloAfter = Math.max(eloBefore + delta, defaultRating);
-                const placementAfter = placementBefore + 1;
+                const placementAfter = nextPlacementPlayed(placementBefore);
                 const placementCompleteAfter = placementCompleteBefore || placementAfter >= PLACEMENT_GAMES_REQUIRED;
                 const rankAfter = placementCompleteAfter
                     ? await this.getRankNumberForElo(eloAfter, transaction)
@@ -2067,7 +2076,7 @@ class CompetitiveRatingDao {
                 const placementBefore = state.placementPlayed;
                 const delta = calculateDelta(eloBefore, teamAverages.get(opponentTeamNumber), isWinner ? 1 : 0, !state.placementComplete);
                 const eloAfter = Math.max(eloBefore + delta, defaultRating);
-                const placementAfter = placementBefore + 1;
+                const placementAfter = nextPlacementPlayed(placementBefore);
                 const placementCompleteAfter = state.placementComplete || placementAfter >= PLACEMENT_GAMES_REQUIRED;
                 const rankAfter = placementCompleteAfter
                     ? rankForEloFromThresholds(eloAfter, thresholds)

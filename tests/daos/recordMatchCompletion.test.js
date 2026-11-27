@@ -188,6 +188,36 @@ describe('competitiveRatingDao.recordMatchCompletion', () => {
         expect(mockTransaction.rollback).toHaveBeenCalledTimes(1);
     });
 
+    test('the placement counter stops at the placement matches while every match still counts', async () => {
+        // home-user is placed long ago with 254 counted matches (the next would have overflowed the TINYINT
+        // column before); away-user plays the last placement match.
+        const dao = new CompetitiveRatingDao();
+        stubRatingHelpers(dao);
+        dao._getOrCreateRatingForUpdate.mockImplementation(async (transaction, { playerId }) => (playerId === 11
+            ? { Id: 110, Elo: 900, RankNumber: 7, PlacementPlayed: 254, PlacementComplete: true, PeakElo: 900, PeakRankNumber: 7 }
+            : { Id: 220, Elo: 600, RankNumber: 0, PlacementPlayed: 4, PlacementComplete: false, PeakElo: 600, PeakRankNumber: 0 }));
+        mockTransaction = createTransaction();
+
+        const changes = await dao.recordMatchCompletion(completion(), calculateCompetitiveEloDelta);
+
+        expect(changes.map(change => [change.discordId, change.placementBefore, change.placementAfter, change.placementComplete]))
+            .toEqual([
+                ['home-user', 254, 254, true],
+                ['away-user', 4, 5, true]
+            ]);
+        const ratingWrites = mockTransaction.queries
+            .filter(entry => /^\s*UPDATE/.test(entry.query) && entry.query.includes('CompetitivePlayerRating'))
+            .map(entry => entry.inputs);
+        expect(ratingWrites.map(inputs => [inputs.ratingId, inputs.placementAfter, inputs.placementCompleteAfter]))
+            .toEqual([[110, 254, 1], [220, 5, 1]]);
+        // The match itself is counted for both, without any limit.
+        expect(ratingWrites.map(inputs => inputs.winIncrement + inputs.lossIncrement)).toEqual([1, 1]);
+        const auditRows = mockTransaction.queries
+            .filter(entry => /^\s*INSERT/.test(entry.query) && entry.query.includes('CompetitiveRatingChange'))
+            .map(entry => [entry.inputs.placementBefore, entry.inputs.placementAfter]);
+        expect(auditRows).toEqual([[254, 254], [4, 5]]);
+    });
+
     test('rolls back everything when a write fails in the middle', async () => {
         const dao = new CompetitiveRatingDao();
         stubRatingHelpers(dao);
